@@ -1,0 +1,19 @@
+[package]
+name = "embed"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["bgem3"]
+# The real model. Off for crates that only need HashEmbedder in tests, so they don't link ONNX Runtime.
+bgem3 = ["dep:fastembed", "dep:ort"]
+directml = ["bgem3", "fastembed/directml"]
+
+[dependencies]
+fastembed = { version = "7.1.0", optional = true, default-features = false, features = ["hf-hub", "hf-hub-native-tls", "ort-download-binaries-native-tls"] }
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false }
+thiserror = "2.0.21"
+
+[[test]]
+name = "bgem3_model"
+required-features = ["bgem3"]

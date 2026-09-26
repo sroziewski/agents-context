@@ -7,6 +7,7 @@
 pub mod claude;
 pub mod opencode;
 pub mod project;
+pub mod teams;
 mod tools;
 
 use std::path::PathBuf;

@@ -51,18 +51,93 @@ pub struct ListArgs {
 }
 
 #[derive(Clone)]
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TeamsArgs {
+    /// What to look for, in Polish or English; matched by meaning and by keywords.
+    pub query: String,
+    /// A people.json group (e.g. "SEDN"): only its channels.
+    pub group: Option<String>,
+    /// Substring of the Teams team name (case- and accent-insensitive).
+    pub team: Option<String>,
+    /// Substring of the channel name.
+    pub channel: Option<String>,
+    /// Substring of the author's name.
+    pub author: Option<String>,
+    /// Only messages on or after this date, YYYY-MM-DD.
+    pub since: Option<String>,
+    /// Only messages on or before this date, YYYY-MM-DD.
+    pub until: Option<String>,
+    /// Number of threads, 1-20 (default 6).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TeamsThreadArgs {
+    /// Thread id as shown in search_teams results.
+    pub thread_id: String,
+}
+
+/// Largest `get_teams_thread` answer.
+const MAX_THREAD_CHARS: usize = 40_000;
+
+#[derive(Clone)]
 pub struct ContextServer {
     ctx: Context,
     /// Project key of the directory the agent was started in.
     current_project: String,
     state_path: PathBuf,
+    teams: Option<crate::teams::TeamsSearch>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl ContextServer {
     pub fn new(ctx: Context, current_project: String, state_path: PathBuf) -> Self {
-        Self { ctx, current_project, state_path, tool_router: Self::tool_router() }
+        Self { ctx, current_project, state_path, teams: None, tool_router: Self::tool_router() }
+    }
+
+    pub fn with_teams(mut self, teams: crate::teams::TeamsSearch) -> Self {
+        self.teams = Some(teams);
+        self
+    }
+
+    fn teams(&self) -> Result<&crate::teams::TeamsSearch, String> {
+        self.teams.as_ref().ok_or_else(|| "Teams search is not configured".to_owned())
+    }
+
+    /// Search the organisation's Microsoft Teams channel messages (shared, not project-scoped),
+    /// by meaning and by keywords; results are threads with their best matching message and
+    /// author roles. Threads in the current project's groups rank higher. Open one with
+    /// get_teams_thread.
+    #[tool(name = "search_teams")]
+    pub async fn search_teams(&self, Parameters(a): Parameters<TeamsArgs>) -> Result<String, String> {
+        let teams = self.teams()?;
+        if a.query.trim().is_empty() {
+            return Err("query must not be empty".into());
+        }
+        let q = crate::teams::TeamsQuery {
+            text: a.query,
+            group: a.group,
+            team: a.team,
+            channel: a.channel,
+            author: a.author,
+            since: a.since.as_deref().map(|d| parse_date(d, false)).transpose().map_err(|e| e.to_string())?,
+            until: a.until.as_deref().map(|d| parse_date(d, true)).transpose().map_err(|e| e.to_string())?,
+            limit: a.limit.unwrap_or(6).clamp(1, 20) as usize,
+        };
+        let r = teams.search(&q, Some(&self.current_project)).await.map_err(|e| e.to_string())?;
+        Ok(crate::teams::format_results(&r))
+    }
+
+    /// A whole Teams thread (root and replies) with author roles.
+    #[tool(name = "get_teams_thread")]
+    pub async fn get_teams_thread(&self, Parameters(a): Parameters<TeamsThreadArgs>) -> Result<String, String> {
+        let teams = self.teams()?.clone();
+        let id = a.thread_id.trim().to_owned();
+        tokio::task::spawn_blocking(move || teams.thread(&id, MAX_THREAD_CHARS))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
     }
 
     fn scope(&self, scope: Option<&str>, project: Option<&str>) -> Result<Scope, String> {
@@ -137,7 +212,9 @@ impl ServerHandler for ContextServer {
              Current project: {}. Searches stay inside the current project unless you pass scope \"all\" \
              or another project path — only do that when the user asks about other projects. \
              Results cite session id, agent and date: quote them when you rely on a result, and \
-             prefer recent sessions when results conflict.",
+             prefer recent sessions when results conflict. search_teams / get_teams_thread cover the \
+             organisation's Teams channels, which are shared by all projects; author roles in brackets \
+             come from the team directory.",
             self.current_project
         ))
     }

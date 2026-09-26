@@ -20,6 +20,7 @@ use crate::Sources;
 pub enum Target {
     Claude,
     Opencode,
+    Teams,
     All,
 }
 
@@ -28,12 +29,18 @@ impl Target {
         if self == other { self } else { Target::All }
     }
 
-    pub fn sources(self) -> Sources {
+    /// Session sources this run covers; `None` for a Teams-only run.
+    pub fn sessions(self) -> Option<Sources> {
         match self {
-            Target::Claude => Sources::Claude,
-            Target::Opencode => Sources::OpenCode,
-            Target::All => Sources::All,
+            Target::Claude => Some(Sources::Claude),
+            Target::Opencode => Some(Sources::OpenCode),
+            Target::Teams => None,
+            Target::All => Some(Sources::All),
         }
+    }
+
+    pub fn includes_teams(self) -> bool {
+        matches!(self, Target::Teams | Target::All)
     }
 }
 
@@ -163,6 +170,14 @@ mod tests {
         assert_eq!(Target::Claude.merge(Target::Claude), Target::Claude);
         assert_eq!(Target::Claude.merge(Target::Opencode), Target::All);
         assert_eq!(Target::All.merge(Target::Claude), Target::All);
+    }
+
+    #[test]
+    fn teams_runs_cover_no_sessions_and_all_covers_everything() {
+        assert_eq!(Target::Teams.sessions(), None);
+        assert!(Target::Teams.includes_teams() && Target::All.includes_teams());
+        assert!(!Target::Claude.includes_teams());
+        assert_eq!(Target::Teams.merge(Target::Claude), Target::All);
     }
 
     #[test]

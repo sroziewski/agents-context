@@ -70,6 +70,26 @@ enum Command {
         #[arg(long)]
         subagents: bool,
     },
+    /// Search Teams channel messages by meaning and keywords.
+    SearchTeams {
+        query: String,
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(long)]
+        team: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        author: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long, default_value_t = 6)]
+        limit: usize,
+    },
+    /// Print a whole Teams thread.
+    TeamsThread { thread_id: String },
     /// List indexed sessions, newest first.
     Sessions {
         #[arg(long)]
@@ -121,6 +141,7 @@ enum MemoriesAction {
 enum SourceArg {
     Claude,
     Opencode,
+    Teams,
     All,
 }
 
@@ -159,7 +180,16 @@ async fn main() -> anyhow::Result<()> {
                     Duration::from_secs(180),
                 )) as Arc<dyn ingest::Summarizer>
             });
-            let runner = ctx::daemon_runner(cfg.clone(), Arc::new(connect_store(&cfg)?), Arc::new(counter), shared.clone(), model.clone(), summarizer);
+            let teams_store = Arc::new(Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.teams_collection, embed::BGEM3_DIM)?);
+            let runner = ctx::daemon_runner(
+                cfg.clone(),
+                Arc::new(connect_store(&cfg)?),
+                Arc::new(counter),
+                shared.clone(),
+                model.clone(),
+                summarizer,
+                Some(teams_store),
+            );
             let queue = IndexQueue::start(runner, Duration::from_secs(20));
             if !addr.ip().is_loopback() {
                 eprintln!("warning: {addr} is not a loopback address; the daemon has no authentication");
@@ -201,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
             let which = match source {
                 SourceArg::Claude => Sources::Claude,
                 SourceArg::Opencode => Sources::OpenCode,
+                SourceArg::Teams => anyhow::bail!("indexing Teams needs the daemon (`ctx embed-server`); run without --local"),
                 SourceArg::All => Sources::All,
             };
             let refs = ctx::discover(&cfg, which)?;
@@ -237,6 +268,28 @@ async fn main() -> anyhow::Result<()> {
                 include_subagents: subagents,
             };
             println!("{}", format_results(&ctx.search(&q).await?));
+            Ok(())
+        }
+        Command::SearchTeams { query, group, team, channel, author, since, until, limit } => {
+            let teams = teams_search(&cfg, &context(&cfg).await?);
+            let q = ctx::teams::TeamsQuery {
+                text: query,
+                group,
+                team,
+                channel,
+                author,
+                since: since.as_deref().map(|d| parse_date(d, false)).transpose()?,
+                until: until.as_deref().map(|d| parse_date(d, true)).transpose()?,
+                limit,
+            };
+            let project = sources::project::key(&std::env::current_dir()?.to_string_lossy());
+            println!("{}", ctx::teams::format_results(&teams.search(&q, Some(&project)).await?));
+            Ok(())
+        }
+        Command::TeamsThread { thread_id } => {
+            let store = Arc::new(connect_store(&cfg)?);
+            let ctx = Context { store, embedder: Arc::new(Mutex::new(Box::new(embed::HashEmbedder::new(1)))) };
+            println!("{}", teams_search(&cfg, &ctx).thread(&thread_id, usize::MAX)?);
             Ok(())
         }
         Command::Sessions { all, limit } => {
@@ -345,9 +398,24 @@ async fn main() -> anyhow::Result<()> {
         Command::Mcp => {
             let embedder: Box<dyn Embedder> = Box::new(embed_server::LazyRemote::new(&cfg.embed_url, embed::BGEM3_DIM));
             let ctx = Context { store: Arc::new(connect_store(&cfg)?), embedder: Arc::new(Mutex::new(embedder)) };
-            let server = mcp::ContextServer::new(ctx, mcp::current_project(), cfg.state_path.clone());
+            let teams = teams_search(&cfg, &ctx);
+            let server = mcp::ContextServer::new(ctx, mcp::current_project(), cfg.state_path.clone()).with_teams(teams);
             mcp::serve_stdio(server).await
         }
+    }
+}
+
+/// Teams search sharing the context's embedder, over the teams collection.
+fn teams_search(cfg: &Config, ctx: &Context) -> ctx::teams::TeamsSearch {
+    let store = Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.teams_collection, embed::BGEM3_DIM)
+        .expect("Qdrant client construction does not connect");
+    ctx::teams::TeamsSearch {
+        store: Arc::new(store),
+        embedder: ctx.embedder.clone(),
+        db: cfg.teams_db.clone(),
+        people: cfg.teams_people.clone(),
+        projects: cfg.teams_projects.clone(),
+        redact: cfg.redact_file.clone(),
     }
 }
 
@@ -355,6 +423,7 @@ fn to_target(source: SourceArg) -> Target {
     match source {
         SourceArg::Claude => Target::Claude,
         SourceArg::Opencode => Target::Opencode,
+        SourceArg::Teams => Target::Teams,
         SourceArg::All => Target::All,
     }
 }

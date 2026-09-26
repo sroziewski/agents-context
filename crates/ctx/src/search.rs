@@ -126,8 +126,15 @@ fn int(p: &serde_json::Map<String, Value>, k: &str) -> i64 {
 /// when `end_of_day` (so `until` includes the whole day).
 pub fn parse_date(s: &str, end_of_day: bool) -> anyhow::Result<i64> {
     let date: jiff::civil::Date = s.trim().parse().map_err(|_| anyhow::anyhow!("invalid date {s:?}, expected YYYY-MM-DD"))?;
-    let start = date.to_zoned(jiff::tz::TimeZone::system())?.timestamp().as_millisecond();
-    Ok(if end_of_day { start + 86_400_000 - 1 } else { start })
+    let tz = jiff::tz::TimeZone::system();
+    if end_of_day {
+        // The start of the next local day, minus 1 ms: a fixed 24 h is an hour off on the days
+        // daylight saving time starts or ends.
+        let next = date.tomorrow()?.to_zoned(tz)?.timestamp().as_millisecond();
+        Ok(next - 1)
+    } else {
+        Ok(date.to_zoned(tz)?.timestamp().as_millisecond())
+    }
 }
 
 /// Summaries first under their own heading, then turns. Without summaries the output is just
@@ -225,6 +232,17 @@ mod tests {
         assert_eq!(end - start, 86_400_000 - 1);
         assert!(parse_date("25.09.2026", false).is_err());
         assert!(parse_date(" 2026-09-25 ", false).is_ok());
+    }
+
+    #[test]
+    fn end_of_day_follows_the_local_calendar_across_dst_changes() {
+        for day in ["2026-03-29", "2026-10-25", "2026-06-15"] {
+            let start = parse_date(day, false).unwrap();
+            let next: jiff::civil::Date = day.parse::<jiff::civil::Date>().unwrap().tomorrow().unwrap();
+            let next_start = parse_date(&next.to_string(), false).unwrap();
+            assert_eq!(parse_date(day, true).unwrap(), next_start - 1, "{day}");
+            assert!(parse_date(day, true).unwrap() > start);
+        }
     }
 
     #[test]

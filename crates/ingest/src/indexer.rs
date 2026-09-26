@@ -36,6 +36,8 @@ pub enum IndexError {
     Store(#[from] store::StoreError),
     #[error("state: {0}")]
     State(#[from] rusqlite::Error),
+    #[error("source: {0}")]
+    Source(String),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -54,6 +56,43 @@ pub struct Report {
 pub enum Progress<'a> {
     Indexed { id: &'a str, chunks: usize },
     Failed { id: &'a str, error: &'a str },
+}
+
+/// Writes `chunks` as the complete set of points matching `scope`: embeds only chunks whose id
+/// and text are not stored yet, upserts them, then prunes points under `scope` that are no longer
+/// produced. Returns how many chunks the scope now holds.
+///
+/// An active session grows by a turn at a time (a Teams thread by a reply); re-embedding all of
+/// it on every sync made a re-run of one long session take minutes. The payload is derived from
+/// the same source as the text, so equal text means an equal point.
+pub(crate) async fn write_chunks(
+    store: &Store,
+    embedder: &mut dyn Embedder,
+    config: &IndexConfig,
+    scope: &SearchFilter,
+    chunks: &[Chunk],
+) -> Result<usize, IndexError> {
+    let stored: HashMap<Uuid, String> = store
+        .scroll(scope, MAX_SESSION_CHUNKS)
+        .await?
+        .into_iter()
+        .filter_map(|h| h.payload.get("text").and_then(|t| t.as_str()).map(|t| (h.id, t.to_owned())))
+        .collect();
+    let todo: Vec<&Chunk> = chunks.iter().filter(|c| stored.get(&c.id) != Some(&c.text)).collect();
+
+    let tokens: Vec<usize> = todo.iter().map(|c| c.tokens).collect();
+    let mut docs = Vec::with_capacity(todo.len());
+    for range in batches(&tokens, config.max_padded_tokens, config.max_batch) {
+        let texts: Vec<&str> = todo[range.clone()].iter().map(|c| c.text.as_str()).collect();
+        let embeddings = embedder.embed(&texts)?;
+        for (chunk, embedding) in todo[range].iter().zip(embeddings) {
+            docs.push(Doc { id: chunk.id, embedding, payload: chunk.payload.clone() });
+        }
+    }
+    store.upsert(docs).await?;
+    let ids: Vec<Uuid> = chunks.iter().map(|c| c.id).collect();
+    store.delete_matching_except(scope, &ids).await?;
+    Ok(ids.len())
 }
 
 pub struct Indexer<'a> {
@@ -76,32 +115,8 @@ impl Indexer<'_> {
             .eq("session_id", s.id.clone())
             .eq("kind", "turn");
 
-        // An active session grows by a turn at a time; re-embedding all of it on every sync made a
-        // re-run of one long session take minutes. Chunks whose id and text are already stored
-        // keep their vectors. The payload is derived from the same turn as the text, so equal
-        // text means an equal point.
-        let stored: HashMap<Uuid, String> = self
-            .store
-            .scroll(&session, MAX_SESSION_CHUNKS)
-            .await?
-            .into_iter()
-            .filter_map(|h| h.payload.get("text").and_then(|t| t.as_str()).map(|t| (h.id, t.to_owned())))
-            .collect();
-        let todo: Vec<&Chunk> = chunks.iter().filter(|c| stored.get(&c.id) != Some(&c.text)).collect();
-
-        let tokens: Vec<usize> = todo.iter().map(|c| c.tokens).collect();
-        let mut docs = Vec::with_capacity(todo.len());
-        for range in batches(&tokens, self.config.max_padded_tokens, self.config.max_batch) {
-            let texts: Vec<&str> = todo[range.clone()].iter().map(|c| c.text.as_str()).collect();
-            let embeddings = self.embedder.embed(&texts)?;
-            for (chunk, embedding) in todo[range].iter().zip(embeddings) {
-                docs.push(Doc { id: chunk.id, embedding, payload: chunk.payload.clone() });
-            }
-        }
-        self.store.upsert(docs).await?;
-        let ids: Vec<Uuid> = chunks.iter().map(|c| c.id).collect();
-        self.store.delete_matching_except(&session, &ids).await?;
-        Ok((ids.len(), stats.redactions))
+        let n = write_chunks(self.store, self.embedder, &self.config, &session, &chunks).await?;
+        Ok((n, stats.redactions))
     }
 
     /// Indexes every ref whose fingerprint changed since the last run.

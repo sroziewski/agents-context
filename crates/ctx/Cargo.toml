@@ -10,6 +10,7 @@ clap = { version = "4", features = ["derive", "env"] }
 dirs = "7.0.0"
 dotenvy = "0.15.7"
 embed = { version = "0.1.0", path = "../embed" }
+indexmap = { version = "2.14.2", features = ["serde"] }
 ingest = { version = "0.1.0", path = "../ingest" }
 jiff = "0.2.37"
 rmcp = { version = "3.4", features = ["server", "transport-io", "macros"] }
@@ -25,6 +26,7 @@ uuid = "1"
 [dev-dependencies]
 ingest = { path = "../ingest" }
 rmcp = { version = "3.4", features = ["client", "transport-async-rw"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3.27.0"
 testkit = { path = "../testkit" }
 tokio = { version = "1", features = ["test-util"] }

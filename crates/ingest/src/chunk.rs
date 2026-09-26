@@ -129,7 +129,7 @@ fn payload(s: &Session, title: Option<&str>, t: &Turn, index: usize, total: usiz
 }
 
 /// Breaks text into segments that each fit `budget`: paragraphs, then lines, then hard cuts.
-fn split(text: &str, budget: usize, counter: &dyn TokenCounter) -> Vec<String> {
+pub(crate) fn split(text: &str, budget: usize, counter: &dyn TokenCounter) -> Vec<String> {
     let mut out = Vec::new();
     for para in text.split("\n\n").filter(|p| !p.trim().is_empty()) {
         if counter.count(para) <= budget {
@@ -170,7 +170,7 @@ fn hard_split(line: &str, budget: usize, counter: &dyn TokenCounter) -> Vec<Stri
 
 /// Greedily joins segments into chunks under `budget`, re-counting the joined text because
 /// tokens can merge across a join.
-fn pack(segments: Vec<String>, budget: usize, overlap: usize, counter: &dyn TokenCounter) -> Vec<String> {
+pub(crate) fn pack(segments: Vec<String>, budget: usize, overlap: usize, counter: &dyn TokenCounter) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut current: Vec<String> = Vec::new();
     for seg in segments {

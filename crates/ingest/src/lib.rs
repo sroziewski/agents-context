@@ -7,6 +7,7 @@ pub mod rescan;
 pub mod scrub;
 pub mod state;
 pub mod summary;
+pub mod teams;
 pub mod tokens;
 
 pub use chunk::{CHUNKER_VERSION, ChunkConfig};

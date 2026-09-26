@@ -318,3 +318,23 @@ async fn scroll_pages_through_more_points_than_one_page() {
         .unwrap();
     assert!(pages >= 3, "{pages}");
 }
+
+#[tokio::test]
+async fn any_of_matches_listed_values_and_an_empty_list_matches_nothing() {
+    let mut e = env().await;
+    let docs = vec![
+        e.doc("a", "status update", json!({"channel": "c1"})),
+        e.doc("b", "status update", json!({"channel": "c2"})),
+        e.doc("c", "status update", json!({"channel": "c3"})),
+    ];
+    e.store.upsert(docs).await.unwrap();
+    let two = SearchFilter::default().any_of("channel", vec!["c1".into(), "c3".into()]);
+    let mut keys = e.search("status update", two.clone(), SearchMode::Hybrid).await;
+    keys.sort();
+    assert_eq!(keys, ["a", "c"]);
+    assert_eq!(e.store.count(&two).await.unwrap(), 2);
+    let none = SearchFilter::default().any_of("channel", vec![]);
+    assert!(e.search("status update", none.clone(), SearchMode::Hybrid).await.is_empty());
+    assert_eq!(e.store.count(&none).await.unwrap(), 0);
+    assert!(e.store.scroll(&none, 10).await.unwrap().is_empty());
+}

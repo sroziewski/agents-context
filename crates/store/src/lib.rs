@@ -86,6 +86,8 @@ pub struct SearchFilter {
     pub equals: Vec<(String, String)>,
     pub flags: Vec<(String, bool)>,
     pub ints: Vec<(String, i64)>,
+    /// `field` equals any of the values. An empty list matches nothing.
+    pub any: Vec<(String, Vec<String>)>,
     pub ts_from: Option<i64>,
     pub ts_to: Option<i64>,
 }
@@ -94,6 +96,17 @@ impl SearchFilter {
     pub fn eq(mut self, field: impl Into<String>, value: impl Into<String>) -> Self {
         self.equals.push((field.into(), value.into()));
         self
+    }
+
+    pub fn any_of(mut self, field: impl Into<String>, values: Vec<String>) -> Self {
+        self.any.push((field.into(), values));
+        self
+    }
+
+    /// True when some `any_of` list is empty, i.e. the filter can match nothing; callers skip
+    /// the query instead of relying on how Qdrant treats an empty keyword list.
+    pub fn matches_nothing(&self) -> bool {
+        self.any.iter().any(|(_, v)| v.is_empty())
     }
 
     pub fn int(mut self, field: impl Into<String>, value: i64) -> Self {
@@ -119,6 +132,7 @@ impl SearchFilter {
             .map(|(field, value)| Condition::matches(field.clone(), value.clone()))
             .chain(self.flags.iter().map(|(field, value)| Condition::matches(field.clone(), *value)))
             .chain(self.ints.iter().map(|(field, value)| Condition::matches(field.clone(), *value)))
+            .chain(self.any.iter().map(|(field, values)| Condition::matches(field.clone(), values.clone())))
             .collect();
         if self.ts_from.is_some() || self.ts_to.is_some() {
             conditions.push(Condition::range(
@@ -268,6 +282,9 @@ impl Store {
         Fut: std::future::Future<Output = Result<()>>,
     {
         const PAGE: u32 = 256;
+        if filter.matches_nothing() {
+            return Ok(());
+        }
         let qfilter = filter.to_qdrant();
         let mut offset: Option<PointId> = None;
         let mut seen: u32 = 0;
@@ -293,6 +310,9 @@ impl Store {
     }
 
     pub async fn count(&self, filter: &SearchFilter) -> Result<u64> {
+        if filter.matches_nothing() {
+            return Ok(0);
+        }
         let mut req = CountPointsBuilder::new(&self.collection).exact(true);
         if let Some(f) = filter.to_qdrant() {
             req = req.filter(f);
@@ -308,6 +328,9 @@ impl Store {
         mode: SearchMode,
     ) -> Result<Vec<Hit>> {
         self.check_dim(query)?;
+        if filter.matches_nothing() {
+            return Ok(Vec::new());
+        }
         let filter = filter.to_qdrant();
         let dense = VectorInput::new_dense(query.dense.clone());
         let sparse = VectorInput::new_sparse(query.sparse.indices().to_vec(), query.sparse.values().to_vec());

@@ -24,6 +24,13 @@ pub struct Config {
     pub redact_file: PathBuf,
     /// Local working data (state DB, summarizer dir, pending memory suggestions).
     pub data_dir: PathBuf,
+    /// The Teams app's store, read-only; Teams indexing is skipped while it does not exist.
+    pub teams_db: PathBuf,
+    /// The Teams app's who-is-who file (groups, roles, VIPs).
+    pub teams_people: PathBuf,
+    pub teams_collection: String,
+    /// Project → Teams groups whose channels rank higher when searching from that project.
+    pub teams_projects: PathBuf,
 }
 
 impl Config {
@@ -55,6 +62,10 @@ impl Config {
             summarizer_dir: data.join("summarizer"),
             redact_file: path("CTX_REDACT_FILE", Self::config_dir().join("redact.txt")),
             data_dir: data,
+            teams_db: path("CTX_TEAMS_DB", PathBuf::from(r"D:\dev\my\teams\data\teams.db")),
+            teams_people: path("CTX_TEAMS_PEOPLE", PathBuf::from(r"D:\dev\my\teams\people.json")),
+            teams_collection: get("CTX_TEAMS_COLLECTION").unwrap_or_else(|| "teams".into()),
+            teams_projects: path("CTX_TEAMS_PROJECTS", Self::config_dir().join("teams-projects.json")),
         }
     }
 }

@@ -92,12 +92,12 @@ fn text_of(r: &CallToolResult) -> String {
 }
 
 #[tokio::test]
-async fn lists_the_four_tools_with_schemas_and_instructions() {
+async fn lists_the_tools_with_schemas_and_instructions() {
     let e = env().await;
     let tools = e.client.list_all_tools().await.unwrap();
     let mut names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
-    assert_eq!(names, ["get_session", "list_projects", "list_sessions", "search_sessions"]);
+    assert_eq!(names, ["get_session", "get_teams_thread", "list_projects", "list_sessions", "search_sessions", "search_teams"]);
     let search = tools.iter().find(|t| t.name == "search_sessions").unwrap();
     let props = search.input_schema.get("properties").unwrap();
     assert!(props.get("query").is_some() && props.get("scope").is_some());

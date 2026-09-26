@@ -5,11 +5,13 @@ pub mod chunk;
 pub mod indexer;
 pub mod scrub;
 pub mod state;
+pub mod summary;
 pub mod tokens;
 
 pub use chunk::{CHUNKER_VERSION, ChunkConfig};
 pub use indexer::{IndexConfig, IndexError, Indexer, Progress, Report};
 pub use state::State;
+pub use summary::{SummaryConfig, SummaryReport, Summarizer, summarize_pending};
 pub use tokens::{HfTokenizer, TokenCounter, WordCounter};
 
 /// Payload fields the sessions collection indexes. `project` is the tenant key: every session

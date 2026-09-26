@@ -10,7 +10,7 @@ use crate::chunk::{Chunk, ChunkConfig, chunk_session};
 
 /// Upper bound when reading a session's stored chunks; the largest real session has ~1,300.
 const MAX_SESSION_CHUNKS: u32 = 20_000;
-use crate::state::State;
+use crate::state::{Record, State};
 use crate::tokens::TokenCounter;
 
 #[derive(Debug, Clone)]
@@ -69,7 +69,12 @@ impl Indexer<'_> {
     /// no longer exist. Returns `(chunks, redactions)`.
     pub async fn index_session(&mut self, s: &Session) -> Result<(usize, usize), IndexError> {
         let (chunks, stats) = chunk_session(s, self.counter, &self.config.chunk);
-        let session = SearchFilter::default().eq("source", s.source.as_str()).eq("session_id", s.id.clone());
+        // Turn chunks only: the session's summary point is owned by the summary pass, and pruning
+        // it here would delete it on every re-index of a growing session.
+        let session = SearchFilter::default()
+            .eq("source", s.source.as_str())
+            .eq("session_id", s.id.clone())
+            .eq("kind", "turn");
 
         // An active session grows by a turn at a time; re-embedding all of it on every sync made a
         // re-run of one long session take minutes. Chunks whose id and text are already stored
@@ -121,7 +126,8 @@ impl Indexer<'_> {
                 Ok(s) => s,
                 Err(SourceError::Empty(_)) => {
                     // Remember it so an idle empty session isn't re-read on every sync.
-                    self.state.record(source, &r.id, &r.fingerprint, "", 0, 0, now_ms)?;
+                    let empty = Record { source, session_id: &r.id, fingerprint: &r.fingerprint, ..Default::default() };
+                    self.state.record(&empty, now_ms)?;
                     report.empty += 1;
                     continue;
                 }
@@ -133,7 +139,17 @@ impl Indexer<'_> {
                 }
             };
             let (chunks, redactions) = self.index_session(&session).await?;
-            self.state.record(source, &r.id, &r.fingerprint, &session.project, chunks, redactions, now_ms)?;
+            let record = Record {
+                source,
+                session_id: &r.id,
+                fingerprint: &r.fingerprint,
+                project: &session.project,
+                chunks,
+                redactions,
+                turns: session.turns.len(),
+                subagent: session.is_subagent(),
+            };
+            self.state.record(&record, now_ms)?;
             progress(Progress::Indexed { id: &r.id, chunks });
             report.indexed += 1;
             report.chunks += chunks;

@@ -6,6 +6,7 @@ pub mod hook;
 pub mod mcp;
 pub mod queue;
 pub mod search;
+pub mod summarizer;
 
 use embed::Embedder;
 use ingest::{IndexConfig, Indexer, Progress, Report, State, TokenCounter};
@@ -75,15 +76,20 @@ pub fn format_report(r: &Report, elapsed: std::time::Duration) -> String {
 }
 
 /// One index run inside the daemon, embedding in-process through the shared model.
+///
+/// With a summarizer, each run then summarises sessions that are new or have grown, within the
+/// summary budget; the rest wait for the next run.
 pub fn daemon_runner(
     cfg: config::Config,
     store: std::sync::Arc<Store>,
     counter: std::sync::Arc<dyn TokenCounter + Send + Sync>,
     embedder: embed_server::SharedEmbedder,
     model: String,
+    summarizer: Option<std::sync::Arc<dyn ingest::Summarizer>>,
 ) -> queue::Runner {
     std::sync::Arc::new(move |target: queue::Target| {
         let (cfg, store, counter, mut embedder, model) = (cfg.clone(), store.clone(), counter.clone(), embedder.clone(), model.clone());
+        let summarizer = summarizer.clone();
         Box::pin(async move {
             let handle = tokio::runtime::Handle::current();
             // The indexer embeds synchronously; run it on a blocking thread so HTTP handlers
@@ -94,11 +100,19 @@ pub fn daemon_runner(
                     let refs = discover(&cfg, target.sources())?;
                     let state = State::open(&cfg.state_path)?;
                     let report = run_index(&store, &mut embedder, &model, counter.as_ref(), &state, &refs, |_| {}).await?;
-                    let line = format_report(&report, t.elapsed());
-                    eprintln!("[index {target:?}] {line}");
+                    let mut line = format_report(&report, t.elapsed());
                     for (id, error) in &report.failed {
                         eprintln!("[index {target:?}]   FAILED {id}: {error}");
                     }
+                    if let Some(s) = summarizer {
+                        let now = jiff::Timestamp::now().as_millisecond();
+                        let r = ingest::summarize_pending(&store, &mut embedder, s.as_ref(), &state, &ingest::SummaryConfig::default(), now).await?;
+                        line.push_str(&format!(" · summaries {} written, {} failed, {} deferred", r.written, r.failed.len(), r.deferred));
+                        for (id, error) in &r.failed {
+                            eprintln!("[summary]   FAILED {id}: {error}");
+                        }
+                    }
+                    eprintln!("[index {target:?}] {line}");
                     Ok(line)
                 })
             })

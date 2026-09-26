@@ -9,7 +9,7 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::search::{Context, Query, Scope, format_hits, format_session, format_sessions, parse_date};
+use crate::search::{Context, Query, Scope, format_results, format_session, format_sessions, parse_date};
 
 /// Largest `get_session` answer: ~10k tokens, enough for a long session's gist.
 const MAX_SESSION_CHARS: usize = 40_000;
@@ -74,8 +74,9 @@ impl ContextServer {
         }
     }
 
-    /// Semantic + keyword search over past Claude Code and OpenCode sessions. Defaults to the
-    /// current project only; pass scope "all" or a project path to look elsewhere.
+    /// Semantic + keyword search over past Claude Code and OpenCode sessions: matching session
+    /// summaries first, then matching turns. Defaults to the current project only; pass scope
+    /// "all" or a project path to look elsewhere.
     #[tool(name = "search_sessions")]
     pub async fn search_sessions(&self, Parameters(a): Parameters<SearchArgs>) -> Result<String, String> {
         if a.query.trim().is_empty() {
@@ -95,8 +96,8 @@ impl ContextServer {
             limit: u64::from(a.limit.unwrap_or(6).clamp(1, 20)),
             include_subagents: a.include_subagents.unwrap_or(false),
         };
-        let hits = self.ctx.search(&q).await.map_err(|e| e.to_string())?;
-        Ok(format_hits(&hits))
+        let results = self.ctx.search(&q).await.map_err(|e| e.to_string())?;
+        Ok(format_results(&results))
     }
 
     /// Full text of one indexed session, in order. Use after search_sessions to read around a hit.

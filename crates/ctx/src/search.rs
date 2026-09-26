@@ -40,8 +40,18 @@ pub struct SessionSummary {
     pub ts: i64,
 }
 
+/// Search results: matching session summaries (the gist) and matching turns (the detail).
+#[derive(Debug, Clone, Default)]
+pub struct Results {
+    pub summaries: Vec<Hit>,
+    pub turns: Vec<Hit>,
+}
+
+/// Summaries shown above the turns; a few are enough to orient, the turns carry the detail.
+const MAX_SUMMARIES: u64 = 3;
+
 impl Context {
-    pub async fn search(&self, q: &Query) -> anyhow::Result<Vec<Hit>> {
+    pub async fn search(&self, q: &Query) -> anyhow::Result<Results> {
         let embedder = self.embedder.clone();
         let text = q.text.clone();
         // Embedding blocks (HTTP to the daemon or a local model); keep it off async workers.
@@ -49,14 +59,21 @@ impl Context {
             embedder.lock().unwrap_or_else(|p| p.into_inner()).embed_one(&text)
         })
         .await??;
-        let mut filter = scope_filter(&q.scope).between(q.since, q.until);
-        if let Some(source) = &q.source {
-            filter = filter.eq("source", source.clone());
-        }
-        if !q.include_subagents {
-            filter = filter.flag("subagent", false);
-        }
-        Ok(self.store.search(&query, &filter, q.limit, SearchMode::Hybrid).await?)
+        let filter_for = |kind: &str| {
+            let mut f = scope_filter(&q.scope, kind).between(q.since, q.until);
+            if let Some(source) = &q.source {
+                f = f.eq("source", source.clone());
+            }
+            if !q.include_subagents {
+                f = f.flag("subagent", false);
+            }
+            f
+        };
+        let (summary_filter, turn_filter) = (filter_for("summary"), filter_for("turn"));
+        let summaries = self.store.search(&query, &summary_filter, MAX_SUMMARIES.min(q.limit), SearchMode::Hybrid);
+        let turns = self.store.search(&query, &turn_filter, q.limit, SearchMode::Hybrid);
+        let (summaries, turns) = tokio::try_join!(summaries, turns)?;
+        Ok(Results { summaries, turns })
     }
 
     /// All chunks of one session in conversation order. A session id is explicit, so it is not
@@ -69,7 +86,7 @@ impl Context {
 
     /// Sessions newest first, one entry per session (its first chunk).
     pub async fn sessions(&self, scope: &Scope, limit: usize) -> anyhow::Result<Vec<SessionSummary>> {
-        let filter = scope_filter(scope).int("turn_index", 0).int("chunk_index", 0);
+        let filter = scope_filter(scope, "turn").int("turn_index", 0).int("chunk_index", 0);
         let mut out: Vec<SessionSummary> = self
             .store
             .scroll(&filter, 5000)
@@ -89,8 +106,8 @@ impl Context {
     }
 }
 
-fn scope_filter(scope: &Scope) -> SearchFilter {
-    let f = SearchFilter::default().eq("kind", "turn");
+fn scope_filter(scope: &Scope, kind: &str) -> SearchFilter {
+    let f = SearchFilter::default().eq("kind", kind);
     match scope {
         Scope::Project(p) => f.eq("project", p.clone()),
         Scope::All => f,
@@ -111,6 +128,26 @@ pub fn parse_date(s: &str, end_of_day: bool) -> anyhow::Result<i64> {
     let date: jiff::civil::Date = s.trim().parse().map_err(|_| anyhow::anyhow!("invalid date {s:?}, expected YYYY-MM-DD"))?;
     let start = date.to_zoned(jiff::tz::TimeZone::system())?.timestamp().as_millisecond();
     Ok(if end_of_day { start + 86_400_000 - 1 } else { start })
+}
+
+/// Summaries first under their own heading, then turns. Without summaries the output is just
+/// the numbered turns.
+pub fn format_results(r: &Results) -> String {
+    if r.summaries.is_empty() {
+        return format_hits(&r.turns);
+    }
+    let summaries = r
+        .summaries
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let p = &h.payload;
+            format!("[S{}] {} · {} · session {}\n{}", i + 1, string(p, "source"), string(p, "project"), string(p, "session_id"), string(p, "text").trim())
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let turns = if r.turns.is_empty() { "No matching turns.".to_owned() } else { format_hits(&r.turns) };
+    format!("## Session summaries (machine-written; verify against the turns)\n\n{summaries}\n\n## Matching turns\n\n{turns}")
 }
 
 pub fn format_hits(hits: &[Hit]) -> String {
@@ -143,7 +180,12 @@ pub fn format_session(hits: &[Hit], max_chars: usize) -> String {
     }
     let mut out = String::new();
     for (i, h) in hits.iter().enumerate() {
-        let piece = format!("--- turn {} ---\n{}\n\n", int(&h.payload, "turn_index") + 1, string(&h.payload, "text").trim());
+        let label = if string(&h.payload, "kind") == "summary" {
+            "summary".to_owned()
+        } else {
+            format!("turn {}", int(&h.payload, "turn_index") + 1)
+        };
+        let piece = format!("--- {label} ---\n{}\n\n", string(&h.payload, "text").trim());
         if out.len() + piece.len() > max_chars {
             out.push_str(&format!("[truncated: {} of {} chunks shown; use search_sessions to find the rest]", i, hits.len()));
             return out;
@@ -211,8 +253,36 @@ mod tests {
     }
 
     #[test]
-    fn scope_filter_always_restricts_to_turn_chunks() {
-        assert_eq!(scope_filter(&Scope::All).equals, [("kind".to_string(), "turn".to_string())]);
-        assert_eq!(scope_filter(&Scope::Project("d:/p".into())).equals.len(), 2);
+    fn scope_filter_restricts_to_one_kind() {
+        assert_eq!(scope_filter(&Scope::All, "turn").equals, [("kind".to_string(), "turn".to_string())]);
+        assert_eq!(scope_filter(&Scope::Project("d:/p".into()), "summary").equals.len(), 2);
+    }
+
+    #[test]
+    fn results_without_summaries_look_like_plain_hits() {
+        let turns = vec![hit(json!({"source": "claude", "project": "d:/p", "session_id": "s1", "turn_index": 0, "text": "t"}))];
+        let r = Results { summaries: vec![], turns: turns.clone() };
+        assert_eq!(format_results(&r), format_hits(&turns));
+    }
+
+    #[test]
+    fn summaries_come_first_under_their_own_heading() {
+        let r = Results {
+            summaries: vec![hit(json!({"source": "claude", "project": "d:/p", "session_id": "s1", "text": "Session summary\n## Goal\n- x"}))],
+            turns: vec![],
+        };
+        let out = format_results(&r);
+        assert!(out.starts_with("## Session summaries (machine-written; verify against the turns)\n\n[S1] claude · d:/p · session s1\nSession summary"), "{out}");
+        assert!(out.ends_with("## Matching turns\n\nNo matching turns."), "{out}");
+    }
+
+    #[test]
+    fn session_text_labels_the_summary() {
+        let hits = vec![
+            hit(json!({"kind": "summary", "turn_index": -1, "text": "gist"})),
+            hit(json!({"kind": "turn", "turn_index": 0, "text": "first"})),
+        ];
+        let out = format_session(&hits, 10_000);
+        assert!(out.starts_with("--- summary ---\ngist\n\n--- turn 1 ---\nfirst"), "{out}");
     }
 }

@@ -13,6 +13,9 @@ fn ctx() -> Command {
 
 #[test]
 fn hook_with_daemon_down_exits_zero_quickly() {
+    // The first launch of a freshly built exe includes the antivirus scan (seconds on Windows);
+    // that is a one-off per build, not hook latency, so it is excluded from the measurement.
+    ctx().arg("--help").output().unwrap();
     let start = Instant::now();
     let out = ctx().args(["hook", "--source", "claude"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));

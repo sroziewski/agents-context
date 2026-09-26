@@ -9,7 +9,7 @@ use ctx::config::Config;
 use ctx::embed_server::{self, RemoteEmbedder, SharedEmbedder};
 use ctx::hook;
 use ctx::queue::{IndexQueue, Target};
-use ctx::search::{Context, Query, Scope, format_hits, format_sessions, parse_date};
+use ctx::search::{Context, Query, Scope, format_results, format_sessions, parse_date};
 use ctx::{Sources, mcp};
 use embed::{Bgem3Embedder, Bgem3Options, Embedder, ModelSource, Provider};
 use ingest::{HfTokenizer, Progress, State};
@@ -117,7 +117,15 @@ async fn main() -> anyhow::Result<()> {
             .await??;
             eprintln!("loaded {model} on {provider:?} in {:.1?}", t.elapsed());
             let shared = SharedEmbedder::new(Box::new(embedder));
-            let runner = ctx::daemon_runner(cfg.clone(), Arc::new(connect_store(&cfg)?), Arc::new(counter), shared.clone(), model.clone());
+            let summarizer: Option<Arc<dyn ingest::Summarizer>> = cfg.summaries.then(|| {
+                Arc::new(ctx::summarizer::ClaudeCli::new(
+                    cfg.claude_exe.clone(),
+                    &cfg.summary_model,
+                    cfg.summarizer_dir.clone(),
+                    Duration::from_secs(180),
+                )) as Arc<dyn ingest::Summarizer>
+            });
+            let runner = ctx::daemon_runner(cfg.clone(), Arc::new(connect_store(&cfg)?), Arc::new(counter), shared.clone(), model.clone(), summarizer);
             let queue = IndexQueue::start(runner, Duration::from_secs(20));
             if !addr.ip().is_loopback() {
                 eprintln!("warning: {addr} is not a loopback address; the daemon has no authentication");
@@ -193,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
                 limit,
                 include_subagents: subagents,
             };
-            println!("{}", format_hits(&ctx.search(&q).await?));
+            println!("{}", format_results(&ctx.search(&q).await?));
             Ok(())
         }
         Command::Sessions { all, limit } => {

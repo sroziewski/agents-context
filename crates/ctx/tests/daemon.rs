@@ -56,7 +56,7 @@ async fn env_with(debounce: Duration) -> Env {
     };
     let store = Arc::new(Store::connect(&qdrant.url, None, "sessions", DIM).unwrap());
     let embedder = SharedEmbedder::new(Box::new(HashEmbedder::new(DIM)));
-    let runner = ctx::daemon_runner(cfg, store.clone(), Arc::new(WordCounter), embedder.clone(), "hash".into());
+    let runner = ctx::daemon_runner(cfg, store.clone(), Arc::new(WordCounter), embedder.clone(), "hash".into(), None);
     let queue = IndexQueue::start(runner, debounce);
     let app = service_router(embedder, "hash", Some(queue));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -172,7 +172,7 @@ async fn unreachable_qdrant_is_reported_and_the_queue_keeps_working() {
     };
     let store = Arc::new(Store::connect("http://127.0.0.1:9", None, "sessions", DIM).unwrap());
     let embedder = SharedEmbedder::new(Box::new(HashEmbedder::new(DIM)));
-    let queue = IndexQueue::start(ctx::daemon_runner(cfg, store, Arc::new(WordCounter), embedder.clone(), "hash".into()), Duration::from_millis(10));
+    let queue = IndexQueue::start(ctx::daemon_runner(cfg, store, Arc::new(WordCounter), embedder.clone(), "hash".into(), None), Duration::from_millis(10));
     for run in 1..=2 {
         queue.request(Target::Claude);
         for _ in 0..500 {

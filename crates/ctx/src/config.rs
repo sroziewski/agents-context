@@ -14,6 +14,12 @@ pub struct Config {
     pub model_dir: PathBuf,
     pub claude_dir: PathBuf,
     pub opencode_db: PathBuf,
+    /// `CTX_SUMMARIES=off` disables session summaries.
+    pub summaries: bool,
+    pub summary_model: String,
+    pub claude_exe: PathBuf,
+    /// Working directory for `claude -p` summarizer runs.
+    pub summarizer_dir: PathBuf,
 }
 
 impl Config {
@@ -39,6 +45,10 @@ impl Config {
             model_dir: path("CTX_MODEL_DIR", PathBuf::from(r"D:\dev\my\agents-context\models\bge-m3-fp32")),
             claude_dir: path("CTX_CLAUDE_DIR", home.join(".claude").join("projects")),
             opencode_db: path("CTX_OPENCODE_DB", home.join(".local/share/opencode/opencode.db")),
+            summaries: !get("CTX_SUMMARIES").is_some_and(|v| v.eq_ignore_ascii_case("off")),
+            summary_model: get("CTX_SUMMARY_MODEL").unwrap_or_else(|| "haiku".into()),
+            claude_exe: path("CTX_CLAUDE_EXE", PathBuf::from("claude")),
+            summarizer_dir: data.join("summarizer"),
         }
     }
 }
@@ -55,6 +65,8 @@ mod tests {
         assert_eq!(c.embed_url, "http://127.0.0.1:7997");
         assert_eq!(c.collection, "sessions");
         assert!(c.qdrant_api_key.is_none());
+        assert!(c.summaries);
+        assert_eq!(c.summary_model, "haiku");
         assert!(c.claude_dir.ends_with(".claude/projects") || c.claude_dir.ends_with(r".claude\projects"));
     }
 
@@ -65,5 +77,11 @@ mod tests {
         assert_eq!(c.qdrant_url, "http://q:1");
         assert!(c.qdrant_api_key.is_none());
         assert_eq!(c.state_path, PathBuf::from("x.db"));
+    }
+
+    #[test]
+    fn summaries_can_be_switched_off() {
+        assert!(!Config::from_env(|k| (k == "CTX_SUMMARIES").then(|| "OFF".to_owned())).summaries);
+        assert!(Config::from_env(|k| (k == "CTX_SUMMARIES").then(|| "on".to_owned())).summaries);
     }
 }

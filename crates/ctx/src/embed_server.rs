@@ -10,6 +10,8 @@ use axum::{Json, Router};
 use embed::{Embedder, Embedding, SparseVector};
 use serde::{Deserialize, Serialize};
 
+use crate::queue::{IndexQueue, Status, Target};
+
 /// Upper bound per request so one client cannot pin the GPU for minutes; the indexer sends
 /// small token-capped batches anyway.
 pub const MAX_TEXTS: usize = 64;
@@ -53,19 +55,89 @@ pub struct EmbedResponse {
     pub embeddings: Vec<WireEmbedding>,
 }
 
+/// Embedder shared by the HTTP handlers and the background indexer. The lock is taken per
+/// `embed` call, so a search query waits for at most one indexing batch, not a whole run.
+#[derive(Clone)]
+pub struct SharedEmbedder(pub Arc<Mutex<Box<dyn Embedder>>>);
+
+impl SharedEmbedder {
+    pub fn new(e: Box<dyn Embedder>) -> Self {
+        Self(Arc::new(Mutex::new(e)))
+    }
+}
+
+impl Embedder for SharedEmbedder {
+    fn dim(&self) -> usize {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).dim()
+    }
+
+    fn embed(&mut self, texts: &[&str]) -> embed::Result<Vec<Embedding>> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).embed(texts)
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
-    embedder: Arc<Mutex<Box<dyn Embedder>>>,
+    embedder: SharedEmbedder,
     health: Health,
+    queue: Option<IndexQueue>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IndexRequest {
+    pub source: Target,
 }
 
 pub fn router(embedder: Box<dyn Embedder>, model: &str) -> Router {
+    service_router(SharedEmbedder::new(embedder), model, None)
+}
+
+/// Full daemon API. `/index` exists only when an index queue is attached.
+pub fn service_router(embedder: SharedEmbedder, model: &str, queue: Option<IndexQueue>) -> Router {
     let health = Health { model: model.to_owned(), dim: embedder.dim() };
-    let state = AppState { embedder: Arc::new(Mutex::new(embedder)), health };
+    let state = AppState { embedder, health, queue };
     Router::new()
         .route("/health", get(|State(s): State<AppState>| async move { Json(s.health) }))
         .route("/embed", post(embed))
+        .route("/index", post(request_index))
+        .route("/index/status", get(index_status))
+        .layer(axum::middleware::from_fn(loopback_host_only))
         .with_state(state)
+}
+
+/// Rejects requests whose `Host` is not a loopback name. Binding to 127.0.0.1 keeps other
+/// machines out, but a web page can still reach it through DNS rebinding (a hostname that
+/// resolves to 127.0.0.1); browsers then send that hostname, which this refuses.
+async fn loopback_host_only(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let host = req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+    if is_loopback_host(host) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "only loopback clients are served").into_response()
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    };
+    matches!(name.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
+}
+
+async fn request_index(State(s): State<AppState>, Json(req): Json<IndexRequest>) -> StatusCode {
+    match s.queue {
+        Some(q) => {
+            q.request(req.source);
+            StatusCode::ACCEPTED
+        }
+        None => StatusCode::NOT_FOUND,
+    }
+}
+
+async fn index_status(State(s): State<AppState>) -> Result<Json<Status>, StatusCode> {
+    s.queue.map(|q| Json(q.status())).ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn embed(
@@ -75,12 +147,11 @@ async fn embed(
     if req.texts.len() > MAX_TEXTS {
         return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("at most {MAX_TEXTS} texts per request")));
     }
-    let embedder = s.embedder.clone();
+    let mut embedder = s.embedder.clone();
     // Inference is CPU/GPU-bound and synchronous; keep it off the async workers.
     let out = tokio::task::spawn_blocking(move || {
         let refs: Vec<&str> = req.texts.iter().map(String::as_str).collect();
-        let mut guard = embedder.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.embed(&refs)
+        embedder.embed(&refs)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -269,6 +340,29 @@ mod tests {
         let l = lazy.clone();
         let up = blocking(move || l.lock().unwrap().embed(&["x"]).map(|v| v.len())).await;
         assert_eq!(up.unwrap(), 1, "reconnects once the daemon is up");
+    }
+
+    #[test]
+    fn loopback_host_names_are_recognised() {
+        for ok in ["127.0.0.1:7997", "localhost:7997", "LOCALHOST", "[::1]:7997", "127.0.0.1"] {
+            assert!(is_loopback_host(ok), "{ok}");
+        }
+        for bad in ["evil.example:7997", "127.0.0.1.evil.example", "", "10.0.0.5:7997", "[::2]:1"] {
+            assert!(!is_loopback_host(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebinding_host_header_is_forbidden() {
+        let base = spawn("m").await;
+        let status = blocking(move || {
+            match ureq::get(&format!("{base}/health")).header("Host", "attacker.example:7997").call() {
+                Err(ureq::Error::StatusCode(code)) => code,
+                other => panic!("expected 403, got {other:?}"),
+            }
+        })
+        .await;
+        assert_eq!(status, 403);
     }
 
     #[test]

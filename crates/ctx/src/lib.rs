@@ -2,7 +2,9 @@
 
 pub mod config;
 pub mod embed_server;
+pub mod hook;
 pub mod mcp;
+pub mod queue;
 pub mod search;
 
 use embed::Embedder;
@@ -56,4 +58,51 @@ pub async fn run_index(
     let mut indexer = Indexer { store, embedder, counter, state, config: IndexConfig::default() };
     let now = jiff::Timestamp::now().as_millisecond();
     Ok(indexer.sync(refs, load, |p| on_progress(p), now).await?)
+}
+
+pub fn format_report(r: &Report, elapsed: std::time::Duration) -> String {
+    format!(
+        "scanned {} · indexed {} · unchanged {} · empty {} · failed {} · {} chunks · {} secrets redacted · {:.1?}",
+        r.scanned,
+        r.indexed,
+        r.unchanged,
+        r.empty,
+        r.failed.len(),
+        r.chunks,
+        r.redactions,
+        elapsed
+    )
+}
+
+/// One index run inside the daemon, embedding in-process through the shared model.
+pub fn daemon_runner(
+    cfg: config::Config,
+    store: std::sync::Arc<Store>,
+    counter: std::sync::Arc<dyn TokenCounter + Send + Sync>,
+    embedder: embed_server::SharedEmbedder,
+    model: String,
+) -> queue::Runner {
+    std::sync::Arc::new(move |target: queue::Target| {
+        let (cfg, store, counter, mut embedder, model) = (cfg.clone(), store.clone(), counter.clone(), embedder.clone(), model.clone());
+        Box::pin(async move {
+            let handle = tokio::runtime::Handle::current();
+            // The indexer embeds synchronously; run it on a blocking thread so HTTP handlers
+            // (search queries) keep being served in between batches.
+            tokio::task::spawn_blocking(move || {
+                handle.block_on(async move {
+                    let t = std::time::Instant::now();
+                    let refs = discover(&cfg, target.sources())?;
+                    let state = State::open(&cfg.state_path)?;
+                    let report = run_index(&store, &mut embedder, &model, counter.as_ref(), &state, &refs, |_| {}).await?;
+                    let line = format_report(&report, t.elapsed());
+                    eprintln!("[index {target:?}] {line}");
+                    for (id, error) in &report.failed {
+                        eprintln!("[index {target:?}]   FAILED {id}: {error}");
+                    }
+                    Ok(line)
+                })
+            })
+            .await?
+        })
+    })
 }

@@ -1,12 +1,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand, ValueEnum};
 use ctx::config::Config;
-use ctx::embed_server::{self, RemoteEmbedder};
+use ctx::embed_server::{self, RemoteEmbedder, SharedEmbedder};
+use ctx::hook;
+use ctx::queue::{IndexQueue, Target};
 use ctx::search::{Context, Query, Scope, format_hits, format_sessions, parse_date};
 use ctx::{Sources, mcp};
 use embed::{Bgem3Embedder, Bgem3Options, Embedder, ModelSource, Provider};
@@ -31,11 +33,24 @@ enum Command {
         /// Model directory; defaults to CTX_MODEL_DIR.
         #[arg(long)]
         model_dir: Option<PathBuf>,
+        /// Minutes between background index runs of all sources; 0 disables them. Hooks
+        /// trigger runs on top of this.
+        #[arg(long, default_value_t = 15)]
+        index_every: u64,
+    },
+    /// Called by agent hooks: asks the daemon to re-index and exits 0 immediately, always.
+    Hook {
+        #[arg(long, value_enum, default_value_t = SourceArg::All)]
+        source: SourceArg,
     },
     /// Index new or changed sessions (incremental; safe to run any time).
     Index {
         #[arg(long, value_enum, default_value_t = SourceArg::All)]
         source: SourceArg,
+        /// Index in this process even when the daemon is running (by default the daemon does it,
+        /// so two runs never race over the same state).
+        #[arg(long)]
+        local: bool,
     },
     /// Search sessions from the terminal.
     Search {
@@ -77,12 +92,20 @@ enum SourceArg {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // Claude Code treats exit code 2 (clap's usage error) from a Stop/PreCompact hook as a
+        // blocking error and forces the turn to continue; a typo or stale binary must not do that.
+        Err(e) if std::env::args().nth(1).as_deref() == Some("hook") && e.use_stderr() => return Ok(()),
+        Err(e) => e.exit(),
+    };
     let cfg = Config::load();
     match cli.command {
-        Command::EmbedServer { addr, provider, model_dir } => {
+        Command::EmbedServer { addr, provider, model_dir, index_every } => {
             let dir = model_dir.unwrap_or_else(|| cfg.model_dir.clone());
             let model = model_name(&dir);
+            // Before the slow GPU load, and from the same directory as the model.
+            let counter = HfTokenizer::from_file(&dir.join("tokenizer.json")).map_err(anyhow::Error::msg)?;
             let t = Instant::now();
             let embedder = tokio::task::spawn_blocking(move || {
                 Bgem3Embedder::new(Bgem3Options {
@@ -93,9 +116,46 @@ async fn main() -> anyhow::Result<()> {
             })
             .await??;
             eprintln!("loaded {model} on {provider:?} in {:.1?}", t.elapsed());
-            embed_server::serve(embed_server::router(Box::new(embedder), &model), addr).await
+            let shared = SharedEmbedder::new(Box::new(embedder));
+            let runner = ctx::daemon_runner(cfg.clone(), Arc::new(connect_store(&cfg)?), Arc::new(counter), shared.clone(), model.clone());
+            let queue = IndexQueue::start(runner, Duration::from_secs(20));
+            if !addr.ip().is_loopback() {
+                eprintln!("warning: {addr} is not a loopback address; the daemon has no authentication");
+            }
+            // Catch up on whatever changed while the daemon was down (reboot, crash).
+            queue.request(Target::All);
+            if index_every > 0 {
+                queue.schedule(Duration::from_secs(index_every * 60));
+            }
+            embed_server::serve(embed_server::service_router(shared, &model, Some(queue)), addr).await
         }
-        Command::Index { source } => {
+        Command::Hook { source } => {
+            hook::drain_stdin();
+            let target = to_target(source);
+            let url = cfg.embed_url.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                hook::notify(&url, target, Duration::from_secs(2), |k| std::env::var(k).ok())
+            })
+            .await;
+            Ok(())
+        }
+        Command::Index { source, local } => {
+            if !local {
+                let url = cfg.embed_url.clone();
+                let target = to_target(source);
+                let delegated =
+                    tokio::task::spawn_blocking(move || hook::delegate_index(&url, target, Duration::from_secs(3600))).await??;
+                if let Some(status) = delegated {
+                    return match (status.last_report, status.last_error) {
+                        (_, Some(err)) => Err(anyhow::anyhow!("daemon index run failed: {err}")),
+                        (Some(report), None) => {
+                            println!("{report}  (run by the daemon)");
+                            Ok(())
+                        }
+                        (None, None) => Ok(()),
+                    };
+                }
+            }
             let which = match source {
                 SourceArg::Claude => Sources::Claude,
                 SourceArg::Opencode => Sources::OpenCode,
@@ -119,17 +179,7 @@ async fn main() -> anyhow::Result<()> {
                     .await
                 })
             })?;
-            println!(
-                "scanned {} · indexed {} · unchanged {} · empty {} · failed {} · {} chunks · {} secrets redacted · {:.1?}",
-                report.scanned,
-                report.indexed,
-                report.unchanged,
-                report.empty,
-                report.failed.len(),
-                report.chunks,
-                report.redactions,
-                t.elapsed()
-            );
+            println!("{}", ctx::format_report(&report, t.elapsed()));
             Ok(())
         }
         Command::Search { query, all, project, since, until, limit, subagents } => {
@@ -169,6 +219,14 @@ async fn main() -> anyhow::Result<()> {
             let server = mcp::ContextServer::new(ctx, mcp::current_project(), cfg.state_path.clone());
             mcp::serve_stdio(server).await
         }
+    }
+}
+
+fn to_target(source: SourceArg) -> Target {
+    match source {
+        SourceArg::Claude => Target::Claude,
+        SourceArg::Opencode => Target::Opencode,
+        SourceArg::All => Target::All,
     }
 }
 

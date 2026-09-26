@@ -23,9 +23,11 @@ ureq = { version = "3", features = ["json"] }
 uuid = "1"
 
 [dev-dependencies]
+ingest = { path = "../ingest" }
 rmcp = { version = "3.4", features = ["client", "transport-async-rw"] }
 tempfile = "3.27.0"
 testkit = { path = "../testkit" }
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [features]

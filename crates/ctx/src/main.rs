@@ -79,8 +79,42 @@ enum Command {
     },
     /// Per-project index statistics.
     Stats,
+    /// Manage redaction of secrets in the index.
+    Redact {
+        #[command(subcommand)]
+        action: RedactAction,
+    },
+    /// Propose Claude Code memories from this project's session summaries, for review.
+    Memories {
+        #[command(subcommand)]
+        action: MemoriesAction,
+        /// Project directory (default: the current one).
+        #[arg(long, global = true)]
+        project: Option<String>,
+    },
     /// MCP server over stdio (register with `claude mcp add` / OpenCode config).
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum RedactAction {
+    /// Add a secret to the redaction list, read from stdin (never an argument, which would land
+    /// in shell history), then redact it everywhere in the index.
+    Add,
+    /// Apply the current rules and list to everything already indexed.
+    Rescan,
+}
+
+#[derive(Subcommand)]
+enum MemoriesAction {
+    /// Ask for new suggestions (replaces the pending list); nothing is written to memory.
+    Suggest,
+    /// Show pending suggestions.
+    List,
+    /// Write the chosen suggestions (numbers from `list`) as memory files.
+    Accept { numbers: Vec<usize> },
+    /// Drop all pending suggestions.
+    Discard,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -175,12 +209,13 @@ async fn main() -> anyhow::Result<()> {
             let counter = HfTokenizer::from_file(&cfg.model_dir.join("tokenizer.json")).map_err(anyhow::Error::msg)?;
             let state = State::open(&cfg.state_path)?;
             let store = connect_store(&cfg)?;
+            let redactor = ingest::Redactor::from_file(&cfg.redact_file)?;
             let t = Instant::now();
             // Embedding over blocking HTTP inside the async indexer is fine for a CLI run.
             let report = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     let mut remote = remote;
-                    ctx::run_index(&store, &mut remote, &model, &counter, &state, &refs, |p| match p {
+                    ctx::run_index(&store, &mut remote, &model, &counter, &state, &refs, &redactor, |p| match p {
                         Progress::Indexed { id, chunks } => eprintln!("  indexed {id} ({chunks} chunks)"),
                         Progress::Failed { id, error } => eprintln!("  FAILED {id}: {error}"),
                     })
@@ -219,6 +254,92 @@ async fn main() -> anyhow::Result<()> {
                 chunks += c;
             }
             println!("{:<50} {sessions:>5} sessions {chunks:>7} chunks", "TOTAL");
+            Ok(())
+        }
+        Command::Redact { action } => {
+            if let RedactAction::Add = action {
+                use std::io::{IsTerminal, Read};
+                if std::io::stdin().is_terminal() {
+                    eprintln!("type the secret, then Enter, Ctrl+Z, Enter (the console shows what you type; it is not logged):");
+                }
+                let mut input = String::new();
+                std::io::stdin().read_to_string(&mut input)?;
+                let entries = ctx::redact::append_literal(&cfg.redact_file, input.trim())?;
+                println!("redaction list has {entries} entries ({})", cfg.redact_file.display());
+            }
+            // 1. Re-read every session from source with the current rules; this also restores
+            //    text an older, stricter rule redacted. It runs as a daemon job, which re-reads
+            //    the list at its start, and is waited for, so any run that was already in
+            //    progress with the old list has finished before step 2.
+            let n = State::open(&cfg.state_path)?.force_reread()?;
+            let url = cfg.embed_url.clone();
+            match tokio::task::spawn_blocking(move || hook::delegate_index(&url, Target::All, Duration::from_secs(3600))).await?? {
+                Some(status) => println!("re-read {n} sessions: {}", status.last_report.or(status.last_error).unwrap_or_default()),
+                None => anyhow::bail!("the embedding daemon is not running; start it and run `ctx redact rescan`"),
+            }
+            // 2. Last, apply the rules to everything stored, which covers sessions whose
+            //    transcript is gone and anything an older run wrote in between.
+            let redactor = ingest::Redactor::from_file(&cfg.redact_file)?;
+            let store = connect_store(&cfg)?;
+            let mut embedder = connect_embedder(&cfg).await?;
+            let report = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(ingest::rescan(&store, &mut embedder, &redactor))
+            })?;
+            println!(
+                "checked {} points · rewrote {} · {} secrets redacted",
+                report.checked, report.changed, report.redactions
+            );
+            Ok(())
+        }
+        Command::Memories { action, project } => {
+            let key = match scope(false, project) {
+                Scope::Project(k) => k,
+                Scope::All => unreachable!("scope(false, _) is always a project"),
+            };
+            let pending = ctx::memories::pending_path(&cfg.data_dir, &key);
+            let memory_dir = || {
+                ctx::memories::memory_dir_for(&key, &cfg.claude_dir)
+                    .ok_or_else(|| anyhow::anyhow!("no Claude Code project directory for {key} under {}", cfg.claude_dir.display()))
+            };
+            match action {
+                MemoriesAction::Suggest => {
+                    let existing = memory_dir().map(|d| ctx::memories::existing_memories(&d)).unwrap_or_default();
+                    let summarizer = ctx::summarizer::ClaudeCli::new(cfg.claude_exe.clone(), &cfg.summary_model, cfg.summarizer_dir.clone(), Duration::from_secs(180));
+                    let redactor = ingest::Redactor::from_file(&cfg.redact_file)?;
+                    let store = connect_store(&cfg)?;
+                    let candidates = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(ctx::memories::suggest(&store, &summarizer, &redactor, &key, &existing, Duration::from_secs(180)))
+                    })?;
+                    ctx::memories::save_pending(&pending, &candidates)?;
+                    println!("{}", ctx::memories::format_candidates(&candidates));
+                    if !candidates.is_empty() {
+                        println!("\naccept with: ctx memories accept <numbers>   (nothing is written until then)");
+                    }
+                }
+                MemoriesAction::List => println!("{}", ctx::memories::format_candidates(&ctx::memories::load_pending(&pending))),
+                MemoriesAction::Accept { numbers } => {
+                    let list = ctx::memories::load_pending(&pending);
+                    anyhow::ensure!(!numbers.is_empty(), "give the numbers to accept, e.g. `ctx memories accept 1 3`");
+                    let mut chosen = Vec::new();
+                    for n in &numbers {
+                        chosen.push(list.get(n.wrapping_sub(1)).cloned().ok_or_else(|| anyhow::anyhow!("no suggestion {n} (see `ctx memories list`)"))?);
+                    }
+                    let dir = memory_dir()?;
+                    let written = ctx::memories::accept(&dir, &chosen)?;
+                    for w in &written {
+                        println!("wrote {}", w.display());
+                    }
+                    if written.len() < chosen.len() {
+                        println!("{} skipped: a memory file with that name already exists", chosen.len() - written.len());
+                    }
+                    let rest: Vec<_> = list.into_iter().filter(|c| !chosen.contains(c)).collect();
+                    ctx::memories::save_pending(&pending, &rest)?;
+                }
+                MemoriesAction::Discard => {
+                    let _ = std::fs::remove_file(&pending);
+                    println!("pending suggestions discarded");
+                }
+            }
             Ok(())
         }
         Command::Mcp => {

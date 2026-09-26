@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use store::{Doc, Hit, SearchFilter, Store};
 
 use crate::indexer::IndexError;
-use crate::scrub::scrub;
+use crate::scrub::Redactor;
 use crate::state::State;
 
 /// Condensed transcript budget: ~12k tokens, cheap for a small model and enough for the arc of
@@ -42,6 +42,7 @@ pub struct SummaryConfig {
     /// Consecutive failures before a session is set aside until it grows again.
     pub max_attempts: usize,
     pub max_per_run: usize,
+    pub redactor: Redactor,
 }
 
 impl Default for SummaryConfig {
@@ -53,6 +54,7 @@ impl Default for SummaryConfig {
             call_timeout: Duration::from_secs(60),
             max_attempts: 3,
             max_per_run: 50,
+            redactor: Redactor::default(),
         }
     }
 }
@@ -104,7 +106,7 @@ pub async fn summarize_pending(
                 continue;
             }
         };
-        let (text, _) = scrub(&format!("{}\nSession summary ({} turns)\n{body}", meta.header(), p.turns));
+        let (text, _) = cfg.redactor.scrub(&format!("{}\nSession summary ({} turns)\n{body}", meta.header(), p.turns));
         let embedding = embedder.embed_one(&text)?;
         let doc = Doc {
             id: store::point_id(&p.source, &format!("{}/summary", p.session_id)),

@@ -271,3 +271,15 @@ async fn call_timeout_never_exceeds_the_remaining_budget() {
     let t = clock.0.lock().unwrap()[0];
     assert!(t <= Duration::from_secs(20), "{t:?}");
 }
+
+#[tokio::test]
+async fn listed_secrets_are_redacted_from_summaries() {
+    let e = env().await;
+    e.write("s", &turns(2, ""));
+    e.sync().await;
+    let leaky = Fake::ok(&format!("{BODY}\n- SOCN value is plainsecret1"));
+    let cfg = SummaryConfig { redactor: ingest::Redactor::new(["plainsecret1".to_owned()]), ..Default::default() };
+    e.summarize(&leaky, &cfg).await;
+    let text = e.summaries().await[0].payload["text"].as_str().unwrap().to_owned();
+    assert!(!text.contains("plainsecret1") && text.contains("[REDACTED:listed]"), "{text}");
+}

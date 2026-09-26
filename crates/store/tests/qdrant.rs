@@ -289,3 +289,32 @@ async fn integer_equality_filter_selects_first_chunks() {
     assert_eq!(firsts.len(), 1);
     assert_eq!(firsts[0].payload["key"], "c0");
 }
+
+#[tokio::test]
+async fn scroll_pages_through_more_points_than_one_page() {
+    let mut e = env().await;
+    // Payloads large enough that one unpaged reply of all of them would be several MiB.
+    let big = "x".repeat(3000);
+    let docs: Vec<_> = (0..700).map(|i| e.doc(&format!("p{i}"), &format!("doc {i} {big}"), json!({"n": i}))).collect();
+    for chunk in docs.chunks(100) {
+        e.store.upsert(chunk.to_vec()).await.unwrap();
+    }
+    let all = e.store.scroll(&SearchFilter::default(), 10_000).await.unwrap();
+    assert_eq!(all.len(), 700);
+    let mut ids: Vec<_> = all.iter().map(|h| h.id).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 700, "no duplicates across pages");
+    assert_eq!(e.store.scroll(&SearchFilter::default(), 300).await.unwrap().len(), 300, "limit still applies");
+
+    let mut pages = 0;
+    e.store
+        .scroll_pages(&SearchFilter::default(), 10_000, |p| {
+            assert!(p.len() <= 256);
+            pages += 1;
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+    assert!(pages >= 3, "{pages}");
+}

@@ -235,6 +235,12 @@ impl State {
         Ok(())
     }
 
+    /// Makes the next sync re-read every session from its source, e.g. after redaction rules
+    /// changed. Unchanged chunks keep their vectors, so this costs parsing, not embedding.
+    pub fn force_reread(&self) -> rusqlite::Result<usize> {
+        self.conn.execute("update indexed set fingerprint = ''", [])
+    }
+
     pub fn summary_count(&self) -> rusqlite::Result<usize> {
         self.conn.query_row("select count(*) from summaries", [], |r| r.get::<_, i64>(0)).map(|n| n as usize)
     }
@@ -382,6 +388,15 @@ mod tests {
         s.set_turns("claude", "gone", 4, false).unwrap();
         assert!(s.sessions_missing_turns().unwrap().is_empty());
         assert_eq!(s.pending_summaries(2, 5, 3, 10).unwrap()[0].turns, 4);
+    }
+
+    #[test]
+    fn force_reread_clears_every_fingerprint() {
+        let s = State::in_memory().unwrap();
+        session(&s, "a", 2, false, 1);
+        session(&s, "b", 2, false, 1);
+        assert_eq!(s.force_reread().unwrap(), 2);
+        assert_eq!(s.get("claude", "a").unwrap().unwrap().fingerprint, "");
     }
 
     #[test]

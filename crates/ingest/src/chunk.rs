@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 use sources::{Session, Turn};
 use uuid::Uuid;
 
-use crate::scrub::scrub;
+use crate::scrub::Redactor;
 use crate::tokens::TokenCounter;
 
 /// Bump whenever chunk text or payload layout changes: the indexer re-embeds everything on a
@@ -21,12 +21,13 @@ pub struct ChunkConfig {
     pub overlap_tokens: usize,
     /// Tool-call lines kept per turn; long agentic turns can have hundreds.
     pub max_tools: usize,
+    pub redactor: Redactor,
 }
 
 impl Default for ChunkConfig {
     fn default() -> Self {
         // 512 is bge-m3's configured window; the margin absorbs token merges at segment joins.
-        Self { max_tokens: 480, overlap_tokens: 64, max_tools: 40 }
+        Self { max_tokens: 480, overlap_tokens: 64, max_tools: 40, redactor: Redactor::default() }
     }
 }
 
@@ -46,10 +47,13 @@ pub struct ChunkStats {
 pub fn chunk_session(s: &Session, counter: &dyn TokenCounter, cfg: &ChunkConfig) -> (Vec<Chunk>, ChunkStats) {
     let mut chunks = Vec::new();
     let mut stats = ChunkStats::default();
+    // The title is user text too (OpenCode titles are often the first prompt) and goes into
+    // every chunk header and the payload, so it is redacted like the turns.
+    let title = s.title.as_deref().map(|t| cfg.redactor.scrub(t).0);
     for turn in &s.turns {
-        let (doc, redactions) = scrub(&turn_document(turn, cfg.max_tools));
+        let (doc, redactions) = cfg.redactor.scrub(&turn_document(turn, cfg.max_tools));
         stats.redactions += redactions;
-        let header = header(s, turn);
+        let header = header(title.as_deref(), turn);
         let budget = cfg.max_tokens.saturating_sub(counter.count(&header)).max(16);
         let pieces = pack(split(&doc, budget, counter), budget, cfg.overlap_tokens, counter);
         let total = pieces.len();
@@ -59,7 +63,7 @@ pub fn chunk_session(s: &Session, counter: &dyn TokenCounter, cfg: &ChunkConfig)
             chunks.push(Chunk {
                 id: store::point_id(s.source.as_str(), &format!("{}/{turn_key}/{i}", s.id)),
                 tokens: counter.count(&text),
-                payload: payload(s, turn, i, total, &text),
+                payload: payload(s, title.as_deref(), turn, i, total, &text),
                 text,
             });
         }
@@ -90,17 +94,17 @@ fn turn_document(t: &Turn, max_tools: usize) -> String {
 
 /// Session title and date on every chunk: they carry meaning ("Login bug fix") that a middle
 /// chunk of a long turn would otherwise lack.
-fn header(s: &Session, t: &Turn) -> String {
+fn header(title: Option<&str>, t: &Turn) -> String {
     let date = jiff::Timestamp::from_millisecond(t.ts)
         .map(|ts| ts.strftime("%Y-%m-%d").to_string())
         .unwrap_or_default();
-    match s.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+    match title.map(str::trim).filter(|t| !t.is_empty()) {
         Some(title) => format!("[{title} · {date}]\n"),
         None => format!("[{date}]\n"),
     }
 }
 
-fn payload(s: &Session, t: &Turn, index: usize, total: usize, text: &str) -> Map<String, Value> {
+fn payload(s: &Session, title: Option<&str>, t: &Turn, index: usize, total: usize, text: &str) -> Map<String, Value> {
     let v = json!({
         "kind": "turn",
         "source": s.source.as_str(),
@@ -109,7 +113,7 @@ fn payload(s: &Session, t: &Turn, index: usize, total: usize, text: &str) -> Map
         "session_id": s.id,
         "parent_id": s.parent_id,
         "subagent": s.is_subagent(),
-        "title": s.title,
+        "title": title,
         "branch": s.branch,
         "turn_id": t.id,
         "turn_index": t.index,
@@ -218,7 +222,7 @@ mod tests {
     }
 
     fn cfg(max: usize, overlap: usize) -> ChunkConfig {
-        ChunkConfig { max_tokens: max, overlap_tokens: overlap, max_tools: 3 }
+        ChunkConfig { max_tokens: max, overlap_tokens: overlap, max_tools: 3, ..Default::default() }
     }
 
     #[test]
@@ -311,6 +315,25 @@ mod tests {
         assert!(!chunks[0].text.contains("hunter2"));
         assert!(!chunks[0].payload["text"].as_str().unwrap().contains("hunter2"));
         assert_eq!(stats.redactions, 1);
+    }
+
+    #[test]
+    fn listed_literals_are_redacted_from_chunks() {
+        let t = turn("u1", "the SOCN password is now plainsecret1", "ok");
+        let cfg = ChunkConfig { redactor: Redactor::new(["plainsecret1".to_owned()]), ..Default::default() };
+        let (chunks, stats) = chunk_session(&session(vec![t]), &WordCounter, &cfg);
+        assert!(!chunks[0].text.contains("plainsecret1"), "{}", chunks[0].text);
+        assert!(stats.redactions >= 1);
+    }
+
+    #[test]
+    fn secret_in_the_session_title_is_redacted_in_header_and_payload() {
+        let mut s = session(vec![turn("u1", "q", "a")]);
+        s.title = Some("rotate plainsecret1 today".into());
+        let cfg = ChunkConfig { redactor: Redactor::new(["plainsecret1".to_owned()]), ..Default::default() };
+        let (chunks, _) = chunk_session(&s, &WordCounter, &cfg);
+        assert!(!chunks[0].text.contains("plainsecret1"), "{}", chunks[0].text);
+        assert_eq!(chunks[0].payload["title"], "rotate [REDACTED:listed] today");
     }
 
     #[test]

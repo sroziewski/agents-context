@@ -250,12 +250,46 @@ impl Store {
 
     /// All points matching `filter`, up to `limit`, without vectors; order is unspecified.
     pub async fn scroll(&self, filter: &SearchFilter, limit: u32) -> Result<Vec<Hit>> {
-        let mut req = ScrollPointsBuilder::new(&self.collection).limit(limit).with_payload(true);
-        if let Some(f) = filter.to_qdrant() {
-            req = req.filter(f);
+        let mut out = Vec::new();
+        self.scroll_pages(filter, limit, |page| {
+            out.extend(page);
+            std::future::ready(Ok(()))
+        })
+        .await?;
+        Ok(out)
+    }
+
+    /// Visits up to `limit` matching points page by page. One gRPC reply is capped at 4 MiB by
+    /// default, which a single scroll of a few thousand chunk payloads exceeds, and callers
+    /// that rewrite points should not hold the whole collection in memory either.
+    pub async fn scroll_pages<F, Fut>(&self, filter: &SearchFilter, limit: u32, mut visit: F) -> Result<()>
+    where
+        F: FnMut(Vec<Hit>) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        const PAGE: u32 = 256;
+        let qfilter = filter.to_qdrant();
+        let mut offset: Option<PointId> = None;
+        let mut seen: u32 = 0;
+        while seen < limit {
+            let mut req = ScrollPointsBuilder::new(&self.collection).limit(PAGE.min(limit - seen)).with_payload(true);
+            if let Some(f) = qfilter.clone() {
+                req = req.filter(f);
+            }
+            if let Some(o) = offset.take() {
+                req = req.offset(o);
+            }
+            let resp = self.client.scroll(req).await?;
+            let page = resp.result.into_iter().map(retrieved_to_hit).collect::<Result<Vec<_>>>()?;
+            seen += page.len() as u32;
+            let done = page.is_empty();
+            visit(page).await?;
+            match resp.next_page_offset {
+                Some(next) if !done => offset = Some(next),
+                _ => break,
+            }
         }
-        let points = self.client.scroll(req).await?.result;
-        points.into_iter().map(retrieved_to_hit).collect()
+        Ok(())
     }
 
     pub async fn count(&self, filter: &SearchFilter) -> Result<u64> {

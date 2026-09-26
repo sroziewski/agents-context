@@ -20,6 +20,10 @@ pub struct Config {
     pub claude_exe: PathBuf,
     /// Working directory for `claude -p` summarizer runs.
     pub summarizer_dir: PathBuf,
+    /// Literal secrets to redact everywhere, one per line (see `ctx redact add`).
+    pub redact_file: PathBuf,
+    /// Local working data (state DB, summarizer dir, pending memory suggestions).
+    pub data_dir: PathBuf,
 }
 
 impl Config {
@@ -49,6 +53,8 @@ impl Config {
             summary_model: get("CTX_SUMMARY_MODEL").unwrap_or_else(|| "haiku".into()),
             claude_exe: path("CTX_CLAUDE_EXE", PathBuf::from("claude")),
             summarizer_dir: data.join("summarizer"),
+            redact_file: path("CTX_REDACT_FILE", Self::config_dir().join("redact.txt")),
+            data_dir: data,
         }
     }
 }

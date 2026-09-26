@@ -57,7 +57,7 @@ async fn env() -> Env {
     let state = State::open(&state_path).unwrap();
     let refs = sources::claude::discover(&projects).unwrap();
     let mut embedder = HashEmbedder::new(DIM);
-    let report = ctx::run_index(&store, &mut embedder, "hash", &WordCounter, &state, &refs, |_| {}).await.unwrap();
+    let report = ctx::run_index(&store, &mut embedder, "hash", &WordCounter, &state, &refs, &ingest::Redactor::default(), |_| {}).await.unwrap();
     assert_eq!(report.indexed, 3);
 
     let context = Context {

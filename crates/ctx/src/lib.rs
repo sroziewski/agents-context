@@ -4,7 +4,9 @@ pub mod config;
 pub mod embed_server;
 pub mod hook;
 pub mod mcp;
+pub mod memories;
 pub mod queue;
+pub mod redact;
 pub mod search;
 pub mod summarizer;
 
@@ -50,13 +52,16 @@ pub async fn run_index(
     counter: &dyn TokenCounter,
     state: &State,
     refs: &[SessionRef],
+    redactor: &ingest::Redactor,
     mut on_progress: impl FnMut(Progress<'_>),
 ) -> anyhow::Result<Report> {
     if state.ensure_version(&index_version(model))? {
         eprintln!("model or chunker changed: re-indexing every session");
     }
     store.ensure_collection(ingest::SESSION_FIELDS).await?;
-    let mut indexer = Indexer { store, embedder, counter, state, config: IndexConfig::default() };
+    let mut config = IndexConfig::default();
+    config.chunk.redactor = redactor.clone();
+    let mut indexer = Indexer { store, embedder, counter, state, config };
     let now = jiff::Timestamp::now().as_millisecond();
     Ok(indexer.sync(refs, load, |p| on_progress(p), now).await?)
 }
@@ -99,14 +104,17 @@ pub fn daemon_runner(
                     let t = std::time::Instant::now();
                     let refs = discover(&cfg, target.sources())?;
                     let state = State::open(&cfg.state_path)?;
-                    let report = run_index(&store, &mut embedder, &model, counter.as_ref(), &state, &refs, |_| {}).await?;
+                    // Re-read every run, so `ctx redact add` applies without a daemon restart.
+                    let redactor = ingest::Redactor::from_file(&cfg.redact_file)?;
+                    let report = run_index(&store, &mut embedder, &model, counter.as_ref(), &state, &refs, &redactor, |_| {}).await?;
                     let mut line = format_report(&report, t.elapsed());
                     for (id, error) in &report.failed {
                         eprintln!("[index {target:?}]   FAILED {id}: {error}");
                     }
                     if let Some(s) = summarizer {
                         let now = jiff::Timestamp::now().as_millisecond();
-                        let r = ingest::summarize_pending(&store, &mut embedder, s.as_ref(), &state, &ingest::SummaryConfig::default(), now).await?;
+                        let cfg = ingest::SummaryConfig { redactor, ..Default::default() };
+                        let r = ingest::summarize_pending(&store, &mut embedder, s.as_ref(), &state, &cfg, now).await?;
                         line.push_str(&format!(" · summaries {} written, {} failed, {} deferred", r.written, r.failed.len(), r.deferred));
                         for (id, error) in &r.failed {
                             eprintln!("[summary]   FAILED {id}: {error}");

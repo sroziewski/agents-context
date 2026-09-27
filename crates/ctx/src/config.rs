@@ -39,6 +39,9 @@ pub struct Config {
     pub rerank_model: String,
     pub rerank_threads: Option<usize>,
     pub rerank_pool: u64,
+    /// Where the reranker model is cached (HF-hub layout). Stable, independent of the process's
+    /// working directory.
+    pub rerank_cache_dir: PathBuf,
     pub inject: crate::inject::InjectConfig,
     /// Model that fact-checks memory suggestions against the sessions they came from.
     pub verify_model: String,
@@ -112,6 +115,7 @@ impl Config {
             rerank_model: get("CTX_RERANK_MODEL").unwrap_or_else(|| "jina-v2".into()),
             rerank_threads: get("CTX_RERANK_THREADS").and_then(|v| v.trim().parse().ok()),
             rerank_pool: get("CTX_RERANK_POOL").and_then(|v| v.trim().parse().ok()).unwrap_or(30),
+            rerank_cache_dir: path("CTX_RERANK_CACHE_DIR", data.join("fastembed-cache")),
             inject: crate::inject::InjectConfig {
                 enabled: on("CTX_INJECT", false),
                 teams: on("CTX_INJECT_TEAMS", false),

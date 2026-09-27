@@ -277,10 +277,10 @@ async fn main() -> anyhow::Result<()> {
             }
             // Lazily-built CPU reranker for opt-in deep search; loaded only on the first
             // /rerank call, never for a normal search.
-            let (rerank_model, rerank_threads) = (cfg.rerank_model.clone(), cfg.rerank_threads);
+            let (rerank_model, rerank_threads, rerank_cache) = (cfg.rerank_model.clone(), cfg.rerank_threads, cfg.rerank_cache_dir.clone());
             let reranker: embed_server::RerankerFactory = Arc::new(move || {
                 let which: embed::RerankModel = rerank_model.parse().map_err(embed::EmbedError::Model)?;
-                Ok(Box::new(embed::FastembedReranker::hub(which, 512, rerank_threads, 32)?) as Box<dyn embed::Reranker>)
+                Ok(Box::new(embed::FastembedReranker::hub(which, 512, rerank_threads, 32, Some(rerank_cache.clone()))?) as Box<dyn embed::Reranker>)
             });
             embed_server::serve(embed_server::daemon_router(shared, &model, Some(queue), Some(injector), Some(reranker)), addr).await
         }
@@ -346,7 +346,8 @@ async fn main() -> anyhow::Result<()> {
             if let Some(model) = rerank_model {
                 let which: embed::RerankModel = model.parse().map_err(anyhow::Error::msg)?;
                 eprintln!("loading reranker {model} on CPU (first run downloads it)…");
-                let mut reranker = tokio::task::spawn_blocking(move || embed::FastembedReranker::hub(which, 512, rerank_threads, 32))
+                let cache = cfg.rerank_cache_dir.clone();
+                let mut reranker = tokio::task::spawn_blocking(move || embed::FastembedReranker::hub(which, 512, rerank_threads, 32, Some(cache)))
                     .await?
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 // Baseline: dense turns, no summaries — the same pool the reranker reorders.

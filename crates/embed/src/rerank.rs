@@ -89,12 +89,18 @@ mod fb {
     }
 
     impl FastembedReranker {
-        /// `intra_threads` caps ONNX Runtime's CPU threads (None = all cores).
-        pub fn hub(model: RerankModel, max_length: usize, intra_threads: Option<usize>, batch: usize) -> Result<Self> {
+        /// `intra_threads` caps ONNX Runtime's CPU threads (None = all cores). `cache_dir` fixes
+        /// where the model is fetched and cached; without it fastembed uses `./.fastembed_cache`
+        /// relative to the process's working directory, which differs between the daemon and a
+        /// CLI run, so pass a stable path.
+        pub fn hub(model: RerankModel, max_length: usize, intra_threads: Option<usize>, batch: usize, cache_dir: Option<std::path::PathBuf>) -> Result<Self> {
             // Default execution providers = ORT's CPU provider, which is what we want here.
             let mut opts = RerankInitOptions::new(model.to_fastembed()).with_max_length(max_length).with_show_download_progress(true);
             if let Some(t) = intra_threads {
                 opts = opts.with_intra_threads(t);
+            }
+            if let Some(dir) = cache_dir {
+                opts = opts.with_cache_dir(dir);
             }
             let model = TextRerank::try_new(opts).map_err(|e| EmbedError::Model(e.to_string()))?;
             Ok(Self { model, batch: batch.max(1) })

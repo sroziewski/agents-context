@@ -31,6 +31,15 @@ $exe = Join-Path $bin 'ctx.exe'
 if (Test-Path $exe) { Move-Item $exe "$exe.$(Get-Date -Format yyyyMMddHHmmss).old" }
 Copy-Item (Join-Path $repo 'target\release\ctx.exe') $exe
 
+# Keep the OpenCode plugins in sync (indexing + auto-inject), if OpenCode is installed.
+$plugins = Join-Path $env:USERPROFILE '.config\opencode\plugins'
+if (Test-Path (Split-Path -Parent $plugins)) {
+    New-Item -ItemType Directory -Force $plugins | Out-Null
+    foreach ($js in 'ctx-index.js', 'ctx-inject.js') {
+        Copy-Item (Join-Path $repo "integrations\opencode\$js") (Join-Path $plugins $js) -Force
+    }
+}
+
 function Test-Daemon([int]$seconds) {
     for ($i = 0; $i -lt $seconds; $i += 2) {
         try { Invoke-RestMethod $health -TimeoutSec 2 | Out-Null; return $true } catch { Start-Sleep 2 }

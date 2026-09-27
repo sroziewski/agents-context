@@ -7,11 +7,15 @@
 #[cfg(feature = "bgem3")]
 mod bgem3;
 mod hash;
+mod rerank;
 mod vector;
 
 #[cfg(feature = "bgem3")]
 pub use bgem3::{BGEM3_DIM, Bgem3Embedder, Bgem3Options, ModelSource, Provider};
 pub use hash::HashEmbedder;
+#[cfg(feature = "bgem3")]
+pub use rerank::{FastembedReranker, RerankModel};
+pub use rerank::{HashReranker, Reranker};
 pub use vector::{Embedding, SparseVector, cosine};
 
 #[derive(Debug, thiserror::Error)]

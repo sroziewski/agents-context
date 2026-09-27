@@ -72,4 +72,15 @@ async fn eval_measures_variants_recency_and_inject_thresholds() {
 
     let baseline = Baseline::from_report(production);
     assert!(!eval::compare(&baseline, production).is_regression());
+
+    // Reranker spike path with the deterministic HashReranker (word overlap): it runs over a
+    // real dense pool and produces a comparable report and per-query latencies.
+    let mut reranker = embed::HashReranker;
+    let (reranked, latency) = eval::run_reranked(&ctx, &cases, &vectors, &mut reranker, 20, "dense+rerank").await.unwrap();
+    assert_eq!(reranked.cases.len(), 3, "reranked over the positive cases");
+    assert_eq!(latency.len(), 3, "one timing per query");
+    assert_eq!(reranked.turn_hit_at_5.1, 1, "the turn-targeted case is still counted");
+    // The overlap reranker surfaces the jenkins turn for its query.
+    assert!(reranked.cases.iter().any(|c| c.id == "deploy" && c.rank == Some(1)), "{:?}", reranked.cases);
+    assert!(eval::format_latency("rerank", latency).contains("p50"));
 }

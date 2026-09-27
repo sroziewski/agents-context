@@ -8,8 +8,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::time::Instant;
 
-use embed::Embedding;
+use embed::{Embedding, Reranker};
 use serde::{Deserialize, Serialize};
 use store::SearchMode;
 
@@ -225,6 +226,49 @@ pub async fn run_retrieval(ctx: &Context, cases: &[Case], variants: &[Variant], 
         reports.push(summarize(v.name, cases, results));
     }
     Ok(reports)
+}
+
+/// DEV-28 spike: a dense pool of `pool` turns per query, reordered by the cross-encoder, then
+/// judged like any variant. Returns the report and the per-query rerank latency in ms (the
+/// added cost on top of retrieval). Retrieval stays dense (production); summaries are left out
+/// so the metric is purely the turn ranking the reranker produces.
+pub async fn run_reranked(
+    ctx: &Context,
+    cases: &[Case],
+    vectors: &HashMap<String, Embedding>,
+    reranker: &mut dyn Reranker,
+    pool: u64,
+    name: &'static str,
+) -> anyhow::Result<(VariantReport, Vec<f64>)> {
+    let positives: Vec<&Case> = cases.iter().filter(|c| !c.expect.is_empty()).collect();
+    let mut results = Vec::new();
+    let mut latency_ms = Vec::new();
+    for c in &positives {
+        let mut q = Query::new(c.query.clone(), c.scope(), pool);
+        q.mode = SearchMode::Dense;
+        let r = ctx.search_embedded(&vectors[&c.id], &q).await?;
+        let texts: Vec<&str> = r.turns.iter().map(|h| h.payload.get("text").and_then(|v| v.as_str()).unwrap_or_default()).collect();
+        // The cross-encoder is blocking CPU work; keep it off the async workers.
+        let t0 = Instant::now();
+        let order = tokio::task::block_in_place(|| reranker.order(&c.query, &texts))?;
+        latency_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        let reordered = Results { summaries: Vec::new(), turns: order.iter().map(|&i| r.turns[i].clone()).collect() };
+        results.push(judge_turns(c, &session_order(&reordered, false), &turn_order(&reordered)));
+    }
+    Ok((summarize(name, cases, results), latency_ms))
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    sorted[((p * (sorted.len() - 1) as f64).round() as usize).min(sorted.len() - 1)]
+}
+
+pub fn format_latency(label: &str, mut ms: Vec<f64>) -> String {
+    ms.sort_by(f64::total_cmp);
+    let mean = if ms.is_empty() { 0.0 } else { ms.iter().sum::<f64>() / ms.len() as f64 };
+    format!("{label}: p50 {:.0} ms · p95 {:.0} ms · max {:.0} ms · mean {:.0} ms (n={})", percentile(&ms, 0.5), percentile(&ms, 0.95), percentile(&ms, 1.0), mean, ms.len())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -621,6 +665,13 @@ mod tests {
         assert_eq!(bootstrap_ci(&mixed), bootstrap_ci(&mixed), "deterministic across runs");
         let n = bootstrap_ci(&mixed);
         assert!(n.lo <= n.delta && n.delta <= n.hi);
+    }
+
+    #[test]
+    fn latency_percentiles() {
+        let out = format_latency("rerank", vec![10.0, 20.0, 30.0, 40.0, 100.0]);
+        assert!(out.contains("p50 30 ms") && out.contains("p95 100 ms") && out.contains("max 100 ms") && out.contains("n=5"), "{out}");
+        assert!(format_latency("x", vec![]).contains("n=0"));
     }
 
     #[test]

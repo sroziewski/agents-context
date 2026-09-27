@@ -69,6 +69,17 @@ enum Command {
         /// per-case rank moves and bootstrap CIs on R@1, MRR and turn-MRR.
         #[arg(long, num_args = 2, value_names = ["A", "B"])]
         compare: Vec<String>,
+        /// DEV-28 reranker spike: rerank a dense turn pool with this CPU cross-encoder and
+        /// compare it to the dense baseline (jina-v2, bge-v2-m3 or bge-base). Downloads the
+        /// model on first use.
+        #[arg(long)]
+        rerank_model: Option<String>,
+        /// Candidates fed to the reranker (dense top-N).
+        #[arg(long, default_value_t = 30)]
+        rerank_pool: u64,
+        /// Cap ONNX Runtime CPU threads for the reranker (default: all cores).
+        #[arg(long)]
+        rerank_threads: Option<usize>,
     },
     /// Index new or changed sessions (incremental; safe to run any time).
     Index {
@@ -312,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Eval { file, save_baseline, check, sweep, compare } => {
+        Command::Eval { file, save_baseline, check, sweep, compare, rerank_model, rerank_pool, rerank_threads } => {
             use ctx::eval;
             let path = file.unwrap_or_else(|| cfg.eval_file.clone());
             let cases = eval::load_cases(&path)?;
@@ -320,6 +331,22 @@ async fn main() -> anyhow::Result<()> {
             let vectors = eval::embed_queries(&ctx, &cases).await?;
             let positives = cases.iter().filter(|c| !c.expect.is_empty()).count();
             println!("{} cases ({positives} with expected sessions, {} negatives) from {}\n", cases.len(), cases.len() - positives, path.display());
+            if let Some(model) = rerank_model {
+                let which: embed::RerankModel = model.parse().map_err(anyhow::Error::msg)?;
+                eprintln!("loading reranker {model} on CPU (first run downloads it)…");
+                let mut reranker = tokio::task::spawn_blocking(move || embed::FastembedReranker::hub(which, 512, rerank_threads, 32))
+                    .await?
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                // Baseline: dense turns, no summaries — the same pool the reranker reorders.
+                let base = eval::Variant { name: "dense-turns", mode: store::SearchMode::Dense, summaries: false, recency: ctx::rank::Recency::OFF };
+                let baseline = eval::run_retrieval(&ctx, &cases, &[base], &vectors).await?.remove(0);
+                let (reranked, latency) = eval::run_reranked(&ctx, &cases, &vectors, &mut reranker, rerank_pool, "dense+rerank").await?;
+                println!("reranker: {model}, pool N={rerank_pool}, threads={}\n", rerank_threads.map_or("all".to_owned(), |t| t.to_string()));
+                println!("{}\n", eval::format_retrieval(&[baseline.clone(), reranked.clone()]));
+                println!("{}\n", eval::format_compare(&baseline, &reranked, &cases));
+                println!("{}", eval::format_latency("rerank added latency", latency));
+                return Ok(());
+            }
             let all_variants = eval::variants(cfg.search_mode, cfg.recency);
             if let [a, b] = compare.as_slice() {
                 let pick = |name: &str| {

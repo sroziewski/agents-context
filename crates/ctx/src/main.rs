@@ -683,6 +683,10 @@ async fn run_eval(
 ", eval::format_retrieval(&reports));
         let production = reports.iter().find(|r| r.name == "fused").expect("fused variant is always run");
         println!("{}", eval::format_misses(production, &cases));
+        let vectors = eval::embed_queries(&ctx, &cases).await?;
+        let inj = injector(&cfg).await?;
+        let points = eval::run_teams_inject(&inj, &cases, &vectors, &[0.45, 0.50, 0.55, 0.60, 0.65, 0.70]).await?;
+        println!("\nteams auto-inject (current teams_min_score {:.2}):\n{}\n", cfg.inject.teams_min_score, eval::format_inject(&points));
         let baseline_path = cfg.eval_baseline.with_file_name(format!("{}-teams.json", cfg.eval_baseline.file_stem().and_then(|s| s.to_str()).unwrap_or("eval-baseline")));
         if check {
             let text = std::fs::read_to_string(&baseline_path).with_context(|| format!("no teams baseline at {}; run `ctx eval --target teams --save-baseline` first", baseline_path.display()))?;

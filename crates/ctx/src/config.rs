@@ -120,6 +120,7 @@ impl Config {
                 enabled: on("CTX_INJECT", false),
                 teams: on("CTX_INJECT_TEAMS", false),
                 min_score: number("CTX_INJECT_MIN_SCORE", crate::inject::DEFAULT_MIN_SCORE as f64) as f32,
+                teams_min_score: number("CTX_INJECT_TEAMS_MIN_SCORE", crate::inject::DEFAULT_TEAMS_MIN_SCORE as f64) as f32,
                 max_tokens: number("CTX_INJECT_MAX_TOKENS", crate::inject::DEFAULT_MAX_TOKENS as f64) as usize,
             },
             verify_model: get("CTX_VERIFY_MODEL").unwrap_or_else(|| "sonnet".into()),

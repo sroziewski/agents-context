@@ -22,6 +22,11 @@ use crate::rank::Recency;
 /// bge-m3 cosine between a prompt and a summary of the session it is about; chosen with the
 /// inject sweep of `ctx eval` (see `ctx eval --sweep`).
 pub const DEFAULT_MIN_SCORE: f32 = 0.55;
+/// Teams threads use a higher gate than session summaries. DEV-31 sweep (34-case Teams set):
+/// 0.65 was the lowest threshold meeting the bar to recommend Teams inject — precision 0.89,
+/// 0 false injects on negatives, 62% hit rate; 0.55/0.60 leaked (precision 0.69/0.72, and 0.55
+/// still injected on a negative).
+pub const DEFAULT_TEAMS_MIN_SCORE: f32 = 0.65;
 pub const DEFAULT_MAX_TOKENS: usize = 1500;
 const MAX_SESSIONS: usize = 3;
 const MAX_THREADS: usize = 2;
@@ -43,12 +48,16 @@ pub struct InjectConfig {
     /// Also inject matching Teams threads (`CTX_INJECT_TEAMS`).
     pub teams: bool,
     pub min_score: f32,
+    /// Separate cosine gate for Teams threads: message chunks are short, so their similarity
+    /// distribution differs from session summaries', and they need their own threshold
+    /// (`CTX_INJECT_TEAMS_MIN_SCORE`, calibrated in DEV-31).
+    pub teams_min_score: f32,
     pub max_tokens: usize,
 }
 
 impl Default for InjectConfig {
     fn default() -> Self {
-        Self { enabled: false, teams: false, min_score: DEFAULT_MIN_SCORE, max_tokens: DEFAULT_MAX_TOKENS }
+        Self { enabled: false, teams: false, min_score: DEFAULT_MIN_SCORE, teams_min_score: DEFAULT_MIN_SCORE, max_tokens: DEFAULT_MAX_TOKENS }
     }
 }
 
@@ -204,21 +213,22 @@ impl Injector {
         let sessions = self.recency.rerank(hits, now_ms, MAX_SESSIONS);
 
         let mut threads = Vec::new();
-        if let (true, Some(store)) = (teams, &self.teams) {
+        if teams {
             // Teams is optional: an unreachable or missing collection must not cost the sessions.
-            if let Ok(hits) = store.search(query, &SearchFilter::default(), (MAX_THREADS * 6) as u64, SearchMode::Dense).await {
-                let mut seen = HashSet::new();
-                threads = hits
-                    .into_iter()
-                    .filter(|h| {
-                        let tid = string(&h.payload, "thread_id");
-                        h.score >= min_score && !skip(&format!("t:{tid}")) && seen.insert(tid)
-                    })
-                    .take(MAX_THREADS)
-                    .collect();
-            }
+            let cands = self.teams_candidates(query, self.config.teams_min_score).await.unwrap_or_default();
+            threads = cands.into_iter().filter(|h| !skip(&format!("t:{}", string(&h.payload, "thread_id")))).take(MAX_THREADS).collect();
         }
         Ok(Selection { sessions, threads })
+    }
+
+    /// Top distinct Teams threads (best first) scoring at least `min_score`, capped at what
+    /// inject shows. Its own dense search over the teams collection — shared by the runtime
+    /// inject path and the DEV-31 threshold sweep. Empty when Teams is not attached.
+    pub async fn teams_candidates(&self, query: &Embedding, min_score: f32) -> anyhow::Result<Vec<Hit>> {
+        let Some(store) = &self.teams else { return Ok(Vec::new()) };
+        let hits = store.search(query, &SearchFilter::default(), (MAX_THREADS * 6) as u64, SearchMode::Dense).await?;
+        let mut seen = HashSet::new();
+        Ok(hits.into_iter().filter(|h| h.score >= min_score && seen.insert(string(&h.payload, "thread_id"))).take(MAX_THREADS).collect())
     }
 
     /// The context block for one prompt; empty when nothing qualifies.

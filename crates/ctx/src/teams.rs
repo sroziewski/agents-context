@@ -162,7 +162,11 @@ pub struct TeamsRanking {
 
 impl Default for TeamsRanking {
     fn default() -> Self {
-        Self { use_semantic: true, semantic_mode: SearchMode::Hybrid, rrf_k: RRF_K, boost: PROJECT_BOOST, use_fts: true }
+        // Dense semantic half: DEV-30 measured fused-dense MRR 0.942 vs 0.936 for hybrid on the
+        // Teams set — bge-m3's sparse weights don't help Polish, and the FTS half already covers
+        // keywords. k=60 and boost 1.5 kept: the eval showed no difference from changing them
+        // (re-check once the set has boost-discriminating cases).
+        Self { use_semantic: true, semantic_mode: SearchMode::Dense, rrf_k: RRF_K, boost: PROJECT_BOOST, use_fts: true }
     }
 }
 

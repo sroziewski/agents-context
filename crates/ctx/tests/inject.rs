@@ -28,7 +28,7 @@ fn injector(e: &Env, min_score: f32) -> Injector {
         Arc::new(Mutex::new(Box::new(HashEmbedder::new(DIM)) as Box<dyn Embedder>)),
         Arc::new(WordCounter),
         Recency::OFF,
-        InjectConfig { enabled: true, teams: false, min_score, max_tokens: 1500 },
+        InjectConfig { enabled: true, teams: false, min_score, teams_min_score: min_score, max_tokens: 1500 },
         e.cfg.redact_file.clone(),
     )
 }

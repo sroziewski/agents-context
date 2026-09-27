@@ -297,8 +297,8 @@ pub fn teams_variants() -> Vec<TeamsVariant> {
         TeamsVariant { name: "semantic-dense", ranking: TeamsRanking { semantic_mode: SearchMode::Dense, use_fts: false, ..base } },
         TeamsVariant { name: "semantic-hybrid", ranking: TeamsRanking { semantic_mode: SearchMode::Hybrid, use_fts: false, ..base } },
         TeamsVariant { name: "fused", ranking: base },
-        TeamsVariant { name: "fused-dense", ranking: TeamsRanking { semantic_mode: SearchMode::Dense, ..base } },
-        TeamsVariant { name: "fused-dense-k30", ranking: TeamsRanking { semantic_mode: SearchMode::Dense, rrf_k: 30.0, ..base } },
+        TeamsVariant { name: "fused-hybrid", ranking: TeamsRanking { semantic_mode: SearchMode::Hybrid, ..base } },
+        TeamsVariant { name: "fused-k30", ranking: TeamsRanking { rrf_k: 30.0, ..base } },
         TeamsVariant { name: "fused-noboost", ranking: TeamsRanking { boost: 1.0, ..base } },
     ]
 }
@@ -328,6 +328,34 @@ pub async fn run_teams(teams: &crate::teams::TeamsSearch, cases: &[Case], varian
         reports.push(summarize(v.name, cases, results));
     }
     Ok(reports)
+}
+
+/// Teams inject threshold sweep (DEV-31): at each `min_score`, how often an expected thread is
+/// among what would be injected, its precision, and how often anything is injected on a
+/// negative. Teams inject is not project-scoped, so every case counts.
+pub async fn run_teams_inject(injector: &Injector, cases: &[Case], vectors: &HashMap<String, Embedding>, thresholds: &[f32]) -> anyhow::Result<Vec<InjectPoint>> {
+    let teams: Vec<&Case> = cases.iter().filter(|c| c.target == Target::Teams).collect();
+    let mut points = Vec::new();
+    for &t in thresholds {
+        let mut p = InjectPoint { min_score: t, hits: 0, positives: 0, false_injects: 0, negatives: 0, precision: 0.0 };
+        let (mut expected, mut injected) = (0usize, 0usize);
+        for c in &teams {
+            let cands = injector.teams_candidates(&vectors[&c.id], t).await?;
+            let ids: Vec<String> = cands.iter().filter_map(|h| h.payload.get("thread_id")?.as_str().map(str::to_owned)).collect();
+            if c.expect.is_empty() {
+                p.negatives += 1;
+                p.false_injects += usize::from(!ids.is_empty());
+            } else {
+                p.positives += 1;
+                p.hits += usize::from(ids.iter().any(|s| c.expect.contains(s)));
+                injected += ids.len();
+                expected += ids.iter().filter(|s| c.expect.contains(s)).count();
+            }
+        }
+        p.precision = if injected == 0 { 0.0 } else { expected as f64 / injected as f64 };
+        points.push(p);
+    }
+    Ok(points)
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -755,9 +783,10 @@ mod tests {
     #[test]
     fn teams_variants_cover_the_choices_and_default_matches_shipped() {
         let names: Vec<&str> = teams_variants().iter().map(|v| v.name).collect();
-        assert_eq!(names, ["fts", "semantic-dense", "semantic-hybrid", "fused", "fused-dense", "fused-dense-k30", "fused-noboost"]);
+        assert_eq!(names, ["fts", "semantic-dense", "semantic-hybrid", "fused", "fused-hybrid", "fused-k30", "fused-noboost"]);
         let fused = teams_variants().into_iter().find(|v| v.name == "fused").unwrap();
         assert_eq!(fused.ranking, crate::teams::TeamsRanking::default(), "fused is the shipped ranking");
+        assert_eq!(fused.ranking.semantic_mode, SearchMode::Dense, "shipped Teams semantic half is dense (DEV-31)");
         let fts = teams_variants().into_iter().find(|v| v.name == "fts").unwrap();
         assert!(!fts.ranking.use_semantic && fts.ranking.use_fts);
     }

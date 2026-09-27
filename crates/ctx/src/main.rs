@@ -65,6 +65,10 @@ enum Command {
         /// Also try recency weights and half-lives, to tune them.
         #[arg(long)]
         sweep: bool,
+        /// Compare two variants by name (e.g. `--compare dense+summaries production`): the
+        /// per-case rank moves and bootstrap CIs on R@1, MRR and turn-MRR.
+        #[arg(long, num_args = 2, value_names = ["A", "B"])]
+        compare: Vec<String>,
     },
     /// Index new or changed sessions (incremental; safe to run any time).
     Index {
@@ -308,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Eval { file, save_baseline, check, sweep } => {
+        Command::Eval { file, save_baseline, check, sweep, compare } => {
             use ctx::eval;
             let path = file.unwrap_or_else(|| cfg.eval_file.clone());
             let cases = eval::load_cases(&path)?;
@@ -316,7 +320,21 @@ async fn main() -> anyhow::Result<()> {
             let vectors = eval::embed_queries(&ctx, &cases).await?;
             let positives = cases.iter().filter(|c| !c.expect.is_empty()).count();
             println!("{} cases ({positives} with expected sessions, {} negatives) from {}\n", cases.len(), cases.len() - positives, path.display());
-            let reports = eval::run_retrieval(&ctx, &cases, &eval::variants(cfg.search_mode, cfg.recency), &vectors).await?;
+            let all_variants = eval::variants(cfg.search_mode, cfg.recency);
+            if let [a, b] = compare.as_slice() {
+                let pick = |name: &str| {
+                    all_variants
+                        .iter()
+                        .find(|v| v.name == name)
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("unknown variant {name:?}; valid: {}", all_variants.iter().map(|v| v.name).collect::<Vec<_>>().join(", ")))
+                };
+                let two = [pick(a)?, pick(b)?];
+                let reports = eval::run_retrieval(&ctx, &cases, &two, &vectors).await?;
+                println!("{}", eval::format_compare(&reports[0], &reports[1], &cases));
+                return Ok(());
+            }
+            let reports = eval::run_retrieval(&ctx, &cases, &all_variants, &vectors).await?;
             println!("production = {:?} + summaries, recency weight {:.2}", cfg.search_mode, cfg.recency.weight);
             println!("{}\n", eval::format_retrieval(&reports));
             let production = reports.iter().find(|r| r.name == eval::PRODUCTION).expect("production variant is always run");

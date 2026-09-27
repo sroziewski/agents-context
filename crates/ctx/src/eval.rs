@@ -34,8 +34,20 @@ pub struct Case {
     /// A later session superseded the others: `expect[0]` must outrank the rest.
     #[serde(default)]
     pub latest: bool,
+    /// Optional turn-level target: the specific turns that answer the query, as shown in
+    /// results (1-based, `session` + `turn`). Lets the eval measure a reranker, which reorders
+    /// turns, not just whether the right session appears. A case with none is session-only.
+    #[serde(default)]
+    pub expect_turns: Vec<TurnRef>,
     #[serde(default)]
     pub lang: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRef {
+    pub session: String,
+    /// 1-based, matching the `turn N` shown in search results (payload `turn_index` + 1).
+    pub turn: usize,
 }
 
 impl Case {
@@ -106,6 +118,20 @@ pub fn session_order(r: &Results, summaries: bool) -> Vec<String> {
         .collect()
 }
 
+/// The turns shown, in order, as `(session_id, displayed_turn)` where `displayed_turn` is the
+/// 1-based number a reader sees. This is what a reranker reorders, so turn metrics use it, not
+/// the summaries.
+pub fn turn_order(r: &Results) -> Vec<(String, usize)> {
+    r.turns
+        .iter()
+        .map(|h| {
+            let sid = h.payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+            let turn = h.payload.get("turn_index").and_then(|v| v.as_i64()).unwrap_or(-1) + 1;
+            (sid, turn.max(0) as usize)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CaseResult {
     pub id: String,
@@ -113,12 +139,25 @@ pub struct CaseResult {
     pub rank: Option<usize>,
     /// For `latest` cases: whether the preferred session came before the superseded ones.
     pub latest_ok: Option<bool>,
+    /// 1-based rank, among the turns shown, of the first turn in `expect_turns`; `None` when
+    /// the case has no turn targets or none were found. This is the reranker's metric.
+    #[serde(default)]
+    pub turn_rank: Option<usize>,
 }
 
 pub fn judge(case: &Case, order: &[String]) -> CaseResult {
+    judge_turns(case, order, &[])
+}
+
+/// Session judgement plus, when the case has `expect_turns`, the rank of the first matching
+/// turn in `turns` (the shown turn list from [`turn_order`]).
+pub fn judge_turns(case: &Case, order: &[String], turns: &[(String, usize)]) -> CaseResult {
     let rank = order.iter().position(|s| case.expect.contains(s)).map(|i| i + 1);
     let latest_ok = case.latest.then(|| rank.is_some_and(|r| order[r - 1] == case.expect[0]));
-    CaseResult { id: case.id.clone(), rank, latest_ok }
+    let turn_rank = (!case.expect_turns.is_empty())
+        .then(|| turns.iter().position(|(s, t)| case.expect_turns.iter().any(|e| &e.session == s && e.turn == *t)).map(|i| i + 1))
+        .flatten();
+    CaseResult { id: case.id.clone(), rank, latest_ok, turn_rank }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +169,8 @@ pub struct VariantReport {
     pub mrr: f64,
     /// (preferred first, latest cases found at all).
     pub latest: (usize, usize),
+    /// (turn found in top 5, cases that carry turn targets). `(0, 0)` when none do.
+    pub turn_hit_at_5: (usize, usize),
     /// Language → (found in top 5, cases).
     pub by_lang: BTreeMap<String, (usize, usize)>,
 }
@@ -139,6 +180,12 @@ pub fn summarize(name: &str, cases: &[Case], results: Vec<CaseResult>) -> Varian
     let within = |k: usize| results.iter().filter(|r| r.rank.is_some_and(|x| x <= k)).count() as f64 / n;
     let mrr = results.iter().map(|r| r.rank.map_or(0.0, |x| 1.0 / x as f64)).sum::<f64>() / n;
     let latest = results.iter().filter_map(|r| r.latest_ok).fold((0, 0), |(ok, all), x| (ok + usize::from(x), all + 1));
+    // Only cases with turn targets count toward turn hit@5; a session-only case is not a miss.
+    let turn_targeted: HashSet<&str> = cases.iter().filter(|c| !c.expect_turns.is_empty()).map(|c| c.id.as_str()).collect();
+    let turn_hit_at_5 = results
+        .iter()
+        .filter(|r| turn_targeted.contains(r.id.as_str()))
+        .fold((0, 0), |(hit, all), r| (hit + usize::from(r.turn_rank.is_some_and(|x| x <= 5)), all + 1));
     let lang: HashMap<&str, &str> = cases.iter().map(|c| (c.id.as_str(), c.lang.as_str())).collect();
     let mut by_lang: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for r in &results {
@@ -146,7 +193,7 @@ pub fn summarize(name: &str, cases: &[Case], results: Vec<CaseResult>) -> Varian
         entry.0 += usize::from(r.rank.is_some_and(|x| x <= 5));
         entry.1 += 1;
     }
-    VariantReport { name: name.to_owned(), recall_at_1: within(1), recall_at_5: within(5), mrr, latest, by_lang, cases: results }
+    VariantReport { name: name.to_owned(), recall_at_1: within(1), recall_at_5: within(5), mrr, latest, turn_hit_at_5, by_lang, cases: results }
 }
 
 /// Embeds every query once; the variants reuse the vectors.
@@ -173,7 +220,7 @@ pub async fn run_retrieval(ctx: &Context, cases: &[Case], variants: &[Variant], 
             q.mode = v.mode;
             q.recency = v.recency;
             let r = ctx.search_embedded(&vectors[&c.id], &q).await?;
-            results.push(judge(c, &session_order(&r, v.summaries)));
+            results.push(judge_turns(c, &session_order(&r, v.summaries), &turn_order(&r)));
         }
         reports.push(summarize(v.name, cases, results));
     }
@@ -223,7 +270,11 @@ pub async fn run_inject(injector: &Injector, cases: &[Case], vectors: &HashMap<S
 
 pub fn format_retrieval(reports: &[VariantReport]) -> String {
     let langs: Vec<String> = reports.first().map(|r| r.by_lang.keys().cloned().collect()).unwrap_or_default();
+    let turns = reports.iter().any(|r| r.turn_hit_at_5.1 > 0);
     let mut out = format!("{:<26} {:>5} {:>5} {:>7} {:>7}", "variant", "R@1", "R@5", "MRR", "latest");
+    if turns {
+        out.push_str(&format!(" {:>8}", "turn@5"));
+    }
     for l in &langs {
         out.push_str(&format!(" {:>8}", format!("{} R@5", if l.is_empty() { "?" } else { l })));
     }
@@ -236,11 +287,121 @@ pub fn format_retrieval(reports: &[VariantReport]) -> String {
             r.mrr,
             if r.latest.1 == 0 { "-".to_owned() } else { format!("{}/{}", r.latest.0, r.latest.1) }
         ));
+        if turns {
+            let (hit, all) = r.turn_hit_at_5;
+            out.push_str(&format!(" {:>8}", if all == 0 { "-".to_owned() } else { format!("{hit}/{all}") }));
+        }
         for l in &langs {
             let (hit, all) = r.by_lang.get(l).copied().unwrap_or_default();
             out.push_str(&format!(" {:>8}", format!("{hit}/{all}")));
         }
     }
+    out
+}
+
+/// Paired-bootstrap 95% CI for a per-case metric's delta (variant `b` minus `a`), over the
+/// cases both share. Resampling cases together (paired) cancels the shared per-case difficulty,
+/// so the CI reflects the ranking change, not which questions are hard. Deterministic: a fixed
+/// seed and a fixed resample count, so the same reports always give the same interval.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ci {
+    pub delta: f64,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+impl Ci {
+    /// The interval excludes 0, i.e. the change is beyond bootstrap noise.
+    pub fn significant(&self) -> bool {
+        self.lo > 0.0 || self.hi < 0.0
+    }
+}
+
+/// SplitMix64 — a tiny deterministic PRNG, so the CI needs no external rng crate and is stable
+/// across platforms.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+}
+
+const BOOTSTRAP_RESAMPLES: usize = 1000;
+const BOOTSTRAP_SEED: u64 = 0x5EED_5EED_5EED_5EED;
+
+/// Per-case `(a, b)` metric pairs from two reports, matched by id.
+fn paired(a: &VariantReport, b: &VariantReport, metric: impl Fn(&CaseResult) -> f64) -> Vec<(f64, f64)> {
+    let bm: HashMap<&str, &CaseResult> = b.cases.iter().map(|c| (c.id.as_str(), c)).collect();
+    a.cases.iter().filter_map(|ca| bm.get(ca.id.as_str()).map(|cb| (metric(ca), metric(cb)))).collect()
+}
+
+fn bootstrap_ci(pairs: &[(f64, f64)]) -> Ci {
+    let mean_delta = |sel: &dyn Fn(usize) -> usize| {
+        let n = pairs.len();
+        (0..n).map(|i| { let (a, b) = pairs[sel(i)]; b - a }).sum::<f64>() / n.max(1) as f64
+    };
+    let delta = mean_delta(&|i| i);
+    if pairs.is_empty() {
+        return Ci { delta: 0.0, lo: 0.0, hi: 0.0 };
+    }
+    let mut rng = SplitMix64(BOOTSTRAP_SEED);
+    let n = pairs.len();
+    let mut deltas: Vec<f64> = (0..BOOTSTRAP_RESAMPLES)
+        .map(|_| {
+            let s: f64 = (0..n).map(|_| { let (a, b) = pairs[rng.below(n)]; b - a }).sum();
+            s / n as f64
+        })
+        .collect();
+    deltas.sort_by(f64::total_cmp);
+    let pct = |p: f64| deltas[((p * (BOOTSTRAP_RESAMPLES - 1) as f64).round()) as usize];
+    Ci { delta, lo: pct(0.025), hi: pct(0.975) }
+}
+
+fn rr(r: &CaseResult) -> f64 {
+    r.rank.map_or(0.0, |x| 1.0 / x as f64)
+}
+fn hit1(r: &CaseResult) -> f64 {
+    f64::from(u8::from(r.rank == Some(1)))
+}
+fn turn_rr(r: &CaseResult) -> f64 {
+    r.turn_rank.map_or(0.0, |x| 1.0 / x as f64)
+}
+
+/// `b` vs `a`: the per-case rank moves plus bootstrap CIs on R@1, MRR and (when present)
+/// turn-MRR. This is what `ctx eval --compare a b` prints.
+pub fn format_compare(a: &VariantReport, b: &VariantReport, cases: &[Case]) -> String {
+    let query: HashMap<&str, &str> = cases.iter().map(|c| (c.id.as_str(), c.query.as_str())).collect();
+    let am: HashMap<&str, &CaseResult> = a.cases.iter().map(|c| (c.id.as_str(), c)).collect();
+    let mut moved: Vec<String> = Vec::new();
+    for cb in &b.cases {
+        let Some(ca) = am.get(cb.id.as_str()) else { continue };
+        if ca.rank != cb.rank {
+            let show = |r: Option<usize>| r.map_or("—".to_owned(), |x| x.to_string());
+            moved.push(format!("  {:<16} {:>3} -> {:<3}  {}", cb.id, show(ca.rank), show(cb.rank), query.get(cb.id.as_str()).copied().unwrap_or_default()));
+        }
+    }
+    moved.sort();
+    let ci_line = |label: &str, ci: Ci| {
+        let mark = if ci.significant() { "significant" } else { "within noise" };
+        format!("  {label:<9} Δ {:+.3}  95% CI [{:+.3}, {:+.3}]  {mark}", ci.delta, ci.lo, ci.hi)
+    };
+    let mut out = format!("compare: {} -> {}\n", a.name, b.name);
+    out.push_str(&ci_line("R@1", bootstrap_ci(&paired(a, b, hit1))));
+    out.push('\n');
+    out.push_str(&ci_line("MRR", bootstrap_ci(&paired(a, b, rr))));
+    if a.turn_hit_at_5.1 > 0 || b.turn_hit_at_5.1 > 0 {
+        out.push('\n');
+        out.push_str(&ci_line("turn-MRR", bootstrap_ci(&paired(a, b, turn_rr))));
+    }
+    out.push_str(&format!("\n\nranks moved ({}):\n{}", moved.len(), if moved.is_empty() { "  (none)".to_owned() } else { moved.join("\n") }));
     out
 }
 
@@ -332,11 +493,15 @@ mod tests {
     use store::Hit;
 
     fn case(id: &str, expect: &[&str], latest: bool, lang: &str) -> Case {
-        Case { id: id.into(), query: "q".into(), project: None, expect: expect.iter().map(|s| s.to_string()).collect(), latest, lang: lang.into() }
+        Case { id: id.into(), query: "q".into(), project: None, expect: expect.iter().map(|s| s.to_string()).collect(), latest, expect_turns: vec![], lang: lang.into() }
     }
 
     fn hit(session: &str) -> Hit {
         Hit { id: uuid::Uuid::nil(), score: 1.0, payload: json!({ "session_id": session }).as_object().cloned().unwrap() }
+    }
+
+    fn turn_hit(session: &str, turn: i64) -> Hit {
+        Hit { id: uuid::Uuid::nil(), score: 1.0, payload: json!({ "session_id": session, "turn_index": turn - 1 }).as_object().cloned().unwrap() }
     }
 
     #[test]
@@ -363,19 +528,31 @@ mod tests {
     fn judge_ranks_by_session_and_checks_the_latest() {
         let c = case("a", &["new", "old"], true, "pl");
         let order = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(judge(&c, &order(&["x", "new", "old"])), CaseResult { id: "a".into(), rank: Some(2), latest_ok: Some(true) });
+        assert_eq!(judge(&c, &order(&["x", "new", "old"])), CaseResult { id: "a".into(), rank: Some(2), latest_ok: Some(true), turn_rank: None });
         assert_eq!(judge(&c, &order(&["old", "new"])).latest_ok, Some(false));
-        assert_eq!(judge(&c, &order(&["x"])), CaseResult { id: "a".into(), rank: None, latest_ok: Some(false) });
+        assert_eq!(judge(&c, &order(&["x"])), CaseResult { id: "a".into(), rank: None, latest_ok: Some(false), turn_rank: None });
         assert_eq!(judge(&case("b", &["s"], false, ""), &order(&["s"])).latest_ok, None);
+    }
+
+    #[test]
+    fn turn_order_and_turn_rank() {
+        let r = Results { summaries: vec![hit("s9")], turns: vec![turn_hit("s1", 3), turn_hit("s1", 4), turn_hit("s2", 1)] };
+        assert_eq!(turn_order(&r), [("s1".into(), 3), ("s1".into(), 4), ("s2".into(), 1)]);
+        let mut c = case("t", &["s1"], false, "");
+        c.expect_turns = vec![TurnRef { session: "s2".into(), turn: 1 }];
+        assert_eq!(judge_turns(&c, &session_order(&r, true), &turn_order(&r)).turn_rank, Some(3));
+        c.expect_turns = vec![TurnRef { session: "s2".into(), turn: 9 }];
+        assert_eq!(judge_turns(&c, &[], &turn_order(&r)).turn_rank, None, "target turn not shown");
+        assert_eq!(judge_turns(&case("s", &["s1"], false, ""), &[], &turn_order(&r)).turn_rank, None, "no turn target");
     }
 
     #[test]
     fn summarize_computes_recall_mrr_and_languages() {
         let cases = [case("a", &["s"], false, "pl"), case("b", &["s"], false, "en"), case("c", &["s"], false, "en")];
         let results = vec![
-            CaseResult { id: "a".into(), rank: Some(1), latest_ok: None },
-            CaseResult { id: "b".into(), rank: Some(4), latest_ok: Some(true) },
-            CaseResult { id: "c".into(), rank: None, latest_ok: Some(false) },
+            CaseResult { id: "a".into(), rank: Some(1), latest_ok: None, turn_rank: None },
+            CaseResult { id: "b".into(), rank: Some(4), latest_ok: Some(true), turn_rank: None },
+            CaseResult { id: "c".into(), rank: None, latest_ok: Some(false), turn_rank: None },
         ];
         let r = summarize("v", &cases, results);
         assert!((r.recall_at_1 - 1.0 / 3.0).abs() < 1e-9);
@@ -393,19 +570,19 @@ mod tests {
     fn a_swap_is_reported_but_only_a_net_loss_is_a_regression() {
         let cases = [case("a", &["s"], false, ""), case("b", &["s"], false, "")];
         let before = summarize(PRODUCTION, &cases, vec![
-            CaseResult { id: "a".into(), rank: Some(1), latest_ok: None },
-            CaseResult { id: "b".into(), rank: None, latest_ok: None },
+            CaseResult { id: "a".into(), rank: Some(1), latest_ok: None, turn_rank: None },
+            CaseResult { id: "b".into(), rank: None, latest_ok: None, turn_rank: None },
         ]);
         let swapped = summarize(PRODUCTION, &cases, vec![
-            CaseResult { id: "a".into(), rank: Some(7), latest_ok: None },
-            CaseResult { id: "b".into(), rank: Some(2), latest_ok: None },
+            CaseResult { id: "a".into(), rank: Some(7), latest_ok: None, turn_rank: None },
+            CaseResult { id: "b".into(), rank: Some(2), latest_ok: None, turn_rank: None },
         ]);
         let c = compare(&Baseline::from_report(&before), &swapped);
         assert_eq!((c.lost.as_slice(), c.gained.as_slice()), (&["a".to_string()][..], &["b".to_string()][..]));
         assert!(!c.is_regression());
         let worse = summarize(PRODUCTION, &cases, vec![
-            CaseResult { id: "a".into(), rank: None, latest_ok: None },
-            CaseResult { id: "b".into(), rank: None, latest_ok: None },
+            CaseResult { id: "a".into(), rank: None, latest_ok: None, turn_rank: None },
+            CaseResult { id: "b".into(), rank: None, latest_ok: None, turn_rank: None },
         ]);
         assert!(compare(&Baseline::from_report(&before), &worse).is_regression());
     }
@@ -413,10 +590,10 @@ mod tests {
     #[test]
     fn a_new_hard_case_is_not_a_regression() {
         let cases = [case("a", &["s"], false, ""), case("new", &["s"], false, "")];
-        let before = summarize(PRODUCTION, &cases[..1], vec![CaseResult { id: "a".into(), rank: Some(1), latest_ok: None }]);
+        let before = summarize(PRODUCTION, &cases[..1], vec![CaseResult { id: "a".into(), rank: Some(1), latest_ok: None, turn_rank: None }]);
         let now = summarize(PRODUCTION, &cases, vec![
-            CaseResult { id: "a".into(), rank: Some(1), latest_ok: None },
-            CaseResult { id: "new".into(), rank: None, latest_ok: None },
+            CaseResult { id: "a".into(), rank: Some(1), latest_ok: None, turn_rank: None },
+            CaseResult { id: "new".into(), rank: None, latest_ok: None, turn_rank: None },
         ]);
         let c = compare(&Baseline::from_report(&before), &now);
         assert!(!c.is_regression(), "aggregate recall dropped, but no shared case was lost");
@@ -425,9 +602,37 @@ mod tests {
 
     #[test]
     fn baseline_round_trips_through_json() {
-        let r = summarize(PRODUCTION, &[case("a", &["s"], false, "")], vec![CaseResult { id: "a".into(), rank: Some(3), latest_ok: None }]);
+        let r = summarize(PRODUCTION, &[case("a", &["s"], false, "")], vec![CaseResult { id: "a".into(), rank: Some(3), latest_ok: None, turn_rank: None }]);
         let b = Baseline::from_report(&r);
         let back: Baseline = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
         assert_eq!(back, b);
+    }
+
+    #[test]
+    fn bootstrap_ci_flags_a_real_gain_and_ignores_noise() {
+        let uniform = |v: f64| (0..40).map(|_| (0.0, v)).collect::<Vec<_>>();
+        let ci = bootstrap_ci(&uniform(1.0));
+        assert!((ci.delta - 1.0).abs() < 1e-9 && ci.lo > 0.0 && ci.significant(), "{ci:?}");
+        let zero = bootstrap_ci(&(0..40).map(|_| (0.5, 0.5)).collect::<Vec<_>>());
+        assert_eq!((zero.delta, zero.lo, zero.hi), (0.0, 0.0, 0.0));
+        assert!(!zero.significant());
+        assert_eq!(bootstrap_ci(&[]).delta, 0.0);
+        let mixed: Vec<(f64, f64)> = (0..40).map(|i| (0.0, f64::from(i % 3 == 0))).collect();
+        assert_eq!(bootstrap_ci(&mixed), bootstrap_ci(&mixed), "deterministic across runs");
+        let n = bootstrap_ci(&mixed);
+        assert!(n.lo <= n.delta && n.delta <= n.hi);
+    }
+
+    #[test]
+    fn compare_reports_rank_moves_and_cis() {
+        let cases = [case("a", &["s"], false, ""), case("b", &["s"], false, "")];
+        let cr = |id: &str, rank| CaseResult { id: id.into(), rank, latest_ok: None, turn_rank: None };
+        let a = summarize("dense", &cases, vec![cr("a", Some(3)), cr("b", Some(2))]);
+        let b = summarize("prod", &cases, vec![cr("a", Some(1)), cr("b", Some(2))]);
+        let out = format_compare(&a, &b, &cases);
+        assert!(out.starts_with("compare: dense -> prod"), "{out}");
+        assert!(out.contains("3 -> 1"), "{out}");
+        assert!(out.contains("ranks moved (1)"), "{out}");
+        assert!(out.contains("R@1") && out.contains("MRR") && !out.contains("turn-MRR"), "{out}");
     }
 }

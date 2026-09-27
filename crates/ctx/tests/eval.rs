@@ -23,7 +23,7 @@ const FIXTURES: &[Fixture] = &[
 const CASES: &str = r#"
 # synthetic set: one superseded decision, one cross-project question, one negative
 {"id": "model", "query": "which embedding model did we choose", "project": "Z:\\work\\alpha", "expect": ["model-new", "model-old"], "latest": true, "lang": "en"}
-{"id": "deploy", "query": "jenkins deploy pipeline", "expect": ["beta-deploy"], "lang": "en"}
+{"id": "deploy", "query": "jenkins deploy pipeline", "expect": ["beta-deploy"], "expect_turns": [{"session": "beta-deploy", "turn": 1}], "lang": "en"}
 {"id": "css", "query": "login button colours", "project": "Z:\\work\\alpha", "expect": ["css"], "lang": "en"}
 {"id": "none", "query": "kubernetes ingress certificates rotation", "project": "Z:\\work\\alpha", "lang": "en"}
 "#;
@@ -42,7 +42,18 @@ async fn eval_measures_variants_recency_and_inject_thresholds() {
     assert_eq!(production.cases.len(), 3, "negatives are not retrieval cases");
     assert_eq!(production.recall_at_5, 1.0, "{}", eval::format_misses(production, &cases));
     assert_eq!(production.latest, (1, 1), "the newer decision ranks first with recency");
-    assert!(eval::format_retrieval(&reports).contains(PRODUCTION));
+    assert_eq!(production.turn_hit_at_5, (1, 1), "the one turn-targeted case finds its turn");
+    let table = eval::format_retrieval(&reports);
+    assert!(table.contains(PRODUCTION) && table.contains("turn@5"), "{table}");
+
+    // --compare path: dense vs production, with a bootstrap CI and no panics on real data.
+    let two = eval::variants(store::SearchMode::Hybrid, recency);
+    let dense = two.iter().find(|v| v.name == "dense").copied().unwrap();
+    let prod = two.iter().find(|v| v.name == PRODUCTION).copied().unwrap();
+    let cmp = eval::run_retrieval(&ctx, &cases, &[dense, prod], &vectors).await.unwrap();
+    let out = eval::format_compare(&cmp[0], &cmp[1], &cases);
+    assert!(out.starts_with("compare: dense -> production"), "{out}");
+    assert!(out.contains("R@1") && out.contains("MRR") && out.contains("turn-MRR"), "{out}");
 
     let injector = Injector::new(
         e.store.clone(),

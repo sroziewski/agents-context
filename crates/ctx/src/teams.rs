@@ -144,6 +144,26 @@ pub struct ThreadHit {
     pub text: String,
 }
 
+/// The knobs of Teams ranking, so the eval (DEV-30) can compare fusion choices without copying
+/// the fusion code. [`TeamsRanking::default`] is the shipped behaviour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TeamsRanking {
+    /// How the semantic half searches Qdrant (Hybrid today; Dense may suit Polish better).
+    pub semantic_mode: SearchMode,
+    /// RRF constant fusing the semantic and keyword ranks.
+    pub rrf_k: f64,
+    /// Project-group score multiplier (DEV-20).
+    pub boost: f64,
+    /// Include the FTS5 keyword half.
+    pub use_fts: bool,
+}
+
+impl Default for TeamsRanking {
+    fn default() -> Self {
+        Self { semantic_mode: SearchMode::Hybrid, rrf_k: RRF_K, boost: PROJECT_BOOST, use_fts: true }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TeamsResults {
     pub hits: Vec<ThreadHit>,
@@ -183,6 +203,11 @@ struct Local {
 
 impl TeamsSearch {
     pub async fn search(&self, q: &TeamsQuery, current_project: Option<&str>) -> anyhow::Result<TeamsResults> {
+        self.search_with(q, current_project, TeamsRanking::default()).await
+    }
+
+    /// [`Self::search`] with an explicit ranking, used by the eval to compare variants.
+    pub async fn search_with(&self, q: &TeamsQuery, current_project: Option<&str>, ranking: TeamsRanking) -> anyhow::Result<TeamsResults> {
         anyhow::ensure!(self.db.is_file(), "Teams is not set up: {} does not exist", self.db.display());
         let redactor = Redactor::from_file(&self.redact)?;
         let depth = q.limit.max(1) * DEPTH;
@@ -192,18 +217,22 @@ impl TeamsSearch {
 
         // Semantic half; unavailable is not fatal.
         let mut notes = Vec::new();
-        let semantic = match self.semantic(q, &local, depth).await {
+        let semantic = match self.semantic(q, &local, depth, ranking.semantic_mode).await {
             Ok(hits) => hits,
             Err(e) => {
                 notes.push(format!("semantic search unavailable ({e}); keyword matches only"));
                 Vec::new()
             }
         };
-        let fts = match local.fts {
-            Ok(hits) => hits,
-            Err(e) => {
-                notes.push(format!("keyword search unavailable ({e}); semantic matches only"));
-                Vec::new()
+        let fts = if !ranking.use_fts {
+            Vec::new()
+        } else {
+            match local.fts {
+                Ok(hits) => hits,
+                Err(e) => {
+                    notes.push(format!("keyword search unavailable ({e}); semantic matches only"));
+                    Vec::new()
+                }
             }
         };
 
@@ -219,7 +248,7 @@ impl TeamsSearch {
             let tid = string(p, "thread_id");
             if seen.insert(tid.clone()) {
                 rank += 1;
-                *score.entry(tid.clone()).or_default() += 1.0 / (RRF_K + rank as f64);
+                *score.entry(tid.clone()).or_default() += 1.0 / (ranking.rrf_k + rank as f64);
                 stored.insert(tid.clone(), p.clone());
             }
             if string(p, "kind") == "message" && !evidence.contains_key(&tid) {
@@ -231,7 +260,7 @@ impl TeamsSearch {
         for h in &fts {
             if seen.insert(h.thread_id.clone()) {
                 rank += 1;
-                *score.entry(h.thread_id.clone()).or_default() += 1.0 / (RRF_K + rank as f64);
+                *score.entry(h.thread_id.clone()).or_default() += 1.0 / (ranking.rrf_k + rank as f64);
             }
             evidence.entry(h.thread_id.clone()).or_insert_with(|| Evidence { author: h.author.clone(), ts: h.ts, text: h.text.clone() });
         }
@@ -280,7 +309,7 @@ impl TeamsSearch {
                 let ev = evidence.remove(&tid).unwrap_or(fallback);
                 Some(ThreadHit {
                     thread_id: tid,
-                    score: if boosted { s * PROJECT_BOOST } else { s },
+                    score: if boosted { s * ranking.boost } else { s },
                     boosted,
                     team,
                     channel,
@@ -333,7 +362,7 @@ impl TeamsSearch {
         Ok(Local { dir, channel_ids, authors, fts, boost_channels, boosted_groups })
     }
 
-    async fn semantic(&self, q: &TeamsQuery, local: &Local, depth: usize) -> anyhow::Result<Vec<store::Hit>> {
+    async fn semantic(&self, q: &TeamsQuery, local: &Local, depth: usize, mode: SearchMode) -> anyhow::Result<Vec<store::Hit>> {
         // Thread chunks carry the thread's last message time as `ts`, so a date window selects
         // threads active in it; message chunks carry their own time.
         let mut f = SearchFilter::default().between(q.since, q.until);
@@ -347,7 +376,7 @@ impl TeamsSearch {
         let embedder = self.embedder.clone();
         let text = q.text.clone();
         let query = tokio::task::spawn_blocking(move || embedder.lock().unwrap_or_else(|p| p.into_inner()).embed_one(&text)).await??;
-        Ok(self.store.search(&query, &f, depth as u64, SearchMode::Hybrid).await?)
+        Ok(self.store.search(&query, &f, depth as u64, mode).await?)
     }
 
     /// The whole thread, authors labelled, redacted, capped at `max_chars`.

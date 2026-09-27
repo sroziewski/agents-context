@@ -148,6 +148,8 @@ pub struct ThreadHit {
 /// the fusion code. [`TeamsRanking::default`] is the shipped behaviour.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TeamsRanking {
+    /// Include the semantic (Qdrant) half.
+    pub use_semantic: bool,
     /// How the semantic half searches Qdrant (Hybrid today; Dense may suit Polish better).
     pub semantic_mode: SearchMode,
     /// RRF constant fusing the semantic and keyword ranks.
@@ -160,7 +162,7 @@ pub struct TeamsRanking {
 
 impl Default for TeamsRanking {
     fn default() -> Self {
-        Self { semantic_mode: SearchMode::Hybrid, rrf_k: RRF_K, boost: PROJECT_BOOST, use_fts: true }
+        Self { use_semantic: true, semantic_mode: SearchMode::Hybrid, rrf_k: RRF_K, boost: PROJECT_BOOST, use_fts: true }
     }
 }
 
@@ -217,11 +219,15 @@ impl TeamsSearch {
 
         // Semantic half; unavailable is not fatal.
         let mut notes = Vec::new();
-        let semantic = match self.semantic(q, &local, depth, ranking.semantic_mode).await {
-            Ok(hits) => hits,
-            Err(e) => {
-                notes.push(format!("semantic search unavailable ({e}); keyword matches only"));
-                Vec::new()
+        let semantic = if !ranking.use_semantic {
+            Vec::new()
+        } else {
+            match self.semantic(q, &local, depth, ranking.semantic_mode).await {
+                Ok(hits) => hits,
+                Err(e) => {
+                    notes.push(format!("semantic search unavailable ({e}); keyword matches only"));
+                    Vec::new()
+                }
             }
         };
         let fts = if !ranking.use_fts {
@@ -349,13 +355,13 @@ impl TeamsSearch {
         // DEV-20: the current project's groups rank higher; nothing is filtered out.
         let mut boost_channels = HashSet::new();
         let mut boosted_groups = Vec::new();
-        if let Some(project) = current_project {
-            if let Some(groups) = load_project_groups(&self.projects)?.get(project) {
-                for g in groups {
-                    if let Some((name, paths)) = dir.group(g) {
-                        boost_channels.extend(db.resolve_channels(None, None, Some(paths))?);
-                        boosted_groups.push(name.to_owned());
-                    }
+        if let Some(project) = current_project
+            && let Some(groups) = load_project_groups(&self.projects)?.get(project)
+        {
+            for g in groups {
+                if let Some((name, paths)) = dir.group(g) {
+                    boost_channels.extend(db.resolve_channels(None, None, Some(paths))?);
+                    boosted_groups.push(name.to_owned());
                 }
             }
         }

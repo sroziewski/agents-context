@@ -80,6 +80,9 @@ enum Command {
         /// Cap ONNX Runtime CPU threads for the reranker (default: all cores).
         #[arg(long)]
         rerank_threads: Option<usize>,
+        /// What to evaluate: "sessions" (default) or "teams".
+        #[arg(long, default_value = "sessions")]
+        target: String,
     },
     /// Index new or changed sessions (incremental; safe to run any time).
     Index {
@@ -335,88 +338,8 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Eval { file, save_baseline, check, sweep, compare, rerank_model, rerank_pool, rerank_threads } => {
-            use ctx::eval;
-            let path = file.unwrap_or_else(|| cfg.eval_file.clone());
-            let cases = eval::load_cases(&path)?;
-            let ctx = context(&cfg).await?;
-            let vectors = eval::embed_queries(&ctx, &cases).await?;
-            let positives = cases.iter().filter(|c| !c.expect.is_empty()).count();
-            println!("{} cases ({positives} with expected sessions, {} negatives) from {}\n", cases.len(), cases.len() - positives, path.display());
-            if let Some(model) = rerank_model {
-                let which: embed::RerankModel = model.parse().map_err(anyhow::Error::msg)?;
-                eprintln!("loading reranker {model} on CPU (first run downloads it)…");
-                let cache = cfg.rerank_cache_dir.clone();
-                let mut reranker = tokio::task::spawn_blocking(move || embed::FastembedReranker::hub(which, 512, rerank_threads, 32, Some(cache)))
-                    .await?
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                // Baseline: dense turns, no summaries — the same pool the reranker reorders.
-                let base = eval::Variant { name: "dense-turns", mode: store::SearchMode::Dense, summaries: false, recency: ctx::rank::Recency::OFF };
-                let baseline = eval::run_retrieval(&ctx, &cases, &[base], &vectors).await?.remove(0);
-                let (reranked, latency) = eval::run_reranked(&ctx, &cases, &vectors, &mut reranker, rerank_pool, "dense+rerank").await?;
-                println!("reranker: {model}, pool N={rerank_pool}, threads={}\n", rerank_threads.map_or("all".to_owned(), |t| t.to_string()));
-                println!("{}\n", eval::format_retrieval(&[baseline.clone(), reranked.clone()]));
-                println!("{}\n", eval::format_compare(&baseline, &reranked, &cases));
-                println!("{}", eval::format_latency("rerank added latency", latency));
-                return Ok(());
-            }
-            let all_variants = eval::variants(cfg.search_mode, cfg.recency);
-            if let [a, b] = compare.as_slice() {
-                let pick = |name: &str| {
-                    all_variants
-                        .iter()
-                        .find(|v| v.name == name)
-                        .copied()
-                        .ok_or_else(|| anyhow::anyhow!("unknown variant {name:?}; valid: {}", all_variants.iter().map(|v| v.name).collect::<Vec<_>>().join(", ")))
-                };
-                let two = [pick(a)?, pick(b)?];
-                let reports = eval::run_retrieval(&ctx, &cases, &two, &vectors).await?;
-                println!("{}", eval::format_compare(&reports[0], &reports[1], &cases));
-                return Ok(());
-            }
-            let reports = eval::run_retrieval(&ctx, &cases, &all_variants, &vectors).await?;
-            println!("production = {:?} + summaries, recency weight {:.2}", cfg.search_mode, cfg.recency.weight);
-            println!("{}\n", eval::format_retrieval(&reports));
-            let production = reports.iter().find(|r| r.name == eval::PRODUCTION).expect("production variant is always run");
-            println!("{}\n", eval::format_misses(production, &cases));
-            if sweep {
-                let mut tries = Vec::new();
-                for weight in [0.1, 0.2, 0.3, 0.5] {
-                    for half_life_days in [30.0, 60.0, 120.0] {
-                        tries.push(ctx::rank::Recency { weight, half_life_days });
-                    }
-                }
-                let mut rows = Vec::new();
-                for r in tries {
-                    let v = eval::Variant { name: "sweep", mode: cfg.search_mode, summaries: true, recency: r };
-                    let rep = eval::run_retrieval(&ctx, &cases, &[v], &vectors).await?.remove(0);
-                    rows.push(format!(
-                        "weight {:.1} half-life {:>3} d: R@5 {:.2} MRR {:.3} latest {}/{}",
-                        r.weight, r.half_life_days, rep.recall_at_5, rep.mrr, rep.latest.0, rep.latest.1
-                    ));
-                }
-                println!("recency sweep (production mode + summaries):\n  {}\n", rows.join("\n  "));
-            }
-            let injector = injector(&cfg).await?;
-            let thresholds = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70];
-            let points = eval::run_inject(&injector, &cases, &vectors, &thresholds).await?;
-            println!("auto-inject (current min_score {:.2}):\n{}\n", cfg.inject.min_score, eval::format_inject(&points));
-            // Checked before saving, so `--check --save-baseline` compares against the old one.
-            if check {
-                let text = std::fs::read_to_string(&cfg.eval_baseline)
-                    .with_context(|| format!("no baseline at {}; run `ctx eval --save-baseline` first", cfg.eval_baseline.display()))?;
-                let b: eval::Baseline = serde_json::from_str(&text)?;
-                let c = eval::compare(&b, production);
-                println!("against baseline: lost {:?} · gained {:?} · new cases {:?}", c.lost, c.gained, c.new);
-                anyhow::ensure!(!c.is_regression(), "retrieval regressed against the baseline");
-            }
-            if save_baseline {
-                let b = eval::Baseline::from_report(production);
-                std::fs::create_dir_all(cfg.eval_baseline.parent().unwrap_or(std::path::Path::new(".")))?;
-                std::fs::write(&cfg.eval_baseline, serde_json::to_string_pretty(&b)?)?;
-                println!("baseline saved to {}", cfg.eval_baseline.display());
-            }
-            Ok(())
+        Command::Eval { file, save_baseline, check, sweep, compare, rerank_model, rerank_pool, rerank_threads, target } => {
+            run_eval(cfg, file, save_baseline, check, sweep, compare, rerank_model, rerank_pool, rerank_threads, target).await
         }
         Command::Hook { source, .. } => {
             hook::drain_stdin();
@@ -735,4 +658,122 @@ async fn injector(cfg: &Config) -> anyhow::Result<ctx::inject::Injector> {
 async fn context(cfg: &Config) -> anyhow::Result<Context> {
     let embedder: Box<dyn Embedder> = Box::new(connect_embedder(cfg).await?);
     Ok(Context { store: Arc::new(connect_store(cfg)?), embedder: Arc::new(Mutex::new(embedder)) })
+}
+
+
+/// The `ctx eval` handler, split out of `main` so the async main state machine stays small
+/// enough not to overflow the stack in debug builds.
+#[allow(clippy::too_many_arguments)]
+async fn run_eval(
+    cfg: Config, file: Option<PathBuf>, save_baseline: bool, check: bool, sweep: bool,
+    compare: Vec<String>, rerank_model: Option<String>, rerank_pool: u64, rerank_threads: Option<usize>, target: String,
+) -> anyhow::Result<()> {
+            use ctx::eval;
+    let ctx = context(&cfg).await?;
+    if target == "teams" {
+        let path = file.unwrap_or_else(|| cfg.eval_file.parent().unwrap_or(std::path::Path::new(".")).join("teams.jsonl"));
+        let mut cases = eval::load_cases(&path)?;
+        for c in &mut cases { c.target = eval::Target::Teams; }
+        let positives = cases.iter().filter(|c| !c.expect.is_empty()).count();
+        println!("{} teams cases ({positives} positive, {} negatives) from {}
+", cases.len(), cases.len() - positives, path.display());
+        let teams = teams_search(&cfg, &ctx);
+        let reports = eval::run_teams(&teams, &cases, &eval::teams_variants()).await?;
+        println!("{}
+", eval::format_retrieval(&reports));
+        let production = reports.iter().find(|r| r.name == "fused").expect("fused variant is always run");
+        println!("{}", eval::format_misses(production, &cases));
+        let baseline_path = cfg.eval_baseline.with_file_name(format!("{}-teams.json", cfg.eval_baseline.file_stem().and_then(|s| s.to_str()).unwrap_or("eval-baseline")));
+        if check {
+            let text = std::fs::read_to_string(&baseline_path).with_context(|| format!("no teams baseline at {}; run `ctx eval --target teams --save-baseline` first", baseline_path.display()))?;
+            let c = eval::compare(&serde_json::from_str(&text)?, production);
+            println!("\nagainst baseline: lost {:?} · gained {:?} · new cases {:?}", c.lost, c.gained, c.new);
+            anyhow::ensure!(!c.is_regression(), "teams retrieval regressed against the baseline");
+        }
+        if save_baseline {
+            std::fs::create_dir_all(baseline_path.parent().unwrap_or(std::path::Path::new(".")))?;
+            std::fs::write(&baseline_path, serde_json::to_string_pretty(&eval::Baseline::from_report(production))?)?;
+            println!("\nteams baseline saved to {}", baseline_path.display());
+        }
+        return Ok(());
+    }
+            let path = file.unwrap_or_else(|| cfg.eval_file.clone());
+            let cases = eval::load_cases(&path)?;
+            let vectors = eval::embed_queries(&ctx, &cases).await?;
+            let positives = cases.iter().filter(|c| !c.expect.is_empty()).count();
+            println!("{} cases ({positives} with expected sessions, {} negatives) from {}\n", cases.len(), cases.len() - positives, path.display());
+            if let Some(model) = rerank_model {
+                let which: embed::RerankModel = model.parse().map_err(anyhow::Error::msg)?;
+                eprintln!("loading reranker {model} on CPU (first run downloads it)…");
+                let cache = cfg.rerank_cache_dir.clone();
+                let mut reranker = tokio::task::spawn_blocking(move || embed::FastembedReranker::hub(which, 512, rerank_threads, 32, Some(cache)))
+                    .await?
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                // Baseline: dense turns, no summaries — the same pool the reranker reorders.
+                let base = eval::Variant { name: "dense-turns", mode: store::SearchMode::Dense, summaries: false, recency: ctx::rank::Recency::OFF };
+                let baseline = eval::run_retrieval(&ctx, &cases, &[base], &vectors).await?.remove(0);
+                let (reranked, latency) = eval::run_reranked(&ctx, &cases, &vectors, &mut reranker, rerank_pool, "dense+rerank").await?;
+                println!("reranker: {model}, pool N={rerank_pool}, threads={}\n", rerank_threads.map_or("all".to_owned(), |t| t.to_string()));
+                println!("{}\n", eval::format_retrieval(&[baseline.clone(), reranked.clone()]));
+                println!("{}\n", eval::format_compare(&baseline, &reranked, &cases));
+                println!("{}", eval::format_latency("rerank added latency", latency));
+                return Ok(());
+            }
+            let all_variants = eval::variants(cfg.search_mode, cfg.recency);
+            if let [a, b] = compare.as_slice() {
+                let pick = |name: &str| {
+                    all_variants
+                        .iter()
+                        .find(|v| v.name == name)
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("unknown variant {name:?}; valid: {}", all_variants.iter().map(|v| v.name).collect::<Vec<_>>().join(", ")))
+                };
+                let two = [pick(a)?, pick(b)?];
+                let reports = eval::run_retrieval(&ctx, &cases, &two, &vectors).await?;
+                println!("{}", eval::format_compare(&reports[0], &reports[1], &cases));
+                return Ok(());
+            }
+            let reports = eval::run_retrieval(&ctx, &cases, &all_variants, &vectors).await?;
+            println!("production = {:?} + summaries, recency weight {:.2}", cfg.search_mode, cfg.recency.weight);
+            println!("{}\n", eval::format_retrieval(&reports));
+            let production = reports.iter().find(|r| r.name == eval::PRODUCTION).expect("production variant is always run");
+            println!("{}\n", eval::format_misses(production, &cases));
+            if sweep {
+                let mut tries = Vec::new();
+                for weight in [0.1, 0.2, 0.3, 0.5] {
+                    for half_life_days in [30.0, 60.0, 120.0] {
+                        tries.push(ctx::rank::Recency { weight, half_life_days });
+                    }
+                }
+                let mut rows = Vec::new();
+                for r in tries {
+                    let v = eval::Variant { name: "sweep", mode: cfg.search_mode, summaries: true, recency: r };
+                    let rep = eval::run_retrieval(&ctx, &cases, &[v], &vectors).await?.remove(0);
+                    rows.push(format!(
+                        "weight {:.1} half-life {:>3} d: R@5 {:.2} MRR {:.3} latest {}/{}",
+                        r.weight, r.half_life_days, rep.recall_at_5, rep.mrr, rep.latest.0, rep.latest.1
+                    ));
+                }
+                println!("recency sweep (production mode + summaries):\n  {}\n", rows.join("\n  "));
+            }
+            let injector = injector(&cfg).await?;
+            let thresholds = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70];
+            let points = eval::run_inject(&injector, &cases, &vectors, &thresholds).await?;
+            println!("auto-inject (current min_score {:.2}):\n{}\n", cfg.inject.min_score, eval::format_inject(&points));
+            // Checked before saving, so `--check --save-baseline` compares against the old one.
+            if check {
+                let text = std::fs::read_to_string(&cfg.eval_baseline)
+                    .with_context(|| format!("no baseline at {}; run `ctx eval --save-baseline` first", cfg.eval_baseline.display()))?;
+                let b: eval::Baseline = serde_json::from_str(&text)?;
+                let c = eval::compare(&b, production);
+                println!("against baseline: lost {:?} · gained {:?} · new cases {:?}", c.lost, c.gained, c.new);
+                anyhow::ensure!(!c.is_regression(), "retrieval regressed against the baseline");
+            }
+            if save_baseline {
+                let b = eval::Baseline::from_report(production);
+                std::fs::create_dir_all(cfg.eval_baseline.parent().unwrap_or(std::path::Path::new(".")))?;
+                std::fs::write(&cfg.eval_baseline, serde_json::to_string_pretty(&b)?)?;
+                println!("baseline saved to {}", cfg.eval_baseline.display());
+            }
+            Ok(())
 }

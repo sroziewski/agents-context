@@ -21,13 +21,35 @@ use crate::search::{Context, Query, Results, Scope};
 /// Results fetched per search; MRR is measured to this depth.
 const DEPTH: u64 = 10;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Target {
+    #[default]
+    Sessions,
+    Teams,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Case {
     pub id: String,
     pub query: String,
-    /// Project directory the question is asked from; absent means across all projects.
+    /// What this case searches. Default sessions.
+    #[serde(default)]
+    pub target: Target,
+    /// Project directory the question is asked from; absent means across all projects. For a
+    /// teams case it drives the project→group boost.
     #[serde(default)]
     pub project: Option<String>,
+    /// Teams filters (ignored for session cases): restrict to a people.json group, a team or
+    /// channel substring, or an author substring — as `search_teams` would.
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub team: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub author: Option<String>,
     /// Sessions that answer it, the preferred (newest) one first. Empty means nothing in the
     /// index answers it: a negative, where auto-inject must stay silent.
     #[serde(default)]
@@ -256,6 +278,56 @@ pub async fn run_reranked(
         results.push(judge_turns(c, &session_order(&reordered, false), &turn_order(&reordered)));
     }
     Ok((summarize(name, cases, results), latency_ms))
+}
+
+/// A named Teams ranking to evaluate.
+#[derive(Debug, Clone, Copy)]
+pub struct TeamsVariant {
+    pub name: &'static str,
+    pub ranking: crate::teams::TeamsRanking,
+}
+
+/// The Teams ranking choices worth comparing (DEV-30): each half alone, the current fusion, and
+/// dense-vs-hybrid / RRF-k alternatives. `fused` is the shipped default.
+pub fn teams_variants() -> Vec<TeamsVariant> {
+    use crate::teams::TeamsRanking;
+    let base = TeamsRanking::default();
+    vec![
+        TeamsVariant { name: "fts", ranking: TeamsRanking { use_semantic: false, use_fts: true, ..base } },
+        TeamsVariant { name: "semantic-dense", ranking: TeamsRanking { semantic_mode: SearchMode::Dense, use_fts: false, ..base } },
+        TeamsVariant { name: "semantic-hybrid", ranking: TeamsRanking { semantic_mode: SearchMode::Hybrid, use_fts: false, ..base } },
+        TeamsVariant { name: "fused", ranking: base },
+        TeamsVariant { name: "fused-dense", ranking: TeamsRanking { semantic_mode: SearchMode::Dense, ..base } },
+        TeamsVariant { name: "fused-dense-k30", ranking: TeamsRanking { semantic_mode: SearchMode::Dense, rrf_k: 30.0, ..base } },
+        TeamsVariant { name: "fused-noboost", ranking: TeamsRanking { boost: 1.0, ..base } },
+    ]
+}
+
+/// Teams retrieval metrics per variant. Judges distinct threads (search already returns one hit
+/// per thread). The boost is exercised by cases that carry a `project`.
+pub async fn run_teams(teams: &crate::teams::TeamsSearch, cases: &[Case], variants: &[TeamsVariant]) -> anyhow::Result<Vec<VariantReport>> {
+    let positives: Vec<&Case> = cases.iter().filter(|c| c.target == Target::Teams && !c.expect.is_empty()).collect();
+    let mut reports = Vec::new();
+    for v in variants {
+        let mut results = Vec::new();
+        for c in &positives {
+            let q = crate::teams::TeamsQuery {
+                text: c.query.clone(),
+                group: c.group.clone(),
+                team: c.team.clone(),
+                channel: c.channel.clone(),
+                author: c.author.clone(),
+                since: None,
+                until: None,
+                limit: DEPTH as usize,
+            };
+            let r = teams.search_with(&q, c.project.as_deref(), v.ranking).await?;
+            let order: Vec<String> = r.hits.into_iter().map(|h| h.thread_id).collect();
+            results.push(judge(c, &order));
+        }
+        reports.push(summarize(v.name, cases, results));
+    }
+    Ok(reports)
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -537,7 +609,20 @@ mod tests {
     use store::Hit;
 
     fn case(id: &str, expect: &[&str], latest: bool, lang: &str) -> Case {
-        Case { id: id.into(), query: "q".into(), project: None, expect: expect.iter().map(|s| s.to_string()).collect(), latest, expect_turns: vec![], lang: lang.into() }
+        Case {
+            id: id.into(),
+            query: "q".into(),
+            target: Target::Sessions,
+            project: None,
+            group: None,
+            team: None,
+            channel: None,
+            author: None,
+            expect: expect.iter().map(|s| s.to_string()).collect(),
+            latest,
+            expect_turns: vec![],
+            lang: lang.into(),
+        }
     }
 
     fn hit(session: &str) -> Hit {
@@ -665,6 +750,16 @@ mod tests {
         assert_eq!(bootstrap_ci(&mixed), bootstrap_ci(&mixed), "deterministic across runs");
         let n = bootstrap_ci(&mixed);
         assert!(n.lo <= n.delta && n.delta <= n.hi);
+    }
+
+    #[test]
+    fn teams_variants_cover_the_choices_and_default_matches_shipped() {
+        let names: Vec<&str> = teams_variants().iter().map(|v| v.name).collect();
+        assert_eq!(names, ["fts", "semantic-dense", "semantic-hybrid", "fused", "fused-dense", "fused-dense-k30", "fused-noboost"]);
+        let fused = teams_variants().into_iter().find(|v| v.name == "fused").unwrap();
+        assert_eq!(fused.ranking, crate::teams::TeamsRanking::default(), "fused is the shipped ranking");
+        let fts = teams_variants().into_iter().find(|v| v.name == "fts").unwrap();
+        assert!(!fts.ranking.use_semantic && fts.ranking.use_fts);
     }
 
     #[test]

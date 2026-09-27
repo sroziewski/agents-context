@@ -6,6 +6,8 @@ use embed::Embedder;
 use serde_json::Value;
 use store::{Hit, SearchFilter, SearchMode, Store};
 
+use crate::rank::Recency;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// One project key (see `sources::project::key`).
@@ -23,6 +25,25 @@ pub struct Query {
     pub limit: u64,
     /// Subagent transcripts are mostly exploration noise, so they are opt-in.
     pub include_subagents: bool,
+    pub mode: SearchMode,
+    pub recency: Recency,
+}
+
+impl Query {
+    /// Hybrid search without recency over the given scope; callers set the rest as needed.
+    pub fn new(text: impl Into<String>, scope: Scope, limit: u64) -> Self {
+        Self {
+            text: text.into(),
+            scope,
+            source: None,
+            since: None,
+            until: None,
+            limit,
+            include_subagents: false,
+            mode: SearchMode::Hybrid,
+            recency: Recency::OFF,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -59,6 +80,11 @@ impl Context {
             embedder.lock().unwrap_or_else(|p| p.into_inner()).embed_one(&text)
         })
         .await??;
+        self.search_embedded(&query, q).await
+    }
+
+    /// [`Self::search`] with the query already embedded (the eval runs one query many ways).
+    pub async fn search_embedded(&self, query: &embed::Embedding, q: &Query) -> anyhow::Result<Results> {
         let filter_for = |kind: &str| {
             let mut f = scope_filter(&q.scope, kind).between(q.since, q.until);
             if let Some(source) = &q.source {
@@ -70,10 +96,15 @@ impl Context {
             f
         };
         let (summary_filter, turn_filter) = (filter_for("summary"), filter_for("turn"));
-        let summaries = self.store.search(&query, &summary_filter, MAX_SUMMARIES.min(q.limit), SearchMode::Hybrid);
-        let turns = self.store.search(&query, &turn_filter, q.limit, SearchMode::Hybrid);
+        let n_summaries = MAX_SUMMARIES.min(q.limit);
+        let summaries = self.store.search(query, &summary_filter, q.recency.pool(n_summaries), q.mode);
+        let turns = self.store.search(query, &turn_filter, q.recency.pool(q.limit), q.mode);
         let (summaries, turns) = tokio::try_join!(summaries, turns)?;
-        Ok(Results { summaries, turns })
+        let now = jiff::Timestamp::now().as_millisecond();
+        Ok(Results {
+            summaries: q.recency.rerank(summaries, now, n_summaries as usize),
+            turns: q.recency.rerank(turns, now, q.limit as usize),
+        })
     }
 
     /// All chunks of one session in conversation order. A session id is explicit, so it is not

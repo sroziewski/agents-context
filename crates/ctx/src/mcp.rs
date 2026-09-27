@@ -87,13 +87,21 @@ pub struct ContextServer {
     current_project: String,
     state_path: PathBuf,
     teams: Option<crate::teams::TeamsSearch>,
+    mode: store::SearchMode,
+    recency: crate::rank::Recency,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl ContextServer {
     pub fn new(ctx: Context, current_project: String, state_path: PathBuf) -> Self {
-        Self { ctx, current_project, state_path, teams: None, tool_router: Self::tool_router() }
+        Self { ctx, current_project, state_path, teams: None, mode: store::SearchMode::Hybrid, recency: crate::rank::Recency::OFF, tool_router: Self::tool_router() }
+    }
+
+    pub fn with_ranking(mut self, mode: store::SearchMode, recency: crate::rank::Recency) -> Self {
+        self.mode = mode;
+        self.recency = recency;
+        self
     }
 
     pub fn with_teams(mut self, teams: crate::teams::TeamsSearch) -> Self {
@@ -162,15 +170,13 @@ impl ContextServer {
             Some(s @ ("claude" | "opencode")) => Some(s.to_owned()),
             Some(other) => return Err(format!("unknown source {other:?}; use \"claude\" or \"opencode\"")),
         };
-        let q = Query {
-            text: a.query,
-            scope: self.scope(a.scope.as_deref(), a.project.as_deref())?,
-            source,
-            since: a.since.as_deref().map(|d| parse_date(d, false)).transpose().map_err(|e| e.to_string())?,
-            until: a.until.as_deref().map(|d| parse_date(d, true)).transpose().map_err(|e| e.to_string())?,
-            limit: u64::from(a.limit.unwrap_or(6).clamp(1, 20)),
-            include_subagents: a.include_subagents.unwrap_or(false),
-        };
+        let mut q = Query::new(a.query, self.scope(a.scope.as_deref(), a.project.as_deref())?, u64::from(a.limit.unwrap_or(6).clamp(1, 20)));
+        q.source = source;
+        q.since = a.since.as_deref().map(|d| parse_date(d, false)).transpose().map_err(|e| e.to_string())?;
+        q.until = a.until.as_deref().map(|d| parse_date(d, true)).transpose().map_err(|e| e.to_string())?;
+        q.include_subagents = a.include_subagents.unwrap_or(false);
+        q.recency = self.recency;
+        q.mode = self.mode;
         let results = self.ctx.search(&q).await.map_err(|e| e.to_string())?;
         Ok(format_results(&results))
     }

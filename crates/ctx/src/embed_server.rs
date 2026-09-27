@@ -81,6 +81,7 @@ struct AppState {
     embedder: SharedEmbedder,
     health: Health,
     queue: Option<IndexQueue>,
+    injector: Option<Arc<crate::inject::Injector>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -94,13 +95,24 @@ pub fn router(embedder: Box<dyn Embedder>, model: &str) -> Router {
 
 /// Full daemon API. `/index` exists only when an index queue is attached.
 pub fn service_router(embedder: SharedEmbedder, model: &str, queue: Option<IndexQueue>) -> Router {
+    daemon_router(embedder, model, queue, None)
+}
+
+/// [`service_router`] plus `/context`, the auto-inject lookup, when an injector is attached.
+pub fn daemon_router(
+    embedder: SharedEmbedder,
+    model: &str,
+    queue: Option<IndexQueue>,
+    injector: Option<Arc<crate::inject::Injector>>,
+) -> Router {
     let health = Health { model: model.to_owned(), dim: embedder.dim() };
-    let state = AppState { embedder, health, queue };
+    let state = AppState { embedder, health, queue, injector };
     Router::new()
         .route("/health", get(|State(s): State<AppState>| async move { Json(s.health) }))
         .route("/embed", post(embed))
         .route("/index", post(request_index))
         .route("/index/status", get(index_status))
+        .route("/context", post(context))
         .layer(axum::middleware::from_fn(loopback_host_only))
         .with_state(state)
 }
@@ -138,6 +150,18 @@ async fn request_index(State(s): State<AppState>, Json(req): Json<IndexRequest>)
 
 async fn index_status(State(s): State<AppState>) -> Result<Json<Status>, StatusCode> {
     s.queue.map(|q| Json(q.status())).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn context(
+    State(s): State<AppState>,
+    Json(req): Json<crate::inject::ContextRequest>,
+) -> Result<Json<crate::inject::ContextResponse>, (StatusCode, String)> {
+    let injector = s.injector.ok_or((StatusCode::NOT_FOUND, "auto-inject is not set up in this daemon".to_owned()))?;
+    let resp = injector.context(&req).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if !resp.sessions.is_empty() || !resp.threads.is_empty() {
+        eprintln!("[inject] {} sessions, {} threads for {}", resp.sessions.len(), resp.threads.len(), sources::project::key(&req.cwd));
+    }
+    Ok(Json(resp))
 }
 
 async fn embed(

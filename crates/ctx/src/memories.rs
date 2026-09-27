@@ -29,6 +29,34 @@ pub struct Candidate {
     /// Session the fact comes from, for the reviewer.
     #[serde(default)]
     pub session: String,
+    /// Set by [`verify`]; a candidate without one has not been fact-checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<Review>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    Keep,
+    /// Kept with the verifier's corrections applied.
+    Revise,
+    Drop,
+    /// The verifier gave no answer for it.
+    Unverified,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Review {
+    pub verdict: Verdict,
+    /// The verifier's reasons.
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    /// Deterministic check failures: references that exist nowhere, near-duplicates.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Sessions whose turns were checked against.
+    #[serde(default)]
+    pub sources: Vec<String>,
 }
 
 /// Claude Code names a project's directory after its working directory with every
@@ -76,7 +104,9 @@ pub fn prompt(summaries: &[String], existing: &str) -> String {
          to work (type \"feedback\"), project decisions, constraints or goals not obvious from the code (type \
          \"project\"), who the user is (type \"user\"), pointers to external resources (type \"reference\"). \
          Skip one-off task details, anything derivable from the code or git history, secrets, and anything \
-         already in the existing memories. Propose at most 8; zero is fine.\n\n\
+         already in the existing memories. Quote commands, flags and paths only exactly as the summaries show \
+         them, never reconstruct how a command is used. Every candidate is fact-checked against the session \
+         transcripts afterwards, and unsupported ones are rejected. Propose at most 8; zero is fine.\n\n\
          Answer with only a JSON array, no prose. Each element: {{\"name\": kebab-case slug, \"type\": one of \
          user|feedback|project|reference, \"description\": one line, \"body\": the fact, then for feedback and \
          project a line \"**Why:** …\" and a line \"**How to apply:** …\", \"session\": id of the session it \
@@ -105,7 +135,7 @@ pub fn parse_candidates(raw: &str, redactor: &Redactor) -> Result<Vec<Candidate>
 
 /// The first `[` that starts a valid JSON array, so prose like "here are [3] ideas" before the
 /// real answer does not break parsing.
-fn first_json_array(raw: &str) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn first_json_array(raw: &str) -> Option<Vec<serde_json::Value>> {
     raw.match_indices('[').find_map(|(i, _)| {
         let mut stream = serde_json::Deserializer::from_str(&raw[i..]).into_iter::<Vec<serde_json::Value>>();
         // `[3]` in "here are [3] ideas" is valid JSON too; the answer is an array of objects.
@@ -145,6 +175,14 @@ pub fn sanitize(mut c: Candidate, redactor: &Redactor) -> Option<Candidate> {
     if c.description.is_empty() || c.body.is_empty() {
         return None;
     }
+    if let Some(r) = &mut c.review {
+        let lines = |v: &mut Vec<String>| {
+            *v = v.iter().map(|x| clean(&x.replace('\n', " "), false).chars().take(300).collect::<String>()).filter(|x| !x.is_empty()).take(10).collect();
+        };
+        lines(&mut r.reasons);
+        lines(&mut r.warnings);
+        lines(&mut r.sources);
+    }
     // Summaries are redacted already; the model may still reproduce something secret-shaped.
     c.description = redactor.scrub(&c.description).0;
     c.body = redactor.scrub(&c.body).0;
@@ -158,8 +196,9 @@ pub fn file_name(c: &Candidate) -> String {
 /// The description is written as a double-quoted string (JSON escaping is valid YAML), so a
 /// colon or `#` in it cannot break the frontmatter.
 pub fn render(c: &Candidate) -> String {
+    let origin = if c.session.is_empty() { String::new() } else { format!("  originSessionId: {}\n", serde_json::Value::String(c.session.clone())) };
     format!(
-        "---\nname: {}\ndescription: {}\nmetadata:\n  type: {}\n---\n\n{}\n",
+        "---\nname: {}\ndescription: {}\nmetadata:\n  type: {}\n{origin}---\n\n{}\n",
         c.name,
         serde_json::Value::String(c.description.clone()),
         c.kind,
@@ -260,9 +299,50 @@ pub fn format_candidates(list: &[Candidate]) -> String {
     }
     list.iter()
         .enumerate()
-        .map(|(i, c)| format!("[{}] {} ({})\n    {}\n    {}", i + 1, c.name, c.kind, c.description, c.body.replace('\n', "\n    ")))
+        .map(|(i, c)| {
+            let status = match c.review.as_ref().map(|r| r.verdict) {
+                None => "UNVERIFIED (run `ctx memories verify`)",
+                Some(Verdict::Keep) => "verified",
+                Some(Verdict::Revise) => "verified, corrected by the verifier",
+                Some(Verdict::Drop) => "REJECTED by the verifier",
+                Some(Verdict::Unverified) => "UNVERIFIED (the verifier gave no answer)",
+            };
+            let mut out = format!("[{}] {} ({}) - {status}\n    {}\n    {}", i + 1, c.name, c.kind, c.description, c.body.replace('\n', "\n    "));
+            if let Some(r) = &c.review {
+                for reason in &r.reasons {
+                    out.push_str(&format!("\n    - {reason}"));
+                }
+                for w in &r.warnings {
+                    out.push_str(&format!("\n    ! {w}"));
+                }
+                if !r.sources.is_empty() {
+                    out.push_str(&format!("\n    checked against: {}", r.sources.join(", ")));
+                }
+            }
+            out
+        })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Whether `accept` may write the candidate without `--force`: verified, not rejected, and no
+/// deterministic check failed.
+pub fn acceptable(c: &Candidate) -> Result<(), String> {
+    match &c.review {
+        None => Err(format!("{} has not been verified; run `ctx memories verify` or pass --force", c.name)),
+        Some(r) if r.verdict == Verdict::Drop => Err(format!("{} was rejected by the verifier; pass --force to write it anyway", c.name)),
+        Some(r) if r.verdict == Verdict::Unverified => Err(format!("{} could not be verified; pass --force to write it anyway", c.name)),
+        Some(r) if !r.warnings.is_empty() => Err(format!("{} failed checks ({}); pass --force to write it anyway", c.name, r.warnings.join("; "))),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The list without the given 1-based positions; an unknown number is an error.
+pub fn remove_numbers(list: &[Candidate], numbers: &[usize]) -> Result<Vec<Candidate>, String> {
+    if let Some(n) = numbers.iter().find(|n| **n == 0 || **n > list.len()) {
+        return Err(format!("no suggestion {n} (see `ctx memories list`)"));
+    }
+    Ok(list.iter().enumerate().filter(|(i, _)| !numbers.contains(&(i + 1))).map(|(_, c)| c.clone()).collect())
 }
 
 #[cfg(test)]
@@ -270,7 +350,7 @@ mod tests {
     use super::*;
 
     fn cand(name: &str, kind: &str) -> Candidate {
-        Candidate { name: name.into(), kind: kind.into(), description: "d".into(), body: "b".into(), session: "s".into() }
+        Candidate { name: name.into(), kind: kind.into(), description: "d".into(), body: "b".into(), session: "s".into(), review: None }
     }
 
     #[test]
@@ -317,15 +397,68 @@ mod tests {
     }
 
     #[test]
+    fn render_records_the_origin_session() {
+        let c = Candidate { session: "4b9c".into(), ..cand("x", "user") };
+        assert!(render(&c).contains("metadata:\n  type: user\n  originSessionId: \"4b9c\"\n---"), "{}", render(&c));
+    }
+
+    #[test]
+    fn accept_gate_requires_a_clean_positive_review() {
+        let review = |verdict, warnings: &[&str]| Some(Review { verdict, reasons: vec![], warnings: warnings.iter().map(|w| w.to_string()).collect(), sources: vec![] });
+        assert!(acceptable(&cand("a", "user")).unwrap_err().contains("not been verified"));
+        assert!(acceptable(&Candidate { review: review(Verdict::Keep, &[]), ..cand("a", "user") }).is_ok());
+        assert!(acceptable(&Candidate { review: review(Verdict::Revise, &[]), ..cand("a", "user") }).is_ok());
+        assert!(acceptable(&Candidate { review: review(Verdict::Keep, &["--x missing"]), ..cand("a", "user") }).unwrap_err().contains("--x missing"));
+        assert!(acceptable(&Candidate { review: review(Verdict::Drop, &[]), ..cand("a", "user") }).unwrap_err().contains("rejected"));
+        assert!(acceptable(&Candidate { review: review(Verdict::Unverified, &[]), ..cand("a", "user") }).is_err());
+    }
+
+    #[test]
+    fn list_shows_verdict_reasons_warnings_and_sources() {
+        let c = Candidate {
+            review: Some(Review { verdict: Verdict::Drop, reasons: vec!["derivable".into()], warnings: vec!["--y missing".into()], sources: vec!["s1".into()] }),
+            ..cand("a", "user")
+        };
+        let out = format_candidates(&[c, cand("b", "user")]);
+        assert!(out.contains("[1] a (user) - REJECTED by the verifier"), "{out}");
+        assert!(out.contains("\n    - derivable") && out.contains("\n    ! --y missing") && out.contains("checked against: s1"));
+        assert!(out.contains("[2] b (user) - UNVERIFIED (run `ctx memories verify`)"));
+    }
+
+    #[test]
+    fn remove_numbers_drops_positions_and_rejects_unknown_ones() {
+        let list = [cand("a", "user"), cand("b", "user"), cand("c", "user")];
+        let rest = remove_numbers(&list, &[1, 3]).unwrap();
+        assert_eq!(rest, [cand("b", "user")]);
+        assert!(remove_numbers(&list, &[4]).is_err());
+        assert!(remove_numbers(&list, &[0]).is_err());
+    }
+
+    #[test]
+    fn reviews_survive_the_pending_file_and_are_revalidated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("p.json");
+        let c = Candidate {
+            review: Some(Review { verdict: Verdict::Keep, reasons: vec!["ok\u{1b}[8m".into()], warnings: vec![], sources: vec!["s".into()] }),
+            ..cand("a", "user")
+        };
+        save_pending(&path, &[c]).unwrap();
+        let back = load_pending(&path);
+        let r = back[0].review.as_ref().unwrap();
+        assert_eq!(r.verdict, Verdict::Keep);
+        assert!(!r.reasons[0].contains('\u{1b}'));
+    }
+
+    #[test]
     fn render_uses_the_memory_file_format() {
-        let c = Candidate { name: "git-identity".into(), kind: "project".into(), description: "commit as gmail".into(), body: "Use it.".into(), session: String::new() };
+        let c = Candidate { name: "git-identity".into(), kind: "project".into(), description: "commit as gmail".into(), body: "Use it.".into(), session: String::new(), review: None };
         assert_eq!(render(&c), "---\nname: git-identity\ndescription: \"commit as gmail\"\nmetadata:\n  type: project\n---\n\nUse it.\n");
         assert_eq!(file_name(&c), "project_git-identity.md");
     }
 
     #[test]
     fn description_with_colon_or_hash_stays_valid_frontmatter() {
-        let c = Candidate { name: "x".into(), kind: "user".into(), description: "Use X: always # really \"quoted\"".into(), body: "b".into(), session: String::new() };
+        let c = Candidate { name: "x".into(), kind: "user".into(), description: "Use X: always # really \"quoted\"".into(), body: "b".into(), session: String::new(), review: None };
         let r = render(&c);
         let line = r.lines().nth(2).unwrap();
         let value: String = serde_json::from_str(line.strip_prefix("description: ").unwrap()).unwrap();

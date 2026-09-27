@@ -38,6 +38,41 @@ pub fn notify(embed_url: &str, target: Target, timeout: Duration, env: impl Fn(&
     }
 }
 
+/// The `UserPromptSubmit` hook: asks the daemon for context matching the prompt in the hook
+/// payload and returns what to print, or `None` to add nothing. Like every hook here it never
+/// fails the prompt: a slow or absent daemon just means no context this time.
+pub fn inject(embed_url: &str, payload: &str, timeout: Duration, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if env(SUMMARIZER_ENV).is_some() {
+        return None;
+    }
+    let payload: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let field = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+    let req = crate::inject::ContextRequest { prompt: field("prompt"), cwd: field("cwd"), session_id: field("session_id") };
+    if !crate::inject::worth_searching(&req.prompt) {
+        return None;
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .timeout_connect(Some(timeout.min(Duration::from_millis(300))))
+        .build()
+        .into();
+    let url = format!("{}/context", embed_url.trim_end_matches('/'));
+    let resp: crate::inject::ContextResponse = agent.post(&url).send_json(&req).ok()?.body_mut().read_json().ok()?;
+    (!resp.context.is_empty()).then(|| crate::inject::hook_output(&resp.context))
+}
+
+/// Reads the hook payload (capped; Claude Code sends a small JSON object).
+pub fn read_stdin() -> String {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return String::new();
+    }
+    // Lossy: one byte in a foreign code page must not cost the whole payload.
+    let mut buf = Vec::new();
+    let _ = std::io::stdin().take(1 << 20).read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// Runs an index through the daemon and waits for it, so a manual `ctx index` never races the
 /// daemon's own runs over the same state DB and points. `None` when no daemon with an index
 /// queue is reachable; the caller then indexes in-process.
@@ -126,6 +161,28 @@ mod tests {
             (k == SUMMARIZER_ENV).then(|| "1".to_owned())
         });
         assert_eq!(outcome, Outcome::SkippedSummarizer);
+    }
+
+    #[test]
+    fn inject_adds_nothing_without_a_daemon_or_for_trivial_prompts() {
+        let payload = r#"{"session_id": "s", "cwd": "D:\\x", "prompt": "how did we fix the GPU hang?"}"#;
+        let start = std::time::Instant::now();
+        assert_eq!(inject("http://127.0.0.1:9", payload, Duration::from_secs(2), |_| None), None);
+        assert!(start.elapsed() < Duration::from_millis(1500));
+        assert_eq!(inject("http://127.0.0.1:9", r#"{"prompt": "ok"}"#, Duration::from_secs(2), |_| None), None);
+        assert_eq!(inject("http://127.0.0.1:9", "not json", Duration::from_secs(2), |_| None), None);
+        assert_eq!(inject("http://127.0.0.1:9", payload, Duration::from_secs(2), |k| (k == SUMMARIZER_ENV).then(|| "1".into())), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_against_a_daemon_without_injector_adds_nothing() {
+        let app = crate::embed_server::router(Box::new(HashEmbedder::new(8)), "m");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let payload = r#"{"session_id": "s", "cwd": "D:\\x", "prompt": "how did we fix the GPU hang?"}"#;
+        let out = tokio::task::spawn_blocking(move || inject(&url, payload, Duration::from_secs(2), |_| None)).await.unwrap();
+        assert_eq!(out, None, "404 from /context");
     }
 
     #[tokio::test(flavor = "multi_thread")]

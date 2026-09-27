@@ -28,9 +28,27 @@ fn injector(e: &Env, min_score: f32) -> Injector {
         Arc::new(Mutex::new(Box::new(HashEmbedder::new(DIM)) as Box<dyn Embedder>)),
         Arc::new(WordCounter),
         Recency::OFF,
-        InjectConfig { enabled: true, teams: false, min_score, teams_min_score: min_score, max_tokens: 1500 },
+        InjectConfig { enabled: true, enabled_claude: true, enabled_opencode: true, teams: false, min_score, teams_min_score: min_score, max_tokens: 1500 },
         e.cfg.redact_file.clone(),
     )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn context_is_gated_per_client() {
+    let e = indexed(FIXTURES).await;
+    let mut inj = injector(&e, 0.5);
+    inj.config.enabled_claude = true;
+    inj.config.enabled_opencode = false;
+    let req = |client: &str| ctx::inject::ContextRequest {
+        prompt: "how did we fix the directml gpu hang timeout".into(),
+        cwd: ALPHA.into(),
+        session_id: String::new(),
+        client: client.into(),
+    };
+    let claude = inj.context(&req("claude")).await.unwrap();
+    assert!(!claude.context.is_empty(), "claude is on");
+    let oc = inj.context(&req("opencode")).await.unwrap();
+    assert!(oc.context.is_empty() && oc.reason.as_deref() == Some("disabled"), "opencode is gated off: {oc:?}");
 }
 
 async fn serve(injector: Injector) -> String {
@@ -79,7 +97,7 @@ async fn stays_silent_below_the_threshold_and_for_trivial_prompts() {
 async fn a_busy_embedder_skips_the_prompt_without_marking_anything_injected() {
     let e = indexed(FIXTURES).await;
     let inj = injector(&e, 0.5);
-    let req = ctx::inject::ContextRequest { prompt: "how did we fix the directml gpu hang timeout".into(), cwd: ALPHA.into(), session_id: "conv".into() };
+    let req = ctx::inject::ContextRequest { prompt: "how did we fix the directml gpu hang timeout".into(), cwd: ALPHA.into(), session_id: "conv".into(), client: "claude".into() };
 
     let embedder = inj.embedder.clone();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
@@ -109,7 +127,7 @@ async fn already_injected_sessions_make_room_for_the_next_match() {
     ];
     let e = indexed(fixtures).await;
     let inj = injector(&e, 0.3);
-    let req = ctx::inject::ContextRequest { prompt: "directml gpu hang timeout batch size fix".into(), cwd: ALPHA.into(), session_id: "conv".into() };
+    let req = ctx::inject::ContextRequest { prompt: "directml gpu hang timeout batch size fix".into(), cwd: ALPHA.into(), session_id: "conv".into(), client: "claude".into() };
     let first = inj.context(&req).await.unwrap().sessions;
     assert_eq!(first.len(), 3);
     let second = inj.context(&req).await.unwrap().sessions;
@@ -122,7 +140,7 @@ async fn preview_and_hook_agree_and_respect_the_token_cap() {
     let e = indexed(FIXTURES).await;
     let mut small = injector(&e, 0.0);
     small.config.max_tokens = 60;
-    let req = ctx::inject::ContextRequest { prompt: "directml gpu hang timeout batch size fix".into(), cwd: ALPHA.into(), session_id: String::new() };
+    let req = ctx::inject::ContextRequest { prompt: "directml gpu hang timeout batch size fix".into(), cwd: ALPHA.into(), session_id: String::new(), client: "claude".into() };
     let r = small.context(&req).await.unwrap();
     assert!(!r.context.is_empty());
     assert!(ingest::TokenCounter::count(&WordCounter, &r.context) <= 60, "{}", r.context);

@@ -45,6 +45,10 @@ const EMBED_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 pub struct InjectConfig {
     /// `CTX_INJECT`; read by the hook on every prompt, so toggling needs no daemon restart.
     pub enabled: bool,
+    /// Per-client overrides (`CTX_INJECT_CLAUDE` / `CTX_INJECT_OPENCODE`), each defaulting to
+    /// `enabled`. The daemon gates on these, since the OpenCode plugin can't read `.env`.
+    pub enabled_claude: bool,
+    pub enabled_opencode: bool,
     /// Also inject matching Teams threads (`CTX_INJECT_TEAMS`).
     pub teams: bool,
     pub min_score: f32,
@@ -57,7 +61,15 @@ pub struct InjectConfig {
 
 impl Default for InjectConfig {
     fn default() -> Self {
-        Self { enabled: false, teams: false, min_score: DEFAULT_MIN_SCORE, teams_min_score: DEFAULT_MIN_SCORE, max_tokens: DEFAULT_MAX_TOKENS }
+        Self {
+            enabled: false,
+            enabled_claude: false,
+            enabled_opencode: false,
+            teams: false,
+            min_score: DEFAULT_MIN_SCORE,
+            teams_min_score: DEFAULT_MIN_SCORE,
+            max_tokens: DEFAULT_MAX_TOKENS,
+        }
     }
 }
 
@@ -69,6 +81,14 @@ pub struct ContextRequest {
     /// The conversation asking; its own summary is never injected into it.
     #[serde(default)]
     pub session_id: String,
+    /// Which agent is asking, so the daemon can gate inject per client (DEV-32). Defaults to
+    /// "claude" for the existing hook.
+    #[serde(default = "default_client")]
+    pub client: String,
+}
+
+fn default_client() -> String {
+    "claude".to_owned()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -79,6 +99,9 @@ pub struct ContextResponse {
     pub sessions: Vec<String>,
     #[serde(default)]
     pub threads: Vec<String>,
+    /// Why the context is empty when it is (e.g. "disabled"), for the caller's logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// What would be injected for a prompt, before per-conversation de-duplication and formatting.
@@ -233,10 +256,17 @@ impl Injector {
 
     /// The context block for one prompt; empty when nothing qualifies.
     pub async fn context(&self, req: &ContextRequest) -> anyhow::Result<ContextResponse> {
+        let config = self.current_config();
+        let enabled = match req.client.as_str() {
+            "opencode" => config.enabled_opencode,
+            _ => config.enabled_claude,
+        };
+        if !enabled {
+            return Ok(ContextResponse { reason: Some("disabled".into()), ..Default::default() });
+        }
         if !worth_searching(&req.prompt) {
             return Ok(ContextResponse::default());
         }
-        let config = self.current_config();
         let project = sources::project::key(&req.cwd);
         let Some(query) = self.embed(&req.prompt).await? else {
             eprintln!("[inject] embedder busy with indexing; prompt goes without context");

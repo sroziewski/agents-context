@@ -47,7 +47,7 @@ pub fn inject(embed_url: &str, payload: &str, timeout: Duration, env: impl Fn(&s
     }
     let payload: serde_json::Value = serde_json::from_str(payload).ok()?;
     let field = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_owned();
-    let req = crate::inject::ContextRequest { prompt: field("prompt"), cwd: field("cwd"), session_id: field("session_id") };
+    let req = crate::inject::ContextRequest { prompt: field("prompt"), cwd: field("cwd"), session_id: field("session_id"), client: "claude".into() };
     if !crate::inject::worth_searching(&req.prompt) {
         return None;
     }

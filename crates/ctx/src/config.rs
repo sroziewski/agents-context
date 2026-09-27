@@ -118,6 +118,8 @@ impl Config {
             rerank_cache_dir: path("CTX_RERANK_CACHE_DIR", data.join("fastembed-cache")),
             inject: crate::inject::InjectConfig {
                 enabled: on("CTX_INJECT", false),
+                enabled_claude: on("CTX_INJECT_CLAUDE", on("CTX_INJECT", false)),
+                enabled_opencode: on("CTX_INJECT_OPENCODE", on("CTX_INJECT", false)),
                 teams: on("CTX_INJECT_TEAMS", false),
                 min_score: number("CTX_INJECT_MIN_SCORE", crate::inject::DEFAULT_MIN_SCORE as f64) as f32,
                 teams_min_score: number("CTX_INJECT_TEAMS_MIN_SCORE", crate::inject::DEFAULT_TEAMS_MIN_SCORE as f64) as f32,

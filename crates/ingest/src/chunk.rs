@@ -51,7 +51,11 @@ pub fn chunk_session(s: &Session, counter: &dyn TokenCounter, cfg: &ChunkConfig)
     // every chunk header and the payload, so it is redacted like the turns.
     let title = s.title.as_deref().map(|t| cfg.redactor.scrub(t).0);
     for turn in &s.turns {
-        let (doc, redactions) = cfg.redactor.scrub(&turn_document(turn, cfg.max_tools));
+        // Strip any auto-injected past-context block before indexing, so injected summaries can
+        // never be re-indexed and fed back into future prompts (DEV-32). The readers already
+        // drop it (Claude stores it as an attachment, OpenCode as a synthetic part), but this
+        // catches it whatever the source.
+        let (doc, redactions) = cfg.redactor.scrub(&strip_injected_context(&turn_document(turn, cfg.max_tools)));
         stats.redactions += redactions;
         let header = header(title.as_deref(), turn);
         let budget = cfg.max_tokens.saturating_sub(counter.count(&header)).max(16);
@@ -69,6 +73,29 @@ pub fn chunk_session(s: &Session, counter: &dyn TokenCounter, cfg: &ChunkConfig)
         }
     }
     (chunks, stats)
+}
+
+/// The auto-inject block's tag (kept in sync with `ctx`'s injector).
+const INJECT_TAG: &str = "past-sessions";
+
+/// Removes every `<past-sessions>…</past-sessions>` block (case-insensitive open tag), including
+/// an unclosed trailing one. Text outside the blocks is untouched.
+pub(crate) fn strip_injected_context(text: &str) -> String {
+    let open = format!("<{INJECT_TAG}>");
+    let close = format!("</{INJECT_TAG}>");
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(rel) = lower[i..].find(&open) {
+        let start = i + rel;
+        out.push_str(&text[i..start]);
+        match lower[start..].find(&close) {
+            Some(end_rel) => i = start + end_rel + close.len(),
+            None => return out.trim_end().to_owned(), // unclosed: drop the rest
+        }
+    }
+    out.push_str(&text[i..]);
+    out.trim().to_owned()
 }
 
 fn turn_document(t: &Turn, max_tools: usize) -> String {
@@ -201,6 +228,18 @@ mod tests {
     use super::*;
     use crate::tokens::WordCounter;
     use sources::Source;
+
+    #[test]
+    fn strip_injected_context_removes_the_block_but_keeps_surrounding_text() {
+        let t = "please help\n<past-sessions>\n[S1] session x\ninjected gist\n</past-sessions>\nreal question here";
+        assert_eq!(strip_injected_context(t), "please help\n\nreal question here");
+        // unclosed (truncated) block: drop from the tag on.
+        assert_eq!(strip_injected_context("ask this <PAST-SESSIONS>\ndangling"), "ask this");
+        // no block: untouched.
+        assert_eq!(strip_injected_context("just a normal question"), "just a normal question");
+        // two blocks.
+        assert_eq!(strip_injected_context("a <past-sessions>x</past-sessions> b <past-sessions>y</past-sessions> c"), "a  b  c");
+    }
 
     fn session(turns: Vec<Turn>) -> Session {
         Session {

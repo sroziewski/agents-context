@@ -193,10 +193,17 @@ enum MemoriesAction {
 
 #[derive(Subcommand)]
 enum InjectAction {
-    /// Turn auto-inject on (takes effect on the next prompt).
-    On,
-    /// Turn it off.
-    Off,
+    /// Turn auto-inject on (takes effect on the next prompt). With --client, only for that
+    /// agent; without, the global default for both.
+    On {
+        #[arg(long)]
+        client: Option<String>,
+    },
+    /// Turn it off (globally, or for one --client).
+    Off {
+        #[arg(long)]
+        client: Option<String>,
+    },
     /// Show whether it is on and its settings.
     Status,
     /// Show what would be injected for a prompt asked from the current directory.
@@ -289,7 +296,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Hook { inject: true, .. } => {
             let payload = hook::read_stdin();
-            if cfg.inject.enabled {
+            // Fast path: skip the HTTP call when Claude inject is off. The daemon gates per
+            // client too, so this only saves a round-trip.
+            if cfg.inject.enabled_claude {
                 let url = cfg.embed_url.clone();
                 let out = tokio::task::spawn_blocking(move || hook::inject(&url, &payload, Duration::from_secs(3), |k| std::env::var(k).ok())).await;
                 if let Ok(Some(json)) = out {
@@ -301,32 +310,45 @@ async fn main() -> anyhow::Result<()> {
         Command::Inject { action } => {
             let env_file = Config::env_file();
             match action {
-                InjectAction::On | InjectAction::Off => {
-                    let on = matches!(action, InjectAction::On);
-                    ctx::config::set_env_value(&env_file, "CTX_INJECT", if on { "on" } else { "off" })?;
-                    println!("auto-inject {} ({})", if on { "on" } else { "off" }, env_file.display());
+                InjectAction::On { ref client } | InjectAction::Off { ref client } => {
+                    let on = matches!(action, InjectAction::On { .. });
+                    let key = match client.as_deref() {
+                        None => "CTX_INJECT",
+                        Some("claude") => "CTX_INJECT_CLAUDE",
+                        Some("opencode") => "CTX_INJECT_OPENCODE",
+                        Some(other) => anyhow::bail!("unknown client {other:?}; use claude or opencode"),
+                    };
+                    ctx::config::set_env_value(&env_file, key, if on { "on" } else { "off" })?;
+                    println!("auto-inject {} for {} ({})", if on { "on" } else { "off" }, client.as_deref().unwrap_or("all clients"), env_file.display());
                     if on {
-                        println!("it needs the UserPromptSubmit hook in ~/.claude/settings.json: `ctx.exe hook --inject`");
+                        println!("Claude needs the UserPromptSubmit hook (`ctx.exe hook --inject`); OpenCode needs the ctx-inject plugin.");
                     }
                 }
                 InjectAction::Status => {
                     let i = cfg.inject;
+                    let onoff = |b| if b { "on" } else { "off" };
                     println!(
-                        "auto-inject {} · teams {} · min_score {:.2} · max {} tokens · recency weight {:.2}, half-life {} days",
-                        if i.enabled { "on" } else { "off" },
-                        if i.teams { "on" } else { "off" },
+                        "auto-inject: claude {} · opencode {} · teams {} · min_score {:.2} · teams_min_score {:.2} · max {} tokens · recency weight {:.2}, half-life {} days",
+                        onoff(i.enabled_claude),
+                        onoff(i.enabled_opencode),
+                        onoff(i.teams),
                         i.min_score,
+                        i.teams_min_score,
                         i.max_tokens,
                         cfg.recency.weight,
                         cfg.recency.half_life_days
                     );
                 }
                 InjectAction::Preview { prompt } => {
+                    // Show what would be injected even when inject is currently off.
+                    let mut cfg = cfg.clone();
+                    cfg.inject.enabled_claude = true;
                     let injector = injector(&cfg).await?;
                     let req = ctx::inject::ContextRequest {
                         prompt,
                         cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
                         session_id: String::new(),
+                        client: "claude".into(),
                     };
                     let resp = injector.context(&req).await?;
                     if resp.context.is_empty() {

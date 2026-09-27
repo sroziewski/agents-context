@@ -34,6 +34,11 @@ pub struct Config {
     pub recency: crate::rank::Recency,
     /// How session search ranks (`CTX_SEARCH_MODE`: dense, hybrid, sparse).
     pub search_mode: store::SearchMode,
+    /// Deep-search reranker: which CPU model, its thread cap, and the candidate pool. Opt-in;
+    /// normal search never loads it (DEV-28 found it ~16 s/query, too slow for the default).
+    pub rerank_model: String,
+    pub rerank_threads: Option<usize>,
+    pub rerank_pool: u64,
     pub inject: crate::inject::InjectConfig,
     /// Model that fact-checks memory suggestions against the sessions they came from.
     pub verify_model: String,
@@ -104,6 +109,9 @@ impl Config {
                 half_life_days: number("CTX_RECENCY_HALF_LIFE_DAYS", DEFAULT_HALF_LIFE_DAYS),
             },
             search_mode: parse_mode(get("CTX_SEARCH_MODE").as_deref()),
+            rerank_model: get("CTX_RERANK_MODEL").unwrap_or_else(|| "jina-v2".into()),
+            rerank_threads: get("CTX_RERANK_THREADS").and_then(|v| v.trim().parse().ok()),
+            rerank_pool: get("CTX_RERANK_POOL").and_then(|v| v.trim().parse().ok()).unwrap_or(30),
             inject: crate::inject::InjectConfig {
                 enabled: on("CTX_INJECT", false),
                 teams: on("CTX_INJECT_TEAMS", false),

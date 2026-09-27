@@ -83,4 +83,14 @@ async fn eval_measures_variants_recency_and_inject_thresholds() {
     // The overlap reranker surfaces the jenkins turn for its query.
     assert!(reranked.cases.iter().any(|c| c.id == "deploy" && c.rank == Some(1)), "{:?}", reranked.cases);
     assert!(eval::format_latency("rerank", latency).contains("p50"));
+
+    // Deep search (opt-in): the same reordering, but summaries stay first and the turns are cut
+    // to the caller's limit. Uses a local HashReranker, no daemon.
+    let rr: Arc<Mutex<Box<dyn embed::Reranker>>> = Arc::new(Mutex::new(Box::new(embed::HashReranker)));
+    let mut q = ctx::search::Query::new("jenkins deploy pipeline to production", ctx::search::Scope::All, 3);
+    q.recency = Recency::OFF;
+    let deep = ctx.search_reranked(&q, rr, 20).await.unwrap();
+    assert!(deep.turns.len() <= 3, "cut to the limit");
+    let top = deep.turns[0].payload.get("session_id").and_then(|v| v.as_str()).unwrap();
+    assert_eq!(top, "beta-deploy", "the overlap reranker puts the jenkins turn first");
 }

@@ -34,7 +34,7 @@ fn injector(e: &Env, min_score: f32) -> Injector {
 }
 
 async fn serve(injector: Injector) -> String {
-    let app = daemon_router(SharedEmbedder::new(Box::new(HashEmbedder::new(DIM))), "hash", None, Some(Arc::new(injector)));
+    let app = daemon_router(SharedEmbedder::new(Box::new(HashEmbedder::new(DIM))), "hash", None, Some(Arc::new(injector)), None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

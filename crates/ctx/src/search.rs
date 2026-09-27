@@ -107,6 +107,30 @@ impl Context {
         })
     }
 
+    /// Deep search (opt-in): dense retrieval of a larger turn pool, reordered by `reranker`.
+    /// Summaries (the gist) stay first as in a normal search; only the turns are reranked, then
+    /// cut to `q.limit`. `pool` is how many turns the reranker sees. The reranker call is
+    /// blocking (HTTP to the daemon), so it runs on a blocking thread.
+    pub async fn search_reranked(&self, q: &Query, reranker: std::sync::Arc<std::sync::Mutex<Box<dyn embed::Reranker>>>, pool: u64) -> anyhow::Result<Results> {
+        let mut deep = q.clone();
+        deep.limit = pool.max(q.limit);
+        deep.mode = SearchMode::Dense;
+        deep.recency = Recency::OFF;
+        let mut results = self.search(&deep).await?;
+        if results.turns.len() > 1 {
+            let query = q.text.clone();
+            let texts: Vec<String> = results.turns.iter().map(|h| string(&h.payload, "text")).collect();
+            let order = tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                reranker.lock().unwrap_or_else(|p| p.into_inner()).order(&query, &refs)
+            })
+            .await??;
+            results.turns = order.into_iter().map(|i| results.turns[i].clone()).collect();
+        }
+        results.turns.truncate(q.limit as usize);
+        Ok(results)
+    }
+
     /// All chunks of one session in conversation order. A session id is explicit, so it is not
     /// limited to the current project.
     pub async fn session(&self, id: &str) -> anyhow::Result<Vec<Hit>> {

@@ -107,6 +107,11 @@ enum Command {
         limit: u64,
         #[arg(long)]
         subagents: bool,
+        /// Deep search: rerank the results with the daemon's CPU cross-encoder. Slower
+        /// (seconds), off by default; falls back to the normal order if the daemon has no
+        /// reranker.
+        #[arg(long)]
+        rerank: bool,
     },
     /// Search Teams channel messages by meaning and keywords.
     SearchTeams {
@@ -270,7 +275,14 @@ async fn main() -> anyhow::Result<()> {
             if index_every > 0 {
                 queue.schedule(Duration::from_secs(index_every * 60));
             }
-            embed_server::serve(embed_server::daemon_router(shared, &model, Some(queue), Some(injector)), addr).await
+            // Lazily-built CPU reranker for opt-in deep search; loaded only on the first
+            // /rerank call, never for a normal search.
+            let (rerank_model, rerank_threads) = (cfg.rerank_model.clone(), cfg.rerank_threads);
+            let reranker: embed_server::RerankerFactory = Arc::new(move || {
+                let which: embed::RerankModel = rerank_model.parse().map_err(embed::EmbedError::Model)?;
+                Ok(Box::new(embed::FastembedReranker::hub(which, 512, rerank_threads, 32)?) as Box<dyn embed::Reranker>)
+            });
+            embed_server::serve(embed_server::daemon_router(shared, &model, Some(queue), Some(injector), Some(reranker)), addr).await
         }
         Command::Hook { inject: true, .. } => {
             let payload = hook::read_stdin();
@@ -460,7 +472,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", ctx::format_report(&report, t.elapsed()));
             Ok(())
         }
-        Command::Search { query, all, project, since, until, limit, subagents } => {
+        Command::Search { query, all, project, since, until, limit, subagents, rerank } => {
             let ctx = context(&cfg).await?;
             let mut q = Query::new(query, scope(all, project), limit);
             q.since = since.as_deref().map(|d| parse_date(d, false)).transpose()?;
@@ -468,7 +480,19 @@ async fn main() -> anyhow::Result<()> {
             q.include_subagents = subagents;
             q.recency = cfg.recency;
             q.mode = cfg.search_mode;
-            println!("{}", format_results(&ctx.search(&q).await?));
+            let results = if rerank {
+                let rr: Arc<Mutex<Box<dyn embed::Reranker>>> = Arc::new(Mutex::new(Box::new(embed_server::RemoteReranker::new(&cfg.embed_url))));
+                match ctx.search_reranked(&q, rr, cfg.rerank_pool).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("deep search unavailable ({e}); showing the normal order");
+                        ctx.search(&q).await?
+                    }
+                }
+            } else {
+                ctx.search(&q).await?
+            };
+            println!("{}", format_results(&results));
             Ok(())
         }
         Command::SearchTeams { query, group, team, channel, author, since, until, limit } => {
@@ -635,7 +659,10 @@ async fn main() -> anyhow::Result<()> {
             let embedder: Box<dyn Embedder> = Box::new(embed_server::LazyRemote::new(&cfg.embed_url, embed::BGEM3_DIM));
             let ctx = Context { store: Arc::new(connect_store(&cfg)?), embedder: Arc::new(Mutex::new(embedder)) };
             let teams = teams_search(&cfg, &ctx);
-            let server = mcp::ContextServer::new(ctx, mcp::current_project(), cfg.state_path.clone()).with_teams(teams).with_ranking(cfg.search_mode, cfg.recency);
+            let server = mcp::ContextServer::new(ctx, mcp::current_project(), cfg.state_path.clone())
+                .with_teams(teams)
+                .with_ranking(cfg.search_mode, cfg.recency)
+                .with_rerank(cfg.embed_url.clone(), cfg.rerank_pool);
             mcp::serve_stdio(server).await
         }
     }

@@ -76,12 +76,40 @@ impl Embedder for SharedEmbedder {
     }
 }
 
+/// Builds the reranker on first use. Returns a boxed model so the daemon and tests share the
+/// route: production passes a factory that loads the CPU cross-encoder; tests pass one that
+/// returns a [`embed::HashReranker`].
+pub type RerankerFactory = Arc<dyn Fn() -> embed::Result<Box<dyn embed::Reranker>> + Send + Sync>;
+
+/// Lazily-loaded reranker, kept behind its own lock so it never waits on the embedder mutex the
+/// indexer holds. Loading is slow (model download + init), so it happens on the first `/rerank`.
+struct RerankerState {
+    make: RerankerFactory,
+    slot: Mutex<Option<Box<dyn embed::Reranker>>>,
+}
+
 #[derive(Clone)]
 struct AppState {
     embedder: SharedEmbedder,
     health: Health,
     queue: Option<IndexQueue>,
     injector: Option<Arc<crate::inject::Injector>>,
+    reranker: Option<Arc<RerankerState>>,
+}
+
+/// Largest candidate set one `/rerank` call scores; deep search sends a few dozen.
+pub const MAX_RERANK_DOCS: usize = 64;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RerankRequest {
+    pub query: String,
+    pub docs: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RerankResponse {
+    /// One score per input document, in order; higher is more relevant.
+    pub scores: Vec<f32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -95,26 +123,51 @@ pub fn router(embedder: Box<dyn Embedder>, model: &str) -> Router {
 
 /// Full daemon API. `/index` exists only when an index queue is attached.
 pub fn service_router(embedder: SharedEmbedder, model: &str, queue: Option<IndexQueue>) -> Router {
-    daemon_router(embedder, model, queue, None)
+    daemon_router(embedder, model, queue, None, None)
 }
 
-/// [`service_router`] plus `/context`, the auto-inject lookup, when an injector is attached.
+/// [`service_router`] plus `/context` (auto-inject) when an injector is attached and `/rerank`
+/// (deep search) when a reranker factory is attached.
 pub fn daemon_router(
     embedder: SharedEmbedder,
     model: &str,
     queue: Option<IndexQueue>,
     injector: Option<Arc<crate::inject::Injector>>,
+    reranker: Option<RerankerFactory>,
 ) -> Router {
     let health = Health { model: model.to_owned(), dim: embedder.dim() };
-    let state = AppState { embedder, health, queue, injector };
+    let reranker = reranker.map(|make| Arc::new(RerankerState { make, slot: Mutex::new(None) }));
+    let state = AppState { embedder, health, queue, injector, reranker };
     Router::new()
         .route("/health", get(|State(s): State<AppState>| async move { Json(s.health) }))
         .route("/embed", post(embed))
         .route("/index", post(request_index))
         .route("/index/status", get(index_status))
         .route("/context", post(context))
+        .route("/rerank", post(rerank))
         .layer(axum::middleware::from_fn(loopback_host_only))
         .with_state(state)
+}
+
+/// Scores `docs` against `query` with the daemon's reranker, loading it on the first call.
+/// 404 when no reranker is configured; the CLI/MCP then fall back to the dense order.
+async fn rerank(State(s): State<AppState>, Json(req): Json<RerankRequest>) -> Result<Json<RerankResponse>, (StatusCode, String)> {
+    let rs = s.reranker.ok_or((StatusCode::NOT_FOUND, "reranking is not set up in this daemon".to_owned()))?;
+    if req.docs.len() > MAX_RERANK_DOCS {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("at most {MAX_RERANK_DOCS} documents per request")));
+    }
+    tokio::task::spawn_blocking(move || {
+        let mut slot = rs.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            *slot = Some((rs.make)().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("loading reranker: {e}")))?);
+        }
+        let reranker = slot.as_mut().expect("just loaded");
+        let refs: Vec<&str> = req.docs.iter().map(String::as_str).collect();
+        let scores = reranker.rerank(&req.query, &refs).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        Ok(Json(RerankResponse { scores }))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
 /// Rejects requests whose `Host` is not a loopback name. Binding to 127.0.0.1 keeps other
@@ -278,6 +331,42 @@ impl Embedder for LazyRemote {
     }
 }
 
+/// [`embed::Reranker`] backed by the daemon's `/rerank`. Used only by the opt-in deep search, so
+/// its timeout is generous — a CPU cross-encoder over a few dozen candidates takes seconds.
+pub struct RemoteReranker {
+    agent: ureq::Agent,
+    url: String,
+}
+
+impl RemoteReranker {
+    pub fn new(base: &str) -> Self {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(60)))
+            .build()
+            .into();
+        Self { agent, url: format!("{}/rerank", base.trim_end_matches('/')) }
+    }
+}
+
+impl embed::Reranker for RemoteReranker {
+    fn rerank(&mut self, query: &str, docs: &[&str]) -> embed::Result<Vec<f32>> {
+        if docs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let req = RerankRequest { query: query.to_owned(), docs: docs.iter().map(|d| d.to_string()).collect() };
+        let resp: RerankResponse = self
+            .agent
+            .post(&self.url)
+            .send_json(&req)
+            .and_then(|mut r| r.body_mut().read_json())
+            .map_err(|e| embed::EmbedError::Model(format!("rerank daemon: {e}")))?;
+        if resp.scores.len() != docs.len() {
+            return Err(embed::EmbedError::CountMismatch { expected: docs.len(), got: resp.scores.len() });
+        }
+        Ok(resp.scores)
+    }
+}
+
 pub async fn serve(router: Router, addr: std::net::SocketAddr) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("embedding daemon listening on http://{addr}");
@@ -288,7 +377,7 @@ pub async fn serve(router: Router, addr: std::net::SocketAddr) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embed::HashEmbedder;
+    use embed::{HashEmbedder, Reranker};
 
     async fn spawn(model: &str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -340,6 +429,46 @@ mod tests {
         })
         .await;
         assert_eq!(status, 413);
+    }
+
+    async fn spawn_with_reranker() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let factory: RerankerFactory = Arc::new(|| Ok(Box::new(embed::HashReranker)));
+        let app = daemon_router(SharedEmbedder::new(Box::new(HashEmbedder::new(16))), "m", None, None, Some(factory));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_reranker_scores_via_the_daemon() {
+        let base = spawn_with_reranker().await;
+        let scores = blocking(move || {
+            RemoteReranker::new(&base).rerank("database migration", &["unrelated text", "database migration failed"]).unwrap()
+        })
+        .await;
+        // HashReranker scores by shared-word count: doc 1 shares two words, doc 0 none.
+        assert_eq!(scores, vec![0.0, 2.0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_is_404_without_a_factory_and_413_when_oversized() {
+        // No factory: /rerank absent.
+        let plain = spawn("m").await;
+        let no_reranker = blocking(move || match ureq::post(&format!("{plain}/rerank")).send_json(&RerankRequest { query: "q".into(), docs: vec!["d".into()] }) {
+            Err(ureq::Error::StatusCode(code)) => code,
+            other => panic!("expected status error, got {other:?}"),
+        })
+        .await;
+        assert_eq!(no_reranker, 404);
+
+        let base = spawn_with_reranker().await;
+        let oversized = blocking(move || match ureq::post(&format!("{base}/rerank")).send_json(&RerankRequest { query: "q".into(), docs: vec!["d".into(); MAX_RERANK_DOCS + 1] }) {
+            Err(ureq::Error::StatusCode(code)) => code,
+            other => panic!("expected status error, got {other:?}"),
+        })
+        .await;
+        assert_eq!(oversized, 413);
     }
 
     #[tokio::test(flavor = "multi_thread")]

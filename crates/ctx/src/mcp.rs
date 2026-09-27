@@ -89,13 +89,21 @@ pub struct ContextServer {
     teams: Option<crate::teams::TeamsSearch>,
     mode: store::SearchMode,
     recency: crate::rank::Recency,
+    /// Daemon URL + candidate pool for the opt-in `deep_search_sessions`; `None` disables it.
+    rerank: Option<(String, u64)>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl ContextServer {
     pub fn new(ctx: Context, current_project: String, state_path: PathBuf) -> Self {
-        Self { ctx, current_project, state_path, teams: None, mode: store::SearchMode::Hybrid, recency: crate::rank::Recency::OFF, tool_router: Self::tool_router() }
+        Self { ctx, current_project, state_path, teams: None, mode: store::SearchMode::Hybrid, recency: crate::rank::Recency::OFF, rerank: None, tool_router: Self::tool_router() }
+    }
+
+    /// Enable `deep_search_sessions`, which reranks through the daemon at `embed_url`.
+    pub fn with_rerank(mut self, embed_url: String, pool: u64) -> Self {
+        self.rerank = Some((embed_url, pool));
+        self
     }
 
     pub fn with_ranking(mut self, mode: store::SearchMode, recency: crate::rank::Recency) -> Self {
@@ -178,6 +186,33 @@ impl ContextServer {
         q.recency = self.recency;
         q.mode = self.mode;
         let results = self.ctx.search(&q).await.map_err(|e| e.to_string())?;
+        Ok(format_results(&results))
+    }
+
+    /// Like search_sessions but reorders the matching turns with a cross-encoder reranker for
+    /// higher precision. Slower — seconds, not milliseconds — so use it only when the plain
+    /// search_sessions ranking is not good enough, not as the default. Same arguments.
+    #[tool(name = "deep_search_sessions")]
+    pub async fn deep_search_sessions(&self, Parameters(a): Parameters<SearchArgs>) -> Result<String, String> {
+        let Some((url, pool)) = self.rerank.clone() else {
+            return Err("deep search is not enabled in this daemon; use search_sessions".into());
+        };
+        if a.query.trim().is_empty() {
+            return Err("query must not be empty".into());
+        }
+        let source = match a.source.as_deref() {
+            None => None,
+            Some(s @ ("claude" | "opencode")) => Some(s.to_owned()),
+            Some(other) => return Err(format!("unknown source {other:?}; use \"claude\" or \"opencode\"")),
+        };
+        let mut q = Query::new(a.query, self.scope(a.scope.as_deref(), a.project.as_deref())?, u64::from(a.limit.unwrap_or(6).clamp(1, 20)));
+        q.source = source;
+        q.since = a.since.as_deref().map(|d| parse_date(d, false)).transpose().map_err(|e| e.to_string())?;
+        q.until = a.until.as_deref().map(|d| parse_date(d, true)).transpose().map_err(|e| e.to_string())?;
+        q.include_subagents = a.include_subagents.unwrap_or(false);
+        let reranker: std::sync::Arc<std::sync::Mutex<Box<dyn embed::Reranker>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Box::new(crate::embed_server::RemoteReranker::new(&url))));
+        let results = self.ctx.search_reranked(&q, reranker, pool).await.map_err(|e| e.to_string())?;
         Ok(format_results(&results))
     }
 

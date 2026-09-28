@@ -98,6 +98,35 @@ impl Jira {
         Ok(v.get("issues").and_then(|i| i.as_array()).map(|arr| arr.iter().map(|i| self.parse_issue(i)).collect()).unwrap_or_default())
     }
 
+    fn post_json(&self, path: &str, body: serde_json::Value) -> Result<()> {
+        let url = format!("{}{path}", self.base);
+        match self.agent.post(&url).header("Authorization", format!("Bearer {}", self.token)).header("Accept", "application/json").send_json(&body) {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::StatusCode(401 | 403)) => Err(JiraError::Auth),
+            Err(ureq::Error::StatusCode(404)) => Err(JiraError::NotFound(path.to_owned())),
+            Err(e) => Err(JiraError::Http(e.to_string())),
+        }
+    }
+
+    /// Appends a comment. Write op — callers gate it (DEV-38).
+    pub fn add_comment(&self, key: &str, body: &str) -> Result<()> {
+        self.post_json(&format!("/rest/api/2/issue/{key}/comment"), serde_json::json!({ "body": body }))
+    }
+
+    /// Available transitions for an issue, as `(id, name)`.
+    pub fn transitions(&self, key: &str) -> Result<Vec<(String, String)>> {
+        let v = self.get_json(&format!("/rest/api/2/issue/{key}/transitions"))?;
+        Ok(v.get("transitions")
+            .and_then(|t| t.as_array())
+            .map(|arr| arr.iter().map(|t| (string(t, "id"), t.get("to").map(|to| string(to, "name")).unwrap_or_else(|| string(t, "name")))).collect())
+            .unwrap_or_default())
+    }
+
+    /// Applies a transition by id. Write op — callers gate it (DEV-38).
+    pub fn do_transition(&self, key: &str, transition_id: &str) -> Result<()> {
+        self.post_json(&format!("/rest/api/2/issue/{key}/transitions"), serde_json::json!({ "transition": { "id": transition_id } }))
+    }
+
     /// `(key, name)` for every visible project.
     pub fn projects(&self) -> Result<Vec<(String, String)>> {
         let v = self.get_json("/rest/api/2/project")?;
@@ -222,6 +251,10 @@ pub struct JiraSearch {
     pub projects: std::path::PathBuf,
     /// The user's literal redaction list; issue/comment text is scrubbed before display.
     pub redact: std::path::PathBuf,
+    /// Config lock (`JIRA_WRITE`): writes are refused unless this is true, whatever the caller asks.
+    pub write_allowed: bool,
+    /// Append-only local record of writes that were actually sent.
+    pub write_log: std::path::PathBuf,
 }
 
 impl JiraSearch {
@@ -250,6 +283,55 @@ impl JiraSearch {
         let issue = self.jira.issue(key).map_err(anyhow::Error::msg)?;
         let redactor = ingest::Redactor::from_file(&self.redact)?;
         Ok(format_issue(&issue, &redactor))
+    }
+
+    /// The config lock. Refused with a clear message when `JIRA_WRITE` is off.
+    fn require_write_allowed(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.write_allowed, "Jira writes are off; set JIRA_WRITE=on in the config .env to allow them (they still need an explicit confirm)");
+        Ok(())
+    }
+
+    /// Adds a comment. Two locks: `JIRA_WRITE=on` (config) AND `confirm` (explicit intent).
+    /// Without `confirm` it is a dry run — it returns what *would* be sent and sends nothing.
+    pub fn comment(&self, key: &str, body: &str, confirm: bool) -> anyhow::Result<String> {
+        self.require_write_allowed()?;
+        if !confirm {
+            return Ok(format!("DRY RUN — would POST a comment to {key}:\n{body}\n\n(pass the confirm/--write flag to actually send it)"));
+        }
+        self.jira.add_comment(key, body).map_err(anyhow::Error::msg)?;
+        self.log(&format!("comment {key}: {} chars", body.len()));
+        Ok(format!("Comment added to {key}."))
+    }
+
+    /// Transitions an issue to the named status (case-insensitive). Lists transitions first,
+    /// resolves the name, then applies it under the same two locks and dry-run rule.
+    pub fn transition(&self, key: &str, to: &str, confirm: bool) -> anyhow::Result<String> {
+        self.require_write_allowed()?;
+        let available = self.jira.transitions(key).map_err(anyhow::Error::msg)?;
+        let choice = available.iter().find(|(_, name)| name.eq_ignore_ascii_case(to.trim()));
+        let Some((id, name)) = choice else {
+            let names: Vec<&str> = available.iter().map(|(_, n)| n.as_str()).collect();
+            anyhow::bail!("no transition to {to:?} from {key}'s current status; available: {}", if names.is_empty() { "(none)".to_owned() } else { names.join(", ") });
+        };
+        if !confirm {
+            return Ok(format!("DRY RUN — would transition {key} to \"{name}\" (id {id}).\n(pass the confirm/--write flag to actually send it)"));
+        }
+        self.jira.do_transition(key, id).map_err(anyhow::Error::msg)?;
+        self.log(&format!("transition {key} -> {name}"));
+        Ok(format!("{key} transitioned to \"{name}\"."))
+    }
+
+    /// Appends a timestamped line to the local write log; best-effort (a log failure must not
+    /// fail the write that already happened).
+    fn log(&self, what: &str) {
+        use std::io::Write;
+        if let Some(dir) = self.write_log.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.write_log) {
+            let ts = jiff::Timestamp::now().to_string();
+            let _ = writeln!(f, "{ts}  {what}");
+        }
     }
 }
 

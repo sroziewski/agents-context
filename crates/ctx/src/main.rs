@@ -186,6 +186,23 @@ enum JiraAction {
     },
     /// Print one issue with its description and comments.
     Issue { key: String },
+    /// Add a comment. Dry-run unless --write, and refused unless JIRA_WRITE=on.
+    Comment {
+        key: String,
+        #[arg(long)]
+        body: String,
+        /// Actually send it (the explicit-intent lock); without it, dry-run.
+        #[arg(long)]
+        write: bool,
+    },
+    /// Move an issue to a status (case-insensitive). Dry-run unless --write; needs JIRA_WRITE=on.
+    Transition {
+        key: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -502,6 +519,8 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", js.search(&query, project_key.as_deref(), jql, all, limit)?);
                 }
                 JiraAction::Issue { key } => println!("{}", js.issue(&key)?),
+                JiraAction::Comment { key, body, write } => println!("{}", js.comment(&key, &body, write)?),
+                JiraAction::Transition { key, to, write } => println!("{}", js.transition(&key, &to, write)?),
             }
             Ok(())
         }
@@ -678,7 +697,13 @@ fn jira_search(cfg: &Config) -> anyhow::Result<ctx::jira::JiraSearch> {
     let jira = cfg
         .jira()
         .ok_or_else(|| anyhow::anyhow!("Jira is not configured; set JIRA_URL and JIRA_TOKEN in {}", Config::env_file().display()))?;
-    Ok(ctx::jira::JiraSearch { jira, projects: cfg.jira_projects.clone(), redact: cfg.redact_file.clone() })
+    Ok(ctx::jira::JiraSearch {
+        jira,
+        projects: cfg.jira_projects.clone(),
+        redact: cfg.redact_file.clone(),
+        write_allowed: cfg.jira_write,
+        write_log: cfg.data_dir.join("jira-writes.log"),
+    })
 }
 
 fn to_target(source: SourceArg) -> Target {

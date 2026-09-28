@@ -92,6 +92,26 @@ pub struct JiraIssueArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct JiraCommentArgs {
+    /// Issue key, e.g. HD-1410.
+    pub key: String,
+    /// Comment text.
+    pub body: String,
+    /// Must be true to actually send; omitted/false is a dry run.
+    pub confirm: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct JiraTransitionArgs {
+    /// Issue key, e.g. HD-1410.
+    pub key: String,
+    /// Target status name (case-insensitive), e.g. "In Progress".
+    pub to: String,
+    /// Must be true to actually send; omitted/false is a dry run.
+    pub confirm: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TeamsThreadArgs {
     /// Thread id as shown in search_teams results.
     pub thread_id: String,
@@ -273,6 +293,33 @@ impl ContextServer {
             return Err("key must not be empty".into());
         }
         tokio::task::spawn_blocking(move || jira.issue(&key)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+    }
+
+    /// Add a comment to a Jira issue. A WRITE — off unless the daemon allows Jira writes
+    /// (JIRA_WRITE=on) AND you pass confirm=true. Without confirm it is a dry run: it returns
+    /// what would be sent and changes nothing. Use it only when the user clearly asked to
+    /// comment on the issue.
+    #[tool(name = "jira_add_comment")]
+    pub async fn jira_add_comment(&self, Parameters(a): Parameters<JiraCommentArgs>) -> Result<String, String> {
+        let jira = self.jira.clone().ok_or("Jira is not configured (JIRA_URL / JIRA_TOKEN unset)")?;
+        let (key, body, confirm) = (a.key.trim().to_owned(), a.body, a.confirm.unwrap_or(false));
+        if key.is_empty() || body.trim().is_empty() {
+            return Err("key and body must not be empty".into());
+        }
+        tokio::task::spawn_blocking(move || jira.comment(&key, &body, confirm)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+    }
+
+    /// Move a Jira issue to a status by name. A WRITE — same gate as jira_add_comment
+    /// (JIRA_WRITE=on and confirm=true); dry run otherwise. Only when the user asked to change
+    /// the issue's status.
+    #[tool(name = "jira_transition_issue")]
+    pub async fn jira_transition_issue(&self, Parameters(a): Parameters<JiraTransitionArgs>) -> Result<String, String> {
+        let jira = self.jira.clone().ok_or("Jira is not configured (JIRA_URL / JIRA_TOKEN unset)")?;
+        let (key, to, confirm) = (a.key.trim().to_owned(), a.to, a.confirm.unwrap_or(false));
+        if key.is_empty() || to.trim().is_empty() {
+            return Err("key and to must not be empty".into());
+        }
+        tokio::task::spawn_blocking(move || jira.transition(&key, &to, confirm)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
     }
 
     /// Full text of one indexed session, in order. Use after search_sessions to read around a hit.

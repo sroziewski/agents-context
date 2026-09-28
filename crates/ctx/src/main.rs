@@ -141,6 +141,11 @@ enum Command {
         #[command(subcommand)]
         action: JiraAction,
     },
+    /// Remove indexed data (optional, manual; dry-run unless --yes).
+    Prune {
+        #[command(subcommand)]
+        action: PruneAction,
+    },
     /// List indexed sessions, newest first.
     Sessions {
         #[arg(long)]
@@ -203,6 +208,33 @@ enum JiraAction {
         #[arg(long)]
         write: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum PruneAction {
+    /// Drop all indexed points for a project (sessions collection), by its directory.
+    Project {
+        dir: String,
+        /// Actually delete; without it, a dry run reporting what would go.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove points older than N days (by their timestamp) from a collection.
+    OlderThan {
+        days: u32,
+        #[arg(long, value_enum, default_value_t = PruneSource::Sessions)]
+        source: PruneSource,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PruneSource {
+    Sessions,
+    Teams,
+    Jira,
+    All,
 }
 
 #[derive(Subcommand)]
@@ -534,6 +566,31 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Prune { action } => {
+            match action {
+                PruneAction::Project { dir, yes } => {
+                    let key = sources::project::key(&dir);
+                    let store = connect_store(&cfg)?;
+                    let r = ctx::prune::prune_project(&store, &cfg.state_path, &key, yes).await?;
+                    println!("{}", ctx::prune::format_report(&format!("project {key}"), &r));
+                    if !yes && r.points > 0 {
+                        println!("re-run with --yes to apply. Note: a project whose sessions still exist is re-indexed on the next run.");
+                    }
+                }
+                PruneAction::OlderThan { days, source, yes } => {
+                    let cutoff = jiff::Timestamp::now().as_millisecond() - i64::from(days) * 86_400_000;
+                    for (label, collection, id_field) in prune_targets(source, &cfg) {
+                        let store = Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &collection, embed::BGEM3_DIM)?;
+                        let r = ctx::prune::prune_older_than(&store, &cfg.state_path, id_field, cutoff, yes).await?;
+                        println!("{}", ctx::prune::format_report(&format!("{label} older than {days}d"), &r));
+                    }
+                    if !yes {
+                        println!("re-run with --yes to apply.");
+                    }
+                }
+            }
+            Ok(())
+        }
         Command::Sessions { all, limit } => {
             let store = connect_store(&cfg)?;
             let ctx = Context { store: Arc::new(store), embedder: Arc::new(Mutex::new(Box::new(embed::HashEmbedder::new(1)))) };
@@ -714,6 +771,19 @@ fn jira_search(cfg: &Config) -> anyhow::Result<ctx::jira::JiraSearch> {
         write_allowed: cfg.jira_write,
         write_log: cfg.data_dir.join("jira-writes.log"),
     })
+}
+
+/// Collections a prune targets: `(label, collection, id-field)`.
+fn prune_targets(source: PruneSource, cfg: &Config) -> Vec<(&'static str, String, &'static str)> {
+    let sessions = ("sessions", cfg.collection.clone(), "session_id");
+    let teams = ("teams", cfg.teams_collection.clone(), "thread_id");
+    let jira = ("jira", cfg.jira_collection.clone(), "issue_key");
+    match source {
+        PruneSource::Sessions => vec![sessions],
+        PruneSource::Teams => vec![teams],
+        PruneSource::Jira => vec![jira],
+        PruneSource::All => vec![sessions, teams, jira],
+    }
 }
 
 fn to_target(source: SourceArg) -> Target {

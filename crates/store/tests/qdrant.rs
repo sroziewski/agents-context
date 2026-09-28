@@ -175,6 +175,38 @@ async fn delete_removes_points_and_empty_calls_are_no_ops() {
 }
 
 #[tokio::test]
+async fn delete_matching_prunes_by_filter_and_refuses_an_empty_one() {
+    let mut e = env().await;
+    let docs = vec![
+        e.doc("a1", "alpha one", json!({"project": "A", "session_id": "a1", "ts": 100})),
+        e.doc("a2", "alpha two", json!({"project": "A", "session_id": "a1", "ts": 100})),
+        e.doc("b1", "beta one", json!({"project": "B", "session_id": "b1", "ts": 5000})),
+    ];
+    e.store.upsert(docs).await.unwrap();
+
+    // Empty filter is refused (would wipe the collection).
+    assert!(e.store.delete_matching(&SearchFilter::default()).await.is_err());
+    assert_eq!(e.store.count(&SearchFilter::default()).await.unwrap(), 3);
+
+    // distinct_payload gathers the ids about to go.
+    let ids = e.store.distinct_payload(&SearchFilter::default().eq("project", "A"), "session_id", 100).await.unwrap();
+    assert_eq!(ids, ["a1"], "two chunks, one distinct session");
+
+    // Prune project A: only A's points go.
+    e.store.delete_matching(&SearchFilter::default().eq("project", "A")).await.unwrap();
+    assert_eq!(e.store.count(&SearchFilter::default()).await.unwrap(), 1);
+    assert_eq!(e.store.count(&SearchFilter::default().eq("project", "B")).await.unwrap(), 1);
+
+    // Prune older-than: ts <= cutoff removes the old one, keeps the newer (b1 ts=5000).
+    let old = e.doc("a3", "gamma", json!({"project": "A", "session_id": "a3", "ts": 50}));
+    e.store.upsert(vec![old]).await.unwrap();
+    assert_eq!(e.store.count(&SearchFilter::default().between(None, Some(60))).await.unwrap(), 1, "only a3 is old");
+    e.store.delete_matching(&SearchFilter::default().between(None, Some(60))).await.unwrap();
+    assert_eq!(e.store.count(&SearchFilter::default()).await.unwrap(), 1, "old removed");
+    assert_eq!(e.store.count(&SearchFilter::default().eq("project", "B")).await.unwrap(), 1, "newer B kept");
+}
+
+#[tokio::test]
 async fn wrong_dimension_is_rejected_before_reaching_qdrant() {
     let e = env().await;
     let bad = Embedding { dense: vec![1.0; DIM + 1], sparse: SparseVector::default() };

@@ -256,6 +256,30 @@ impl State {
         self.conn.execute("update indexed set fingerprint = ''", [])
     }
 
+    /// Removes state rows for a project (its `indexed` rows and the matching `summaries`), so a
+    /// prune of that project keeps the state DB consistent. Returns rows removed from `indexed`.
+    pub fn delete_project(&self, project: &str) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "delete from summaries where session_id in (select session_id from indexed where project = ?1)",
+            params![project],
+        )?;
+        self.conn.execute("delete from indexed where project = ?1", params![project])
+    }
+
+    /// Removes state rows for the given session ids (across sources; ids are unique per session,
+    /// thread or issue). For a prune-by-age, after the points are deleted. Returns `indexed` rows
+    /// removed.
+    pub fn delete_ids(&self, ids: &[String]) -> rusqlite::Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut removed = 0;
+        for id in ids {
+            tx.execute("delete from summaries where session_id = ?1", params![id])?;
+            removed += tx.execute("delete from indexed where session_id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     pub fn summary_count(&self) -> rusqlite::Result<usize> {
         self.conn.query_row("select count(*) from summaries", [], |r| r.get::<_, i64>(0)).map(|n| n as usize)
     }
@@ -281,6 +305,35 @@ mod tests {
 
     fn rec<'a>(source: &'a str, id: &'a str, fp: &'a str, project: &'a str, chunks: usize) -> Record<'a> {
         Record { source, session_id: id, fingerprint: fp, project, chunks, ..Default::default() }
+    }
+
+    #[test]
+    fn delete_project_removes_only_that_projects_rows_and_their_summaries() {
+        let s = State::in_memory().unwrap();
+        s.record(&rec("claude", "a1", "f", "proj-a", 3), 0).unwrap();
+        s.record(&rec("claude", "a2", "f", "proj-a", 2), 0).unwrap();
+        s.record(&rec("claude", "b1", "f", "proj-b", 4), 0).unwrap();
+        s.record_summary("claude", "a1", 3, 0).unwrap();
+        s.record_summary("claude", "b1", 4, 0).unwrap();
+
+        assert_eq!(s.delete_project("proj-a").unwrap(), 2, "two indexed rows removed");
+        assert!(s.get("claude", "a1").unwrap().is_none() && s.get("claude", "a2").unwrap().is_none());
+        assert!(s.get("claude", "b1").unwrap().is_some(), "other project kept");
+        assert_eq!(s.summary_count().unwrap(), 1, "a1's summary gone, b1's kept");
+    }
+
+    #[test]
+    fn delete_ids_removes_across_sources_and_summaries() {
+        let s = State::in_memory().unwrap();
+        s.record(&rec("claude", "s1", "f", "p", 1), 0).unwrap();
+        s.record(&rec("teams", "t9", "f", "", 1), 0).unwrap();
+        s.record(&rec("claude", "keep", "f", "p", 1), 0).unwrap();
+        s.record_summary("claude", "s1", 1, 0).unwrap();
+
+        assert_eq!(s.delete_ids(&["s1".into(), "t9".into(), "absent".into()]).unwrap(), 2);
+        assert!(s.get("claude", "s1").unwrap().is_none() && s.get("teams", "t9").unwrap().is_none());
+        assert!(s.get("claude", "keep").unwrap().is_some());
+        assert_eq!(s.summary_count().unwrap(), 0);
     }
 
     #[test]

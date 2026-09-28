@@ -262,6 +262,27 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes every point matching `filter`. Refuses an empty filter (that would wipe the whole
+    /// collection). For the optional prune tools; callers count first for a dry run.
+    pub async fn delete_matching(&self, filter: &SearchFilter) -> Result<()> {
+        self.delete_matching_except(filter, &[]).await
+    }
+
+    /// Distinct string values of `field` across points matching `filter` (e.g. the `session_id`s
+    /// about to be pruned, so their state rows can be removed too).
+    pub async fn distinct_payload(&self, filter: &SearchFilter, field: &str, limit: u32) -> Result<Vec<String>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for h in self.scroll(filter, limit).await? {
+            if let Some(v) = h.payload.get(field).and_then(Value::as_str) {
+                if seen.insert(v.to_owned()) {
+                    out.push(v.to_owned());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// All points matching `filter`, up to `limit`, without vectors; order is unspecified.
     pub async fn scroll(&self, filter: &SearchFilter, limit: u32) -> Result<Vec<Hit>> {
         let mut out = Vec::new();

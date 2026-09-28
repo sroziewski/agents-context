@@ -8,6 +8,7 @@ pub mod hook;
 pub mod inject;
 pub mod jira;
 pub mod mcp;
+pub mod prune;
 pub mod memories;
 pub mod queue;
 pub mod rank;

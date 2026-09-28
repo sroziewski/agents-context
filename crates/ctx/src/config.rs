@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Runtime configuration from environment variables, after loading
 /// `%APPDATA%\agents-context\.env` if it exists. That file matters for the MCP server: Claude
@@ -31,6 +32,9 @@ pub struct Config {
     pub teams_collection: String,
     /// Project → Teams groups whose channels rank higher when searching from that project.
     pub teams_projects: PathBuf,
+    /// Re-run the Teams scraper when its store goes stale (`CTX_TEAMS_SYNC_CMD` and friends). Off
+    /// unless the command is set.
+    pub teams_watch: crate::teams_watch::WatchConfig,
     pub recency: crate::rank::Recency,
     /// How session search ranks (`CTX_SEARCH_MODE`: dense, hybrid, sparse).
     pub search_mode: store::SearchMode,
@@ -126,6 +130,12 @@ impl Config {
             teams_people: path("CTX_TEAMS_PEOPLE", PathBuf::from(r"D:\dev\my\teams\people.json")),
             teams_collection: get("CTX_TEAMS_COLLECTION").unwrap_or_else(|| "teams".into()),
             teams_projects: path("CTX_TEAMS_PROJECTS", Self::config_dir().join("teams-projects.json")),
+            teams_watch: crate::teams_watch::WatchConfig {
+                cmd: get("CTX_TEAMS_SYNC_CMD").map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()),
+                stale_after: Duration::from_secs_f64(number("CTX_TEAMS_STALE_HOURS", 6.0).max(0.0) * 3600.0),
+                cooldown: Duration::from_secs_f64(number("CTX_TEAMS_SYNC_COOLDOWN_MINS", 90.0).max(0.0) * 60.0),
+                hours: crate::teams_watch::parse_hours(get("CTX_TEAMS_SYNC_HOURS").as_deref().unwrap_or("8-18")),
+            },
             recency: crate::rank::Recency {
                 weight: number("CTX_RECENCY_WEIGHT", DEFAULT_RECENCY_WEIGHT),
                 half_life_days: number("CTX_RECENCY_HALF_LIFE_DAYS", DEFAULT_HALF_LIFE_DAYS),

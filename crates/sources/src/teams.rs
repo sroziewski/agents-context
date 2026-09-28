@@ -104,6 +104,14 @@ impl TeamsDb {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The app's own sync heartbeat: the most recent `last_synced_at` across channels, in epoch
+    /// ms, or `None` when no channel has ever synced. This tracks whether the scraper is running,
+    /// not whether new messages arrived — a quiet but healthy scraper still advances it, so it
+    /// tells a stopped scraper apart from a quiet channel.
+    pub fn last_synced_at(&self) -> Result<Option<i64>> {
+        Ok(self.conn.query_row("select max(last_synced_at) from channels", [], |r| r.get::<_, Option<i64>>(0))?)
+    }
+
     pub fn authors(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("select distinct author from messages order by author")?;
         let rows = stmt.query_map([], |r| r.get(0))?;
@@ -268,6 +276,10 @@ pub(crate) mod fixture {
         c.execute("insert into channels (id, team, name) values (?1, ?2, ?3)", params![id, team, name]).unwrap();
     }
 
+    pub fn synced(c: &Connection, id: &str, at: i64) {
+        c.execute("update channels set last_synced_at = ?2 where id = ?1", params![id, at]).unwrap();
+    }
+
     pub fn message(c: &Connection, id: &str, channel: &str, thread: &str, author: &str, ts: i64, text: &str) {
         c.execute(
             "insert into messages (id, channel_id, thread_id, author, ts, text, indexed_at) values (?1, ?2, ?3, ?4, ?5, ?6, 0)",
@@ -328,6 +340,19 @@ mod tests {
         message(&c, "2", "c1", "1", "B", 2, "reply");
         let after = TeamsDb::open(&path).unwrap().threads().unwrap()[0].fingerprint();
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn last_synced_at_is_the_newest_heartbeat_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.db");
+        let c = create(&path);
+        channel(&c, "c1", "T", "C1");
+        channel(&c, "c2", "T", "C2");
+        assert_eq!(TeamsDb::open(&path).unwrap().last_synced_at().unwrap(), None, "never synced");
+        synced(&c, "c1", 500);
+        synced(&c, "c2", 900);
+        assert_eq!(TeamsDb::open(&path).unwrap().last_synced_at().unwrap(), Some(900), "newest across channels");
     }
 
     #[test]

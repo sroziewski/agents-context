@@ -16,6 +16,7 @@ pub mod redact;
 pub mod search;
 pub mod summarizer;
 pub mod teams;
+pub mod teams_watch;
 
 use embed::Embedder;
 use ingest::{IndexConfig, Indexer, Progress, Report, State, TokenCounter};
@@ -171,6 +172,16 @@ pub fn daemon_runner(
                         parts.push(format_report(&report, t.elapsed()));
                     }
                     if let (true, Some(teams)) = (target.includes_teams(), &teams_store) {
+                        // Before indexing, notice if the upstream scraper has stopped and, if
+                        // configured, re-run it. ctx runs in the user's live session, so it can
+                        // launch the sync the Interactive scheduled task keeps failing to start.
+                        if cfg.teams_watch.enabled() {
+                            match crate::teams_watch::check_and_trigger(&cfg.teams_watch, &cfg.teams_db, &state, &jiff::Zoned::now()) {
+                                Ok(crate::teams_watch::Decision::Trigger) => parts.push("teams: scraper stale, re-running".into()),
+                                Ok(_) => {}
+                                Err(e) => eprintln!("[teams-sync] check failed: {e:#}"),
+                            }
+                        }
                         if cfg.teams_db.is_file() {
                             // Isolated: a locked or broken teams.db must not stop session
                             // indexing or the summaries below.

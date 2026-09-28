@@ -146,34 +146,52 @@ fn duration_until_next(times: &[(u32, u32)], now: jiff::Zoned) -> Duration {
 
 async fn worker(mut rx: mpsc::UnboundedReceiver<Target>, runner: Runner, debounce: Duration, status: Arc<Mutex<Status>>) {
     while let Some(first) = rx.recv().await {
-        let mut target = first;
         tokio::time::sleep(debounce).await;
-        while let Ok(more) = rx.try_recv() {
-            target = target.merge(more);
-        }
-        set(&status, |s| s.running = true);
-        // Its own task, so a panicking run (sync or async part) becomes an error on this run
-        // instead of killing the worker and leaving every later request silently dropped.
-        let run = runner.clone();
-        let result = match tokio::spawn(async move { run(target).await }).await {
-            Ok(r) => r,
-            Err(e) => Err(anyhow::anyhow!("index run panicked: {e}")),
-        };
-        let now = jiff::Timestamp::now().as_millisecond();
-        set(&status, |s| {
-            s.running = false;
-            s.runs += 1;
-            s.last_target = Some(target);
-            s.last_finished_ms = Some(now);
-            match result {
-                Ok(report) => {
-                    s.last_report = Some(report);
-                    s.last_error = None;
-                }
-                Err(e) => s.last_error = Some(format!("{e:#}")),
+        // Drain the debounce window. Jira is kept separate from the session/Teams merge: merging
+        // it into `All` would drop it (All excludes Jira), so a Jira request coalesced with an
+        // All request would silently never run. Instead each side is its own run.
+        let mut sessions_teams: Option<Target> = None;
+        let mut jira = false;
+        let mut consider = |t: Target| {
+            if t.includes_jira() {
+                jira = true;
+            } else {
+                sessions_teams = Some(sessions_teams.map_or(t, |acc: Target| acc.merge(t)));
             }
-        });
+        };
+        consider(first);
+        while let Ok(more) = rx.try_recv() {
+            consider(more);
+        }
+        for target in sessions_teams.into_iter().chain(jira.then_some(Target::Jira)) {
+            run_and_record(&runner, target, &status).await;
+        }
     }
+}
+
+async fn run_and_record(runner: &Runner, target: Target, status: &Arc<Mutex<Status>>) {
+    set(status, |s| s.running = true);
+    // Its own task, so a panicking run (sync or async part) becomes an error on this run
+    // instead of killing the worker and leaving every later request silently dropped.
+    let run = runner.clone();
+    let result = match tokio::spawn(async move { run(target).await }).await {
+        Ok(r) => r,
+        Err(e) => Err(anyhow::anyhow!("index run panicked: {e}")),
+    };
+    let now = jiff::Timestamp::now().as_millisecond();
+    set(status, |s| {
+        s.running = false;
+        s.runs += 1;
+        s.last_target = Some(target);
+        s.last_finished_ms = Some(now);
+        match result {
+            Ok(report) => {
+                s.last_report = Some(report);
+                s.last_error = None;
+            }
+            Err(e) => s.last_error = Some(format!("{e:#}")),
+        }
+    });
 }
 
 fn set(status: &Mutex<Status>, f: impl FnOnce(&mut Status)) {
@@ -201,6 +219,17 @@ mod tests {
         assert!(Target::Jira.includes_jira() && !Target::All.includes_jira());
         assert!(!Target::Jira.includes_teams());
         assert!(Target::Jira.sessions().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn all_and_jira_in_one_window_both_run() {
+        let (runner, runs) = recording(None);
+        let q = IndexQueue::start(runner, Duration::from_millis(30));
+        q.request(Target::All);
+        q.request(Target::Jira); // would be lost if merged into All
+        settle(&q, 2).await;
+        let got = runs.lock().unwrap().clone();
+        assert!(got.contains(&Target::All) && got.contains(&Target::Jira), "both ran: {got:?}");
     }
 
     /// Records every run's target; each run blocks until `release` is notified when gated.

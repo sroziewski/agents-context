@@ -6,6 +6,7 @@ pub mod eval;
 pub mod factcheck;
 pub mod hook;
 pub mod inject;
+pub mod jira;
 pub mod mcp;
 pub mod memories;
 pub mod queue;

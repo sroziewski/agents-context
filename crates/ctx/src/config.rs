@@ -49,6 +49,13 @@ pub struct Config {
     /// user's config rather than in the repository.
     pub eval_file: PathBuf,
     pub eval_baseline: PathBuf,
+    /// Jira Data Center base URL and Personal Access Token (`JIRA_URL` / `JIRA_TOKEN`, in the
+    /// config .env). The integration is off when either is unset.
+    pub jira_url: Option<String>,
+    pub jira_token: Option<String>,
+    pub jira_projects: PathBuf,
+    /// Writes to Jira are refused unless this is on (`JIRA_WRITE`); read-only by default.
+    pub jira_write: bool,
 }
 
 /// Off: on the real query set (2026-09-27, 33 queries) every weight tried lowered MRR and none
@@ -64,6 +71,14 @@ impl Config {
 
     pub fn env_file() -> PathBuf {
         Self::config_dir().join(".env")
+    }
+
+    /// A read-only Jira client, or `None` when the URL or token is unset (integration off).
+    pub fn jira(&self) -> Option<crate::jira::Jira> {
+        match (&self.jira_url, &self.jira_token) {
+            (Some(url), Some(token)) => Some(crate::jira::Jira::new(url, token)),
+            _ => None,
+        }
     }
 
     pub fn load() -> Self {
@@ -128,6 +143,10 @@ impl Config {
             verify_model: get("CTX_VERIFY_MODEL").unwrap_or_else(|| "sonnet".into()),
             eval_file: path("CTX_EVAL_FILE", Self::config_dir().join("eval").join("sessions.jsonl")),
             eval_baseline: path("CTX_EVAL_BASELINE", data.join("eval-baseline.json")),
+            jira_url: get("JIRA_URL").map(|u| u.trim_end_matches('/').to_owned()).filter(|u| !u.is_empty()),
+            jira_token: get("JIRA_TOKEN").filter(|t| !t.is_empty()),
+            jira_projects: path("JIRA_PROJECTS", Self::config_dir().join("jira-projects.json")),
+            jira_write: on("JIRA_WRITE", false),
         }
     }
 }

@@ -136,6 +136,11 @@ enum Command {
     },
     /// Print a whole Teams thread.
     TeamsThread { thread_id: String },
+    /// Read Jira issues (read-only).
+    Jira {
+        #[command(subcommand)]
+        action: JiraAction,
+    },
     /// List indexed sessions, newest first.
     Sessions {
         #[arg(long)]
@@ -160,6 +165,27 @@ enum Command {
     },
     /// MCP server over stdio (register with `claude mcp add` / OpenCode config).
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum JiraAction {
+    /// Search issues. Plain text unless --jql; a bare key (HD-123) is fetched directly.
+    Search {
+        query: String,
+        /// Scope to this project directory's mapped Jira keys instead of the current one.
+        #[arg(long)]
+        project: Option<String>,
+        /// Treat the query as raw JQL.
+        #[arg(long)]
+        jql: bool,
+        /// Search all projects, ignoring the project→key mapping.
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value_t = 8)]
+        limit: u32,
+    },
+    /// Print one issue with its description and comments.
+    Issue { key: String },
 }
 
 #[derive(Subcommand)]
@@ -463,6 +489,22 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", teams_search(&cfg, &ctx).thread(&thread_id, usize::MAX)?);
             Ok(())
         }
+        Command::Jira { action } => {
+            let js = jira_search(&cfg)?;
+            match action {
+                JiraAction::Search { query, project, jql, all, limit } => {
+                    let project_key = if all {
+                        None
+                    } else {
+                        let dir = project.unwrap_or_else(|| std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default());
+                        Some(sources::project::key(&dir))
+                    };
+                    println!("{}", js.search(&query, project_key.as_deref(), jql, all, limit)?);
+                }
+                JiraAction::Issue { key } => println!("{}", js.issue(&key)?),
+            }
+            Ok(())
+        }
         Command::Sessions { all, limit } => {
             let store = connect_store(&cfg)?;
             let ctx = Context { store: Arc::new(store), embedder: Arc::new(Mutex::new(Box::new(embed::HashEmbedder::new(1)))) };
@@ -605,10 +647,13 @@ async fn main() -> anyhow::Result<()> {
             let embedder: Box<dyn Embedder> = Box::new(embed_server::LazyRemote::new(&cfg.embed_url, embed::BGEM3_DIM));
             let ctx = Context { store: Arc::new(connect_store(&cfg)?), embedder: Arc::new(Mutex::new(embedder)) };
             let teams = teams_search(&cfg, &ctx);
-            let server = mcp::ContextServer::new(ctx, mcp::current_project(), cfg.state_path.clone())
+            let mut server = mcp::ContextServer::new(ctx, mcp::current_project(), cfg.state_path.clone())
                 .with_teams(teams)
                 .with_ranking(cfg.search_mode, cfg.recency)
                 .with_rerank(cfg.embed_url.clone(), cfg.rerank_pool);
+            if let Ok(js) = jira_search(&cfg) {
+                server = server.with_jira(js);
+            }
             mcp::serve_stdio(server).await
         }
     }
@@ -626,6 +671,14 @@ fn teams_search(cfg: &Config, ctx: &Context) -> ctx::teams::TeamsSearch {
         projects: cfg.teams_projects.clone(),
         redact: cfg.redact_file.clone(),
     }
+}
+
+/// A read-only Jira search, or a clear error when Jira is not configured.
+fn jira_search(cfg: &Config) -> anyhow::Result<ctx::jira::JiraSearch> {
+    let jira = cfg
+        .jira()
+        .ok_or_else(|| anyhow::anyhow!("Jira is not configured; set JIRA_URL and JIRA_TOKEN in {}", Config::env_file().display()))?;
+    Ok(ctx::jira::JiraSearch { jira, projects: cfg.jira_projects.clone(), redact: cfg.redact_file.clone() })
 }
 
 fn to_target(source: SourceArg) -> Target {

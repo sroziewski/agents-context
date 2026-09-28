@@ -72,6 +72,26 @@ pub struct TeamsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct JiraSearchArgs {
+    /// Text to match, or a bare issue key (HD-123), or raw JQL when jql=true.
+    pub query: String,
+    /// Scope to this project directory's mapped Jira keys instead of the current project.
+    pub project: Option<String>,
+    /// Treat query as raw JQL.
+    pub jql: Option<bool>,
+    /// Search all projects, ignoring the project→key mapping.
+    pub all: Option<bool>,
+    /// Number of issues, 1-30 (default 8).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct JiraIssueArgs {
+    /// Issue key, e.g. HD-1410.
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TeamsThreadArgs {
     /// Thread id as shown in search_teams results.
     pub thread_id: String,
@@ -91,13 +111,21 @@ pub struct ContextServer {
     recency: crate::rank::Recency,
     /// Daemon URL + candidate pool for the opt-in `deep_search_sessions`; `None` disables it.
     rerank: Option<(String, u64)>,
+    /// Read-only Jira; `None` when JIRA_URL/JIRA_TOKEN are unset.
+    jira: Option<crate::jira::JiraSearch>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl ContextServer {
     pub fn new(ctx: Context, current_project: String, state_path: PathBuf) -> Self {
-        Self { ctx, current_project, state_path, teams: None, mode: store::SearchMode::Hybrid, recency: crate::rank::Recency::OFF, rerank: None, tool_router: Self::tool_router() }
+        Self { ctx, current_project, state_path, teams: None, mode: store::SearchMode::Hybrid, recency: crate::rank::Recency::OFF, rerank: None, jira: None, tool_router: Self::tool_router() }
+    }
+
+    /// Enable the read-only Jira tools.
+    pub fn with_jira(mut self, jira: crate::jira::JiraSearch) -> Self {
+        self.jira = Some(jira);
+        self
     }
 
     /// Enable `deep_search_sessions`, which reranks through the daemon at `embed_url`.
@@ -214,6 +242,37 @@ impl ContextServer {
             std::sync::Arc::new(std::sync::Mutex::new(Box::new(crate::embed_server::RemoteReranker::new(&url))));
         let results = self.ctx.search_reranked(&q, reranker, pool).await.map_err(|e| e.to_string())?;
         Ok(format_results(&results))
+    }
+
+    /// Search the organisation's Jira issues (read-only, Jira Data Center). Plain text becomes a
+    /// JQL text match; a bare issue key (HD-123) is fetched directly; pass jql=true for raw JQL.
+    /// Scoped to the current project's Jira keys by default (set project, or all=true for every
+    /// project). Results carry the key and URL so you can cite and open them.
+    #[tool(name = "search_jira")]
+    pub async fn search_jira(&self, Parameters(a): Parameters<JiraSearchArgs>) -> Result<String, String> {
+        let jira = self.jira.clone().ok_or("Jira is not configured (JIRA_URL / JIRA_TOKEN unset)")?;
+        if a.query.trim().is_empty() {
+            return Err("query must not be empty".into());
+        }
+        let all = a.all.unwrap_or(false);
+        let project_key = if all { None } else { Some(a.project.map_or_else(|| self.current_project.clone(), |p| sources::project::key(&p))) };
+        let (jql, limit) = (a.jql.unwrap_or(false), a.limit.unwrap_or(8).clamp(1, 30));
+        let query = a.query;
+        tokio::task::spawn_blocking(move || jira.search(&query, project_key.as_deref(), jql, all, limit))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
+    }
+
+    /// One Jira issue in full — description and comments (redacted), with a link. Read-only.
+    #[tool(name = "get_jira_issue")]
+    pub async fn get_jira_issue(&self, Parameters(a): Parameters<JiraIssueArgs>) -> Result<String, String> {
+        let jira = self.jira.clone().ok_or("Jira is not configured (JIRA_URL / JIRA_TOKEN unset)")?;
+        let key = a.key.trim().to_owned();
+        if key.is_empty() {
+            return Err("key must not be empty".into());
+        }
+        tokio::task::spawn_blocking(move || jira.issue(&key)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
     }
 
     /// Full text of one indexed session, in order. Use after search_sessions to read around a hit.

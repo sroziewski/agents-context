@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde::Deserialize;
 
 /// A Jira read failure, distinguishing auth from a missing issue from transport, so the CLI can
 /// say something useful (e.g. "check JIRA_TOKEN").
@@ -58,6 +57,7 @@ pub struct JiraIssue {
 }
 
 /// Read-only Jira Data Center client. Blocking `ureq`, like the other service clients.
+#[derive(Clone)]
 pub struct Jira {
     agent: ureq::Agent,
     base: String,
@@ -199,11 +199,106 @@ pub fn detect_issue_key(text: &str) -> Option<String> {
     (code_ok && num_ok).then(|| t.to_owned())
 }
 
-/// Deserialization sanity for a captured search page (used only in tests / future callers).
-#[derive(Debug, Deserialize)]
-pub struct SearchPage {
-    #[serde(default)]
-    pub total: u64,
+/// Builds a JQL query from a plain-text search. Scopes to `keys` (e.g. `project in (HD)`) when
+/// any are given, matches the text with `~`, and orders by most recently updated. Quotes in the
+/// text are escaped so they cannot break out of the JQL string literal.
+pub fn build_jql(text: &str, keys: &[String]) -> String {
+    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    let text_clause = format!("text ~ \"{escaped}\"");
+    let scoped = if keys.is_empty() {
+        text_clause
+    } else {
+        format!("project in ({}) AND {text_clause}", keys.join(", "))
+    };
+    format!("{scoped} ORDER BY updated DESC")
+}
+
+/// Read-only Jira search + formatting, redacted on the way out. Mirrors `TeamsSearch`: the CLI
+/// and MCP tools call this so the query/scoping/redaction logic lives in one place.
+#[derive(Clone)]
+pub struct JiraSearch {
+    pub jira: Jira,
+    /// `jira-projects.json`, for default project scoping.
+    pub projects: std::path::PathBuf,
+    /// The user's literal redaction list; issue/comment text is scrubbed before display.
+    pub redact: std::path::PathBuf,
+}
+
+impl JiraSearch {
+    /// Text or JQL search. A bare issue key (`HD-123`) is fetched directly. Scoped to
+    /// `project_key`'s mapped Jira keys unless `all` or `raw_jql`.
+    pub fn search(&self, query: &str, project_key: Option<&str>, raw_jql: bool, all: bool, limit: u32) -> anyhow::Result<String> {
+        if !raw_jql && let Some(key) = detect_issue_key(query) {
+            return self.issue(&key);
+        }
+        let jql = if raw_jql {
+            query.to_owned()
+        } else {
+            let keys = match (all, project_key) {
+                (false, Some(p)) => keys_for_project(p, &load_project_keys(&self.projects)?),
+                _ => Vec::new(),
+            };
+            build_jql(query, &keys)
+        };
+        let issues = self.jira.search(&jql, limit).map_err(anyhow::Error::msg)?;
+        let redactor = ingest::Redactor::from_file(&self.redact)?;
+        Ok(format_issues(&issues, &jql, &redactor))
+    }
+
+    /// One issue with description and comments, redacted.
+    pub fn issue(&self, key: &str) -> anyhow::Result<String> {
+        let issue = self.jira.issue(key).map_err(anyhow::Error::msg)?;
+        let redactor = ingest::Redactor::from_file(&self.redact)?;
+        Ok(format_issue(&issue, &redactor))
+    }
+}
+
+/// Numbered search results with key, status and URL, redacted.
+pub fn format_issues(issues: &[JiraIssue], jql: &str, redactor: &ingest::Redactor) -> String {
+    if issues.is_empty() {
+        return format!("No Jira issues for: {jql}");
+    }
+    let scrub = |s: &str| redactor.scrub(s).0;
+    issues
+        .iter()
+        .enumerate()
+        .map(|(i, x)| {
+            format!(
+                "[{}] {} · {} · {} · {} · updated {}\n{}\n{}",
+                i + 1,
+                x.key,
+                x.issue_type,
+                x.status,
+                x.assignee,
+                x.updated.split('T').next().unwrap_or(&x.updated),
+                scrub(&x.summary),
+                x.url
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// One issue in full: header, description, then comments — all redacted.
+pub fn format_issue(x: &JiraIssue, redactor: &ingest::Redactor) -> String {
+    let scrub = |s: &str| redactor.scrub(s).0;
+    let mut out = format!(
+        "{} · {} · {} · assignee {} · updated {}\n{}\n\n{}",
+        x.key,
+        x.issue_type,
+        x.status,
+        x.assignee,
+        x.updated,
+        x.url,
+        scrub(&x.summary)
+    );
+    if !x.description.trim().is_empty() {
+        out.push_str(&format!("\n\n{}", scrub(x.description.trim())));
+    }
+    for c in &x.comments {
+        out.push_str(&format!("\n\n--- {} · {} ---\n{}", c.author, c.created.split('T').next().unwrap_or(&c.created), scrub(c.body.trim())));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -282,6 +377,42 @@ mod tests {
         let full = j.issue(&issues[0].key).unwrap();
         assert_eq!(full.key, issues[0].key);
         assert!(!full.summary.is_empty());
+    }
+
+    #[test]
+    fn build_jql_scopes_and_escapes() {
+        assert_eq!(build_jql("login fails", &[]), "text ~ \"login fails\" ORDER BY updated DESC");
+        assert_eq!(
+            build_jql("login", &["HD".into(), "SEDN26".into()]),
+            "project in (HD, SEDN26) AND text ~ \"login\" ORDER BY updated DESC"
+        );
+        // a quote in the text cannot break out of the JQL literal
+        assert!(build_jql("say \"hi\"", &[]).contains("text ~ \"say \\\"hi\\\"\""));
+    }
+
+    #[test]
+    fn formats_issues_and_one_issue_redacted() {
+        let red = ingest::Redactor::new(["s3cr3tp4ss".to_string()]);
+        let issues = [JiraIssue {
+            key: "HD-1".into(),
+            summary: "leak s3cr3tp4ss here".into(),
+            description: String::new(),
+            status: "Open".into(),
+            issue_type: "Bug".into(),
+            assignee: "Anna".into(),
+            updated: "2026-09-27T10:00:00.000+0200".into(),
+            url: "https://j/browse/HD-1".into(),
+            comments: vec![],
+        }];
+        let out = format_issues(&issues, "jql", &red);
+        assert!(out.contains("[1] HD-1 · Bug · Open · Anna · updated 2026-09-27"), "{out}");
+        assert!(!out.contains("s3cr3tp4ss") && out.contains("https://j/browse/HD-1"), "{out}");
+        assert_eq!(format_issues(&[], "project = X", &red), "No Jira issues for: project = X");
+
+        let full = JiraIssue { description: "detail s3cr3tp4ss".into(), comments: vec![JiraComment { author: "Bob".into(), created: "2026-09-27T11:00:00Z".into(), body: "note s3cr3tp4ss".into() }], ..issues[0].clone() };
+        let one = format_issue(&full, &red);
+        assert!(!one.contains("s3cr3tp4ss"), "description and comments redacted: {one}");
+        assert!(one.contains("--- Bob · 2026-09-27 ---"));
     }
 
     #[test]

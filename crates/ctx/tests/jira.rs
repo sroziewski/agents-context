@@ -120,6 +120,60 @@ async fn writes_need_both_the_config_lock_and_confirm() {
     assert_eq!(sent(), 1, "sent exactly once when allowed and confirmed");
 }
 
+/// A mock Jira /search returning a fixed set of issues (ignoring the JQL), for the indexer.
+async fn serve_search(updated: &'static str) -> String {
+    let search = move || async move {
+        Json(json!({
+            "total": 1,
+            "issues": [{
+                "key": "HD-1",
+                "fields": {"summary": "Login fails", "description": "detail", "status": {"name": "Open"},
+                    "issuetype": {"name": "Bug"}, "assignee": {"displayName": "Anna"}, "updated": updated,
+                    "comment": {"comments": []}}
+            }]
+        }))
+    };
+    let app: Router = Router::new().route("/rest/api/2/search", get(search));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_jira_indexes_then_skips_unchanged_and_reindexes_changed() {
+    use ingest::{IndexConfig, State};
+    let qdrant = testkit::qdrant().await;
+    let store = store::Store::connect(&qdrant.url, None, "jira", 64).unwrap();
+    store.ensure_collection(ingest::jira::JIRA_FIELDS).await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let state = State::open(&tmp.path().join("state.db")).unwrap();
+    let keys = vec!["HD".to_string()];
+    let cfg = IndexConfig::default();
+
+    let run = |url: String| {
+        let store = &store;
+        let state = &state;
+        let keys = &keys;
+        let cfg = &cfg;
+        async move {
+            let mut emb = embed::HashEmbedder::new(64);
+            let client = Jira::new(&url, "tok");
+            ingest::jira::sync_jira(store, &mut emb, &ingest::WordCounter, state, &client, keys, cfg, 0).await.unwrap()
+        }
+    };
+
+    let first = run(serve_search("2026-09-27T10:00:00.000+0200").await).await;
+    assert_eq!((first.indexed, first.unchanged), (1, 0), "first run indexes the issue");
+    assert!(first.chunks >= 1);
+
+    let second = run(serve_search("2026-09-27T10:00:00.000+0200").await).await;
+    assert_eq!((second.indexed, second.unchanged), (0, 1), "same `updated` → skipped, not re-embedded");
+
+    let third = run(serve_search("2026-09-28T09:00:00.000+0200").await).await;
+    assert_eq!((third.indexed, third.unchanged), (1, 0), "changed `updated` → re-indexed");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_401_maps_to_the_auth_error() {
     let (url, _) = serve(true).await;

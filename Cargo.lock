@@ -2983,6 +2983,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "unicode-normalization",
+ "ureq",
 ]
 
 [[package]]

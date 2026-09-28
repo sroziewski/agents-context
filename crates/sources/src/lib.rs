@@ -5,6 +5,7 @@
 //! embedded — they are ~90% of the bytes and almost all of the noise.
 
 pub mod claude;
+pub mod jira;
 pub mod opencode;
 pub mod project;
 pub mod teams;

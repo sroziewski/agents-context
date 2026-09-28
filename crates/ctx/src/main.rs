@@ -258,6 +258,7 @@ enum SourceArg {
     Claude,
     Opencode,
     Teams,
+    Jira,
     All,
 }
 
@@ -297,6 +298,8 @@ async fn main() -> anyhow::Result<()> {
                 )) as Arc<dyn ingest::Summarizer>
             });
             let teams_store = Arc::new(Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.teams_collection, embed::BGEM3_DIM)?);
+            // Jira store only when Jira is configured; the twice-daily schedule drives it.
+            let jira_store = cfg.jira().map(|_| Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.jira_collection, embed::BGEM3_DIM)).transpose()?.map(Arc::new);
             let sessions_store = Arc::new(connect_store(&cfg)?);
             let counter: Arc<dyn ingest::TokenCounter + Send + Sync> = Arc::new(counter);
             // Always attached: whether to inject is decided by the hook on every prompt, so
@@ -318,6 +321,7 @@ async fn main() -> anyhow::Result<()> {
                 model.clone(),
                 summarizer,
                 Some(teams_store),
+                jira_store.clone(),
             );
             let queue = IndexQueue::start(runner, Duration::from_secs(20));
             if !addr.ip().is_loopback() {
@@ -327,6 +331,11 @@ async fn main() -> anyhow::Result<()> {
             queue.request(Target::All);
             if index_every > 0 {
                 queue.schedule(Duration::from_secs(index_every * 60));
+            }
+            // Jira: only on its own twice-daily schedule (not part of All), when configured.
+            if jira_store.is_some() {
+                eprintln!("jira indexing scheduled at {:?} local", cfg.jira_index_times);
+                queue.schedule_daily(Target::Jira, cfg.jira_index_times.clone());
             }
             // Lazily-built CPU reranker for opt-in deep search; loaded only on the first
             // /rerank call, never for a normal search.
@@ -437,6 +446,7 @@ async fn main() -> anyhow::Result<()> {
                 SourceArg::Claude => Sources::Claude,
                 SourceArg::Opencode => Sources::OpenCode,
                 SourceArg::Teams => anyhow::bail!("indexing Teams needs the daemon (`ctx embed-server`); run without --local"),
+                SourceArg::Jira => anyhow::bail!("indexing Jira needs the daemon (`ctx embed-server`); run without --local"),
                 SourceArg::All => Sources::All,
             };
             let refs = ctx::discover(&cfg, which)?;
@@ -711,6 +721,7 @@ fn to_target(source: SourceArg) -> Target {
         SourceArg::Claude => Target::Claude,
         SourceArg::Opencode => Target::Opencode,
         SourceArg::Teams => Target::Teams,
+        SourceArg::Jira => Target::Jira,
         SourceArg::All => Target::All,
     }
 }

@@ -3,6 +3,7 @@
 pub mod batch;
 pub mod chunk;
 pub mod indexer;
+pub mod jira;
 pub mod rescan;
 pub mod scrub;
 pub mod state;

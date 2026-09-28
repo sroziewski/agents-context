@@ -137,6 +137,21 @@ impl State {
         Ok(current.is_some())
     }
 
+    /// Reads a free-form meta value (e.g. the Jira watermark). `None` if unset.
+    pub fn get_meta(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn.query_row("select value from meta where key = ?1", params![key], |r| r.get(0)).optional()
+    }
+
+    /// Sets a free-form meta value. Keys here are separate from `version`, so they survive a
+    /// re-index (the watermark should not, though — callers clear it when the model changes).
+    pub fn set_meta(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "insert into meta (key, value) values (?1, ?2) on conflict(key) do update set value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     pub fn get(&self, source: &str, session_id: &str) -> rusqlite::Result<Option<Indexed>> {
         self.conn
             .query_row(

@@ -21,6 +21,9 @@ pub enum Target {
     Claude,
     Opencode,
     Teams,
+    /// Jira only. Deliberately not part of `All`: Jira is indexed on its own twice-daily
+    /// schedule, not on the frequent session/Teams runs.
+    Jira,
     All,
 }
 
@@ -29,18 +32,24 @@ impl Target {
         if self == other { self } else { Target::All }
     }
 
-    /// Session sources this run covers; `None` for a Teams-only run.
+    /// Session sources this run covers; `None` for a Teams- or Jira-only run.
     pub fn sessions(self) -> Option<Sources> {
         match self {
             Target::Claude => Some(Sources::Claude),
             Target::Opencode => Some(Sources::OpenCode),
-            Target::Teams => None,
+            Target::Teams | Target::Jira => None,
             Target::All => Some(Sources::All),
         }
     }
 
     pub fn includes_teams(self) -> bool {
         matches!(self, Target::Teams | Target::All)
+    }
+
+    /// Jira runs only when explicitly targeted (the twice-daily scheduler or `ctx index
+    /// --source jira`), never as part of `All`.
+    pub fn includes_jira(self) -> bool {
+        matches!(self, Target::Jira)
     }
 }
 
@@ -94,6 +103,45 @@ impl IndexQueue {
             }
         });
     }
+
+    /// Requests `target` at each given local `(hour, minute)` — for Jira's twice-daily index.
+    /// Sleeps until the next slot, fires, repeats; robust across days and DST via jiff.
+    pub fn schedule_daily(&self, target: Target, times: Vec<(u32, u32)>) {
+        if times.is_empty() {
+            return;
+        }
+        let q = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let wait = duration_until_next(&times, jiff::Zoned::now());
+                tokio::time::sleep(wait).await;
+                q.request(target);
+                // Guard against firing twice within the same minute after a near-zero sleep.
+                tokio::time::sleep(Duration::from_secs(61)).await;
+            }
+        });
+    }
+}
+
+/// Time from `now` to the next `(hour, minute)` slot in `now`'s time zone.
+fn duration_until_next(times: &[(u32, u32)], now: jiff::Zoned) -> Duration {
+    let (date, tz, now_ts) = (now.date(), now.time_zone().clone(), now.timestamp());
+    let next = times
+        .iter()
+        .flat_map(|&(h, m)| {
+            // today and tomorrow, so a slot earlier today rolls to tomorrow.
+            let tz = tz.clone();
+            [0i64, 1].into_iter().filter_map(move |day| {
+                date.checked_add(jiff::Span::new().days(day)).ok()?.at(h as i8, m as i8, 0, 0).to_zoned(tz.clone()).ok()
+            })
+        })
+        .map(|z| z.timestamp())
+        .filter(|&t| t > now_ts)
+        .min();
+    match next {
+        Some(t) => Duration::from_millis((t.as_millisecond() - now_ts.as_millisecond()).max(0) as u64),
+        None => Duration::from_secs(3600),
+    }
 }
 
 async fn worker(mut rx: mpsc::UnboundedReceiver<Target>, runner: Runner, debounce: Duration, status: Arc<Mutex<Status>>) {
@@ -136,6 +184,24 @@ fn set(status: &Mutex<Status>, f: impl FnOnce(&mut Status)) {
 mod tests {
     use super::*;
     use tokio::sync::Notify;
+
+    #[test]
+    fn next_daily_slot_is_computed_across_the_day() {
+        let times = [(10, 0), (17, 0)];
+        let at = |s: &str| jiff::Zoned::strptime("%Y-%m-%dT%H:%M:%S[%Q]", s).unwrap();
+        let hours = |z: jiff::Zoned| duration_until_next(&times, z).as_secs_f64() / 3600.0;
+        assert!((hours(at("2026-09-28T09:00:00[Europe/Warsaw]")) - 1.0).abs() < 0.01, "09:00 → 10:00");
+        assert!((hours(at("2026-09-28T12:00:00[Europe/Warsaw]")) - 5.0).abs() < 0.01, "12:00 → 17:00");
+        assert!((hours(at("2026-09-28T18:00:00[Europe/Warsaw]")) - 16.0).abs() < 0.01, "18:00 → next 10:00");
+        assert_eq!(duration_until_next(&[], at("2026-09-28T09:00:00[Europe/Warsaw]")).as_secs(), 3600, "no times → idle hour");
+    }
+
+    #[test]
+    fn jira_target_is_isolated_from_all() {
+        assert!(Target::Jira.includes_jira() && !Target::All.includes_jira());
+        assert!(!Target::Jira.includes_teams());
+        assert!(Target::Jira.sessions().is_none());
+    }
 
     /// Records every run's target; each run blocks until `release` is notified when gated.
     fn recording(gate: Option<Arc<Notify>>) -> (Runner, Arc<Mutex<Vec<Target>>>) {

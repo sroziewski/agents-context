@@ -83,7 +83,7 @@ async fn env() -> Env {
     let sessions = Arc::new(Store::connect(&q.url, None, "sessions", DIM).unwrap());
     let teams_store = Arc::new(Store::connect(&q.url, None, "teams", DIM).unwrap());
     let shared = SharedEmbedder::new(Box::new(HashEmbedder::new(DIM)));
-    let runner = ctx::daemon_runner(cfg.clone(), sessions.clone(), Arc::new(WordCounter), shared, "hash".into(), None, Some(teams_store.clone()));
+    let runner = ctx::daemon_runner(cfg.clone(), sessions.clone(), Arc::new(WordCounter), shared, "hash".into(), None, Some(teams_store.clone()), None);
     let queue = IndexQueue::start(runner, Duration::from_millis(10));
     queue.request(Target::Teams);
     for _ in 0..500 {

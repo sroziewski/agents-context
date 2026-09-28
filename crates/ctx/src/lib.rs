@@ -93,6 +93,29 @@ pub async fn run_teams_index(
     Ok(ingest::teams::sync_teams(store, embedder, counter, state, &db, &config, now).await?)
 }
 
+/// Delta index of Jira issues (the keys mapped in `jira-projects.json`) into the jira collection.
+pub async fn run_jira_index(
+    cfg: &config::Config,
+    store: &Store,
+    embedder: &mut dyn Embedder,
+    model: &str,
+    counter: &dyn TokenCounter,
+    state: &State,
+    redactor: &ingest::Redactor,
+) -> anyhow::Result<Report> {
+    if state.ensure_version(&index_version(model))? {
+        eprintln!("model or chunker changed: re-indexing everything");
+    }
+    let jira = cfg.jira().ok_or_else(|| anyhow::anyhow!("Jira is not configured (JIRA_URL / JIRA_TOKEN)"))?;
+    let keys = jira::all_keys(&jira::load_project_keys(&cfg.jira_projects)?);
+    anyhow::ensure!(!keys.is_empty(), "no Jira keys mapped in {}", cfg.jira_projects.display());
+    store.ensure_collection(ingest::jira::JIRA_FIELDS).await?;
+    let mut config = IndexConfig::default();
+    config.chunk.redactor = redactor.clone();
+    let now = jiff::Timestamp::now().as_millisecond();
+    Ok(ingest::jira::sync_jira(store, embedder, counter, state, &jira, &keys, &config, now).await?)
+}
+
 pub fn format_report(r: &Report, elapsed: std::time::Duration) -> String {
     format!(
         "scanned {} · indexed {} · unchanged {} · empty {} · failed {} · {} chunks · {} secrets redacted · {:.1?}",
@@ -111,6 +134,7 @@ pub fn format_report(r: &Report, elapsed: std::time::Duration) -> String {
 ///
 /// With a summarizer, each run then summarises sessions that are new or have grown, within the
 /// summary budget; the rest wait for the next run.
+#[allow(clippy::too_many_arguments)]
 pub fn daemon_runner(
     cfg: config::Config,
     store: std::sync::Arc<Store>,
@@ -119,11 +143,13 @@ pub fn daemon_runner(
     model: String,
     summarizer: Option<std::sync::Arc<dyn ingest::Summarizer>>,
     teams_store: Option<std::sync::Arc<Store>>,
+    jira_store: Option<std::sync::Arc<Store>>,
 ) -> queue::Runner {
     std::sync::Arc::new(move |target: queue::Target| {
         let (cfg, store, counter, mut embedder, model) = (cfg.clone(), store.clone(), counter.clone(), embedder.clone(), model.clone());
         let summarizer = summarizer.clone();
         let teams_store = teams_store.clone();
+        let jira_store = jira_store.clone();
         Box::pin(async move {
             let handle = tokio::runtime::Handle::current();
             // The indexer embeds synchronously; run it on a blocking thread so HTTP handlers
@@ -164,6 +190,21 @@ pub fn daemon_runner(
                                     eprintln!("[teams] FAILED: {e:#}");
                                     parts.push(format!("teams: FAILED ({e})"));
                                 }
+                            }
+                        }
+                    }
+                    if let (true, Some(jira)) = (target.includes_jira(), &jira_store) {
+                        // Isolated like Teams: a Jira outage must not affect anything else.
+                        match run_jira_index(&cfg, jira, &mut embedder, &model, counter.as_ref(), &state, &redactor).await {
+                            Ok(r) => {
+                                for (id, error) in &r.failed {
+                                    eprintln!("[jira]   FAILED {id}: {error}");
+                                }
+                                parts.push(format!("jira: scanned {} · indexed {} · unchanged {} · failed {} · {} chunks", r.scanned, r.indexed, r.unchanged, r.failed.len(), r.chunks));
+                            }
+                            Err(e) => {
+                                eprintln!("[jira] FAILED: {e:#}");
+                                parts.push(format!("jira: FAILED ({e})"));
                             }
                         }
                     }

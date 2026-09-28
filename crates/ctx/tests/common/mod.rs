@@ -92,6 +92,7 @@ pub async fn indexed(fixtures: &[Fixture]) -> Env {
         "hash".into(),
         Some(Arc::new(EchoSummarizer)),
         None,
+        None,
     );
     let queue = IndexQueue::start(runner, Duration::from_millis(10));
     queue.request(Target::All);

@@ -56,6 +56,10 @@ pub struct Config {
     pub jira_projects: PathBuf,
     /// Writes to Jira are refused unless this is on (`JIRA_WRITE`); read-only by default.
     pub jira_write: bool,
+    /// Qdrant collection for indexed Jira issues.
+    pub jira_collection: String,
+    /// Local times to index Jira at (`CTX_JIRA_INDEX_TIMES`, e.g. "10:00,17:00").
+    pub jira_index_times: Vec<(u32, u32)>,
 }
 
 /// Off: on the real query set (2026-09-27, 33 queries) every weight tried lowered MRR and none
@@ -147,6 +151,8 @@ impl Config {
             jira_token: get("JIRA_TOKEN").filter(|t| !t.is_empty()),
             jira_projects: path("JIRA_PROJECTS", Self::config_dir().join("jira-projects.json")),
             jira_write: on("JIRA_WRITE", false),
+            jira_collection: get("CTX_JIRA_COLLECTION").unwrap_or_else(|| "jira".into()),
+            jira_index_times: parse_times(get("CTX_JIRA_INDEX_TIMES").as_deref().unwrap_or("10:00,17:00")),
         }
     }
 }
@@ -172,6 +178,22 @@ pub fn fresh_inject(env_file: &std::path::Path) -> crate::inject::InjectConfig {
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let file: std::collections::HashMap<String, String> = dotenvy::from_read_iter(text.as_bytes()).filter_map(Result::ok).collect();
     Config::from_env(|k| file.get(k).cloned().or_else(|| std::env::var(k).ok())).inject
+}
+
+/// Parses "HH:MM,HH:MM" into `(hour, minute)` pairs, dropping malformed entries. Sorted and
+/// deduped so the scheduler can pick the next slot deterministically.
+pub fn parse_times(s: &str) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = s
+        .split(',')
+        .filter_map(|t| {
+            let (h, m) = t.trim().split_once(':')?;
+            let (h, m) = (h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?);
+            (h < 24 && m < 60).then_some((h, m))
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Sets `key=value` in a `.env` file, replacing an existing assignment (also `export KEY=`)
@@ -286,6 +308,17 @@ mod tests {
         std::fs::write(&path, format!("{line}\nCTX_INJECT=off\n")).unwrap();
         set_env_value(&path, "CTX_INJECT", "on").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{line}\nCTX_INJECT=on\n"));
+    }
+
+    #[test]
+    fn parse_times_reads_and_sorts_valid_slots() {
+        assert_eq!(parse_times("10:00,17:00"), [(10, 0), (17, 0)]);
+        assert_eq!(parse_times("17:30, 09:05"), [(9, 5), (17, 30)]);
+        assert_eq!(parse_times("25:00,10:00,nonsense,10:00"), [(10, 0)], "bad/duplicate dropped");
+        assert!(parse_times("").is_empty());
+        let c = Config::from_env(|k| (k == "CTX_JIRA_INDEX_TIMES").then(|| "08:15".to_owned()));
+        assert_eq!(c.jira_index_times, [(8, 15)]);
+        assert_eq!(Config::from_env(|_| None).jira_index_times, [(10, 0), (17, 0)]);
     }
 
     #[test]

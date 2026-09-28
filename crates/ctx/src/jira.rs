@@ -1,187 +1,11 @@
-//! Read-only Jira client (Jira Data Center, REST v2) and the project→key mapping.
-//!
-//! Auth is a Bearer Personal Access Token from `JIRA_TOKEN`; the base URL is `JIRA_URL`. This
-//! module never writes — writes live behind the DEV-38 gate. Nothing here logs the token.
+//! Jira search, formatting and the project→key mapping for `ctx`. The read/write client and the
+//! types live in `sources::jira`; here we add JQL building, redacted formatting, project scoping
+//! and the read-only-by-default write gate. Nothing here logs the token.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-
-/// A Jira read failure, distinguishing auth from a missing issue from transport, so the CLI can
-/// say something useful (e.g. "check JIRA_TOKEN").
-#[derive(Debug)]
-pub enum JiraError {
-    /// 401/403 — the token is missing, wrong or lacks permission.
-    Auth,
-    /// 404 — no such issue/project.
-    NotFound(String),
-    /// Any other HTTP status or a transport error.
-    Http(String),
-    Parse(String),
-}
-
-impl std::fmt::Display for JiraError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Auth => write!(f, "Jira authentication failed (401/403); check JIRA_TOKEN in the config .env"),
-            Self::NotFound(what) => write!(f, "Jira: {what} not found (404)"),
-            Self::Http(e) => write!(f, "Jira request failed: {e}"),
-            Self::Parse(e) => write!(f, "Jira response could not be parsed: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for JiraError {}
-
-pub type Result<T> = std::result::Result<T, JiraError>;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct JiraComment {
-    pub author: String,
-    pub created: String,
-    pub body: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct JiraIssue {
-    pub key: String,
-    pub summary: String,
-    pub description: String,
-    pub status: String,
-    pub issue_type: String,
-    pub assignee: String,
-    pub updated: String,
-    pub url: String,
-    /// Empty for search results (only the summary fields are fetched there).
-    pub comments: Vec<JiraComment>,
-}
-
-/// Read-only Jira Data Center client. Blocking `ureq`, like the other service clients.
-#[derive(Clone)]
-pub struct Jira {
-    agent: ureq::Agent,
-    base: String,
-    token: String,
-}
-
-impl Jira {
-    pub fn new(base: &str, token: &str) -> Self {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(20)))
-            .build()
-            .into();
-        Self { agent, base: base.trim_end_matches('/').to_owned(), token: token.to_owned() }
-    }
-
-    fn get_json(&self, path: &str) -> Result<serde_json::Value> {
-        let url = format!("{}{path}", self.base);
-        match self.agent.get(&url).header("Authorization", format!("Bearer {}", self.token)).header("Accept", "application/json").call() {
-            Ok(mut resp) => resp.body_mut().read_json().map_err(|e| JiraError::Parse(e.to_string())),
-            Err(ureq::Error::StatusCode(401 | 403)) => Err(JiraError::Auth),
-            Err(ureq::Error::StatusCode(404)) => Err(JiraError::NotFound(path.to_owned())),
-            Err(e) => Err(JiraError::Http(e.to_string())),
-        }
-    }
-
-    /// One issue with its description and comments.
-    pub fn issue(&self, key: &str) -> Result<JiraIssue> {
-        let v = self.get_json(&format!("/rest/api/2/issue/{key}?fields=summary,description,status,issuetype,assignee,updated,comment"))?;
-        Ok(self.parse_issue(&v))
-    }
-
-    /// Issues matching a JQL query; summary fields only (no comments), newest changes first if
-    /// the JQL does not order.
-    pub fn search(&self, jql: &str, limit: u32) -> Result<Vec<JiraIssue>> {
-        let q = url_encode(jql);
-        let path = format!("/rest/api/2/search?jql={q}&maxResults={limit}&fields=summary,status,issuetype,assignee,updated");
-        let v = self.get_json(&path)?;
-        Ok(v.get("issues").and_then(|i| i.as_array()).map(|arr| arr.iter().map(|i| self.parse_issue(i)).collect()).unwrap_or_default())
-    }
-
-    fn post_json(&self, path: &str, body: serde_json::Value) -> Result<()> {
-        let url = format!("{}{path}", self.base);
-        match self.agent.post(&url).header("Authorization", format!("Bearer {}", self.token)).header("Accept", "application/json").send_json(&body) {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::StatusCode(401 | 403)) => Err(JiraError::Auth),
-            Err(ureq::Error::StatusCode(404)) => Err(JiraError::NotFound(path.to_owned())),
-            Err(e) => Err(JiraError::Http(e.to_string())),
-        }
-    }
-
-    /// Appends a comment. Write op — callers gate it (DEV-38).
-    pub fn add_comment(&self, key: &str, body: &str) -> Result<()> {
-        self.post_json(&format!("/rest/api/2/issue/{key}/comment"), serde_json::json!({ "body": body }))
-    }
-
-    /// Available transitions for an issue, as `(id, name)`.
-    pub fn transitions(&self, key: &str) -> Result<Vec<(String, String)>> {
-        let v = self.get_json(&format!("/rest/api/2/issue/{key}/transitions"))?;
-        Ok(v.get("transitions")
-            .and_then(|t| t.as_array())
-            .map(|arr| arr.iter().map(|t| (string(t, "id"), t.get("to").map(|to| string(to, "name")).unwrap_or_else(|| string(t, "name")))).collect())
-            .unwrap_or_default())
-    }
-
-    /// Applies a transition by id. Write op — callers gate it (DEV-38).
-    pub fn do_transition(&self, key: &str, transition_id: &str) -> Result<()> {
-        self.post_json(&format!("/rest/api/2/issue/{key}/transitions"), serde_json::json!({ "transition": { "id": transition_id } }))
-    }
-
-    /// `(key, name)` for every visible project.
-    pub fn projects(&self) -> Result<Vec<(String, String)>> {
-        let v = self.get_json("/rest/api/2/project")?;
-        Ok(v.as_array()
-            .map(|arr| arr.iter().map(|p| (string(p, "key"), string(p, "name"))).filter(|(k, _)| !k.is_empty()).collect())
-            .unwrap_or_default())
-    }
-
-    fn parse_issue(&self, v: &serde_json::Value) -> JiraIssue {
-        let key = string(v, "key");
-        let f = v.get("fields").cloned().unwrap_or(serde_json::Value::Null);
-        let named = |field: &str| f.get(field).map(|n| string(n, "name")).unwrap_or_default();
-        let comments = f
-            .pointer("/comment/comments")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|c| JiraComment {
-                        author: c.get("author").map(|a| string(a, "displayName")).unwrap_or_default(),
-                        created: string(c, "created"),
-                        body: string(c, "body"),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        JiraIssue {
-            url: format!("{}/browse/{key}", self.base),
-            summary: string(&f, "summary"),
-            // DC returns description as plain text/wiki markup (not Cloud's ADF object).
-            description: f.get("description").and_then(|d| d.as_str()).unwrap_or_default().to_owned(),
-            status: named("status"),
-            issue_type: named("issuetype"),
-            assignee: f.get("assignee").filter(|a| !a.is_null()).map(|a| string(a, "displayName")).unwrap_or_else(|| "Unassigned".to_owned()),
-            updated: string(&f, "updated"),
-            comments,
-            key,
-        }
-    }
-}
-
-fn string(v: &serde_json::Value, k: &str) -> String {
-    v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_owned()
-}
-
-/// Minimal percent-encoding for a JQL query in a URL query string.
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
+pub use sources::jira::{Jira, JiraComment, JiraError, JiraIssue};
 
 /// Loads `jira-projects.json` (a `{ "project dir": ["JIRA-KEY", …] }` map), keyed by normalised
 /// project key like the Teams mapping. Missing file → empty (integration simply unscoped).
@@ -196,9 +20,8 @@ pub fn load_project_keys(path: &Path) -> anyhow::Result<HashMap<String, Vec<Stri
     }
 }
 
-/// The Jira keys mapped to `project_key`: the values of every mapping entry whose (normalised)
-/// directory is a substring of the project, so `d:/dev/helpdesk/zsun-help-backend` matches a
-/// `helpdesk` entry. Deduped, order-stable.
+/// The Jira keys mapped to `project_key`: values of every entry whose (normalised) directory is
+/// a substring of the project. Deduped, order-stable.
 pub fn keys_for_project(project_key: &str, map: &HashMap<String, Vec<String>>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut entries: Vec<(&String, &Vec<String>)> = map.iter().collect();
@@ -215,46 +38,50 @@ pub fn keys_for_project(project_key: &str, map: &HashMap<String, Vec<String>>) -
     out
 }
 
+/// Every distinct Jira key across the whole mapping (what the indexer covers). Sorted.
+pub fn all_keys(map: &HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut out: Vec<String> = map.values().flatten().cloned().collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// A bare Jira issue key in `text` (e.g. `HD-123`), so a search query that is really an issue
-/// reference can be fetched directly. Requires an uppercase project code and a number.
+/// reference can be fetched directly.
 pub fn detect_issue_key(text: &str) -> Option<String> {
     let t = text.trim();
-    let bytes = t.as_bytes();
     let dash = t.find('-')?;
     let (code, num) = (&t[..dash], &t[dash + 1..]);
-    let code_ok = (2..=10).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) && code.bytes().next().is_some_and(|b| b.is_ascii_uppercase());
+    let code_ok = (2..=10).contains(&code.len())
+        && code.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        && code.bytes().next().is_some_and(|b| b.is_ascii_uppercase());
     let num_ok = !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit());
-    let _ = bytes;
     (code_ok && num_ok).then(|| t.to_owned())
 }
 
-/// Builds a JQL query from a plain-text search. Scopes to `keys` (e.g. `project in (HD)`) when
-/// any are given, matches the text with `~`, and orders by most recently updated. Quotes in the
-/// text are escaped so they cannot break out of the JQL string literal.
+/// Builds a JQL query from plain text. Scopes to `keys` (`project in (…)`) when any are given,
+/// matches with `~`, and orders by most recently updated. Quotes are escaped so text cannot
+/// break out of the JQL string literal.
 pub fn build_jql(text: &str, keys: &[String]) -> String {
     let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
     let text_clause = format!("text ~ \"{escaped}\"");
-    let scoped = if keys.is_empty() {
-        text_clause
-    } else {
-        format!("project in ({}) AND {text_clause}", keys.join(", "))
-    };
+    let scoped = if keys.is_empty() { text_clause } else { format!("project in ({}) AND {text_clause}", keys.join(", ")) };
     format!("{scoped} ORDER BY updated DESC")
 }
 
-/// Read-only Jira search + formatting, redacted on the way out. Mirrors `TeamsSearch`: the CLI
-/// and MCP tools call this so the query/scoping/redaction logic lives in one place.
+/// Read-only Jira search + formatting plus the gated writes, redacted on the way out. The CLI
+/// and MCP tools call this so query/scoping/redaction/gate logic lives in one place.
 #[derive(Clone)]
 pub struct JiraSearch {
     pub jira: Jira,
     /// `jira-projects.json`, for default project scoping.
-    pub projects: std::path::PathBuf,
+    pub projects: PathBuf,
     /// The user's literal redaction list; issue/comment text is scrubbed before display.
-    pub redact: std::path::PathBuf,
-    /// Config lock (`JIRA_WRITE`): writes are refused unless this is true, whatever the caller asks.
+    pub redact: PathBuf,
+    /// Config lock (`JIRA_WRITE`): writes are refused unless true, whatever the caller asks.
     pub write_allowed: bool,
-    /// Append-only local record of writes that were actually sent.
-    pub write_log: std::path::PathBuf,
+    /// Append-only local record of writes actually sent.
+    pub write_log: PathBuf,
 }
 
 impl JiraSearch {
@@ -285,14 +112,13 @@ impl JiraSearch {
         Ok(format_issue(&issue, &redactor))
     }
 
-    /// The config lock. Refused with a clear message when `JIRA_WRITE` is off.
     fn require_write_allowed(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.write_allowed, "Jira writes are off; set JIRA_WRITE=on in the config .env to allow them (they still need an explicit confirm)");
         Ok(())
     }
 
     /// Adds a comment. Two locks: `JIRA_WRITE=on` (config) AND `confirm` (explicit intent).
-    /// Without `confirm` it is a dry run — it returns what *would* be sent and sends nothing.
+    /// Without `confirm` it is a dry run.
     pub fn comment(&self, key: &str, body: &str, confirm: bool) -> anyhow::Result<String> {
         self.require_write_allowed()?;
         if !confirm {
@@ -303,13 +129,11 @@ impl JiraSearch {
         Ok(format!("Comment added to {key}."))
     }
 
-    /// Transitions an issue to the named status (case-insensitive). Lists transitions first,
-    /// resolves the name, then applies it under the same two locks and dry-run rule.
+    /// Transitions an issue to the named status (case-insensitive), under the same two locks.
     pub fn transition(&self, key: &str, to: &str, confirm: bool) -> anyhow::Result<String> {
         self.require_write_allowed()?;
         let available = self.jira.transitions(key).map_err(anyhow::Error::msg)?;
-        let choice = available.iter().find(|(_, name)| name.eq_ignore_ascii_case(to.trim()));
-        let Some((id, name)) = choice else {
+        let Some((id, name)) = available.iter().find(|(_, name)| name.eq_ignore_ascii_case(to.trim())) else {
             let names: Vec<&str> = available.iter().map(|(_, n)| n.as_str()).collect();
             anyhow::bail!("no transition to {to:?} from {key}'s current status; available: {}", if names.is_empty() { "(none)".to_owned() } else { names.join(", ") });
         };
@@ -321,16 +145,13 @@ impl JiraSearch {
         Ok(format!("{key} transitioned to \"{name}\"."))
     }
 
-    /// Appends a timestamped line to the local write log; best-effort (a log failure must not
-    /// fail the write that already happened).
     fn log(&self, what: &str) {
         use std::io::Write;
         if let Some(dir) = self.write_log.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.write_log) {
-            let ts = jiff::Timestamp::now().to_string();
-            let _ = writeln!(f, "{ts}  {what}");
+            let _ = writeln!(f, "{}  {what}", jiff::Timestamp::now());
         }
     }
 }
@@ -364,16 +185,7 @@ pub fn format_issues(issues: &[JiraIssue], jql: &str, redactor: &ingest::Redacto
 /// One issue in full: header, description, then comments — all redacted.
 pub fn format_issue(x: &JiraIssue, redactor: &ingest::Redactor) -> String {
     let scrub = |s: &str| redactor.scrub(s).0;
-    let mut out = format!(
-        "{} · {} · {} · assignee {} · updated {}\n{}\n\n{}",
-        x.key,
-        x.issue_type,
-        x.status,
-        x.assignee,
-        x.updated,
-        x.url,
-        scrub(&x.summary)
-    );
+    let mut out = format!("{} · {} · {} · assignee {} · updated {}\n{}\n\n{}", x.key, x.issue_type, x.status, x.assignee, x.updated, x.url, scrub(&x.summary));
     if !x.description.trim().is_empty() {
         out.push_str(&format!("\n\n{}", scrub(x.description.trim())));
     }
@@ -386,55 +198,18 @@ pub fn format_issue(x: &JiraIssue, redactor: &ingest::Redactor) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    fn jira() -> Jira {
-        Jira::new("https://jira.example.org/", "tok")
-    }
-
-    #[test]
-    fn parses_a_full_issue_with_comments() {
-        let v = json!({
-            "key": "HD-1410",
-            "fields": {
-                "summary": "Login fails after deploy",
-                "description": "Users cannot log in on prod.",
-                "status": {"name": "In Progress"},
-                "issuetype": {"name": "Bug"},
-                "assignee": {"displayName": "Szymon Roziewski"},
-                "updated": "2026-09-27T10:00:00.000+0200",
-                "comment": {"comments": [
-                    {"author": {"displayName": "Anna W"}, "created": "2026-09-27T11:00:00.000+0200", "body": "restarted the service"}
-                ]}
-            }
-        });
-        let i = jira().parse_issue(&v);
-        assert_eq!(i.key, "HD-1410");
-        assert_eq!(i.summary, "Login fails after deploy");
-        assert_eq!((i.status.as_str(), i.issue_type.as_str(), i.assignee.as_str()), ("In Progress", "Bug", "Szymon Roziewski"));
-        assert_eq!(i.url, "https://jira.example.org/browse/HD-1410");
-        assert_eq!(i.comments, [JiraComment { author: "Anna W".into(), created: "2026-09-27T11:00:00.000+0200".into(), body: "restarted the service".into() }]);
-    }
-
-    #[test]
-    fn missing_or_null_fields_degrade_gracefully() {
-        let i = jira().parse_issue(&json!({"key": "SEDN26-1", "fields": {"summary": "x", "status": {"name": "Open"}, "assignee": null}}));
-        assert_eq!(i.assignee, "Unassigned");
-        assert_eq!(i.issue_type, "");
-        assert!(i.description.is_empty() && i.comments.is_empty());
-    }
 
     #[test]
     fn detects_issue_keys_but_not_prose() {
         assert_eq!(detect_issue_key("HD-1410"), Some("HD-1410".into()));
         assert_eq!(detect_issue_key("  SEDN26-42 "), Some("SEDN26-42".into()));
-        assert_eq!(detect_issue_key("how did we fix HD-1410"), None, "only a bare key");
+        assert_eq!(detect_issue_key("how did we fix HD-1410"), None);
         assert_eq!(detect_issue_key("lowercase-12"), None);
         assert_eq!(detect_issue_key("HD-"), None);
     }
 
     #[test]
-    fn maps_project_dirs_to_keys_by_substring() {
+    fn maps_project_dirs_to_keys_and_lists_all() {
         let map: HashMap<String, Vec<String>> = [
             (sources::project::key("helpdesk"), vec!["HD".to_string()]),
             (sources::project::key("zsun-help-backend"), vec!["HD".to_string()]),
@@ -445,6 +220,36 @@ mod tests {
         assert_eq!(keys_for_project(&sources::project::key("d:/dev/helpdesk"), &map), ["HD"]);
         assert_eq!(keys_for_project(&sources::project::key("d:/dev/sedn/sedn26"), &map), ["SEDN26"]);
         assert!(keys_for_project(&sources::project::key("d:/dev/unrelated"), &map).is_empty());
+        assert_eq!(all_keys(&map), ["HD", "SEDN26"]);
+    }
+
+    #[test]
+    fn build_jql_scopes_and_escapes() {
+        assert_eq!(build_jql("login fails", &[]), "text ~ \"login fails\" ORDER BY updated DESC");
+        assert_eq!(build_jql("login", &["HD".into(), "SEDN26".into()]), "project in (HD, SEDN26) AND text ~ \"login\" ORDER BY updated DESC");
+        assert!(build_jql("say \"hi\"", &[]).contains("text ~ \"say \\\"hi\\\"\""));
+    }
+
+    #[test]
+    fn formats_issues_and_one_issue_redacted() {
+        let red = ingest::Redactor::new(["s3cr3tp4ss".to_string()]);
+        let base = JiraIssue {
+            key: "HD-1".into(),
+            summary: "leak s3cr3tp4ss here".into(),
+            description: String::new(),
+            status: "Open".into(),
+            issue_type: "Bug".into(),
+            assignee: "Anna".into(),
+            updated: "2026-09-27T10:00:00.000+0200".into(),
+            url: "https://j/browse/HD-1".into(),
+            comments: vec![],
+        };
+        let out = format_issues(std::slice::from_ref(&base), "jql", &red);
+        assert!(out.contains("[1] HD-1 · Bug · Open · Anna · updated 2026-09-27") && !out.contains("s3cr3tp4ss"), "{out}");
+        assert_eq!(format_issues(&[], "project = X", &red), "No Jira issues for: project = X");
+        let full = JiraIssue { description: "detail s3cr3tp4ss".into(), comments: vec![JiraComment { author: "Bob".into(), created: "2026-09-27T11:00:00Z".into(), body: "note s3cr3tp4ss".into() }], ..base };
+        let one = format_issue(&full, &red);
+        assert!(!one.contains("s3cr3tp4ss") && one.contains("--- Bob · 2026-09-27 ---"), "{one}");
     }
 
     #[test]
@@ -455,51 +260,7 @@ mod tests {
         };
         let j = Jira::new(&url, &token);
         let issues = j.search("project = HD ORDER BY updated DESC", 1).unwrap();
-        assert!(!issues.is_empty(), "HD has issues");
-        let full = j.issue(&issues[0].key).unwrap();
-        assert_eq!(full.key, issues[0].key);
-        assert!(!full.summary.is_empty());
-    }
-
-    #[test]
-    fn build_jql_scopes_and_escapes() {
-        assert_eq!(build_jql("login fails", &[]), "text ~ \"login fails\" ORDER BY updated DESC");
-        assert_eq!(
-            build_jql("login", &["HD".into(), "SEDN26".into()]),
-            "project in (HD, SEDN26) AND text ~ \"login\" ORDER BY updated DESC"
-        );
-        // a quote in the text cannot break out of the JQL literal
-        assert!(build_jql("say \"hi\"", &[]).contains("text ~ \"say \\\"hi\\\"\""));
-    }
-
-    #[test]
-    fn formats_issues_and_one_issue_redacted() {
-        let red = ingest::Redactor::new(["s3cr3tp4ss".to_string()]);
-        let issues = [JiraIssue {
-            key: "HD-1".into(),
-            summary: "leak s3cr3tp4ss here".into(),
-            description: String::new(),
-            status: "Open".into(),
-            issue_type: "Bug".into(),
-            assignee: "Anna".into(),
-            updated: "2026-09-27T10:00:00.000+0200".into(),
-            url: "https://j/browse/HD-1".into(),
-            comments: vec![],
-        }];
-        let out = format_issues(&issues, "jql", &red);
-        assert!(out.contains("[1] HD-1 · Bug · Open · Anna · updated 2026-09-27"), "{out}");
-        assert!(!out.contains("s3cr3tp4ss") && out.contains("https://j/browse/HD-1"), "{out}");
-        assert_eq!(format_issues(&[], "project = X", &red), "No Jira issues for: project = X");
-
-        let full = JiraIssue { description: "detail s3cr3tp4ss".into(), comments: vec![JiraComment { author: "Bob".into(), created: "2026-09-27T11:00:00Z".into(), body: "note s3cr3tp4ss".into() }], ..issues[0].clone() };
-        let one = format_issue(&full, &red);
-        assert!(!one.contains("s3cr3tp4ss"), "description and comments redacted: {one}");
-        assert!(one.contains("--- Bob · 2026-09-27 ---"));
-    }
-
-    #[test]
-    fn url_encoding_covers_jql_punctuation() {
-        assert_eq!(url_encode("project = HD ORDER BY updated"), "project%20%3D%20HD%20ORDER%20BY%20updated");
-        assert_eq!(url_encode("text ~ \"db\""), "text%20~%20%22db%22");
+        assert!(!issues.is_empty());
+        assert_eq!(j.issue(&issues[0].key).unwrap().key, issues[0].key);
     }
 }

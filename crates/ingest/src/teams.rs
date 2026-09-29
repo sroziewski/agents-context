@@ -7,7 +7,7 @@
 
 use embed::Embedder;
 use serde_json::{Map, Value, json};
-use sources::teams::{TeamsDb, Thread};
+use sources::teams::{Meeting, TeamsDb, Thread, TranscriptLine};
 use store::{Field, SearchFilter, Store};
 
 use crate::chunk::{Chunk, pack, split};
@@ -17,12 +17,14 @@ use crate::tokens::TokenCounter;
 
 pub const SOURCE: &str = "teams";
 
-/// Payload fields the teams collection indexes. No project tenant: Teams is shared.
+/// Payload fields the teams collection indexes. No project tenant: Teams is shared. `meeting_id`
+/// scopes meeting/transcript chunks (thread/message chunks simply never set it, and vice versa).
 pub const TEAMS_FIELDS: &[Field] = &[
     Field::Keyword("kind"),
     Field::Keyword("thread_id"),
     Field::Keyword("channel_id"),
     Field::Keyword("author"),
+    Field::Keyword("meeting_id"),
 ];
 
 /// Context lines in a message chunk are cut to this many characters.
@@ -123,6 +125,82 @@ fn base_payload(t: &Thread, kind: &str, text: &str) -> Map<String, Value> {
     m
 }
 
+/// Chunks for one meeting. `transcript` chunks pack the spoken lines into window-sized pieces for
+/// topic search ("what was discussed"); one `meeting` chunk holds the title, the AI summary when
+/// present, and the participants for meeting-level search ("which standup was about X"). Per-line
+/// speaker precision ("who said X") is left to the FTS half of the search, so the multi-speaker
+/// vector windows stay simple. Returns `(chunks, redactions)`.
+pub fn meeting_chunks(m: &Meeting, lines: &[TranscriptLine], counter: &dyn TokenCounter, cfg: &IndexConfig) -> (Vec<Chunk>, usize) {
+    let redactor = &cfg.chunk.redactor;
+    let mut redactions = 0;
+    let header = format!("[{} · {}]\n", m.title, date(m.started_at, false));
+    let budget = cfg.chunk.max_tokens.saturating_sub(counter.count(&header)).max(16);
+
+    let mut rendered: Vec<String> = Vec::new();
+    let mut participants: Vec<String> = Vec::new();
+    for l in lines {
+        let (clean, n) = redactor.scrub(&l.text);
+        redactions += n;
+        // System lines (e.g. "started transcription") have no speaker; show a neutral marker.
+        let who = l.speaker.as_deref().unwrap_or("—");
+        if let Some(s) = &l.speaker {
+            participants.push(s.clone());
+        }
+        rendered.push(format!("{who} ({}): {}", date(l.ts, true), clean.trim()));
+    }
+    participants.sort_unstable();
+    participants.dedup();
+
+    let mut chunks = Vec::new();
+
+    // Transcript window chunks.
+    if !rendered.is_empty() {
+        let pieces = pack(split(&rendered.join("\n"), budget, counter), budget, cfg.chunk.overlap_tokens, counter);
+        let total = pieces.len();
+        let last_ts = lines.last().map_or(m.started_at, |l| l.ts);
+        for (i, piece) in pieces.into_iter().enumerate() {
+            let text = format!("{header}{piece}");
+            let mut p = meeting_payload(m, "transcript", &text);
+            p.insert("chunk_index".into(), json!(i));
+            p.insert("chunk_count".into(), json!(total));
+            p.insert("first_ts".into(), json!(m.started_at));
+            p.insert("ts".into(), json!(last_ts));
+            chunks.push(Chunk { id: store::point_id(SOURCE, &format!("meeting/{}/tr{i}", m.id)), tokens: counter.count(&text), payload: p, text });
+        }
+    }
+
+    // One meeting-level chunk: title, summary (only when actually available), participants.
+    let mut body = String::new();
+    if let Some(sum) = m.summary.as_deref().filter(|s| !s.trim().is_empty() && m.summary_status.eq_ignore_ascii_case("available")) {
+        let (clean, n) = redactor.scrub(sum);
+        redactions += n;
+        body.push_str(&format!("\nPodsumowanie: {}", clean.trim()));
+    }
+    if !participants.is_empty() {
+        body.push_str(&format!("\nUczestnicy: {}", participants.join(", ")));
+    }
+    let text = format!("[{} · {}–{}]{body}", m.title, date(m.started_at, true), date(m.ended_at, true));
+    let mut p = meeting_payload(m, "meeting", &text);
+    p.insert("ts".into(), json!(m.started_at));
+    p.insert("first_ts".into(), json!(m.started_at));
+    p.insert("participants".into(), json!(participants));
+    chunks.push(Chunk { id: store::point_id(SOURCE, &format!("meeting/{}/summary", m.id)), tokens: counter.count(&text), payload: p, text });
+
+    (chunks, redactions)
+}
+
+fn meeting_payload(m: &Meeting, kind: &str, text: &str) -> Map<String, Value> {
+    let v = json!({
+        "kind": kind,
+        "source": SOURCE,
+        "meeting_id": m.id,
+        "title": m.title,
+        "text": text,
+    });
+    let Value::Object(map) = v else { unreachable!("json! object") };
+    map
+}
+
 /// Indexes every thread whose fingerprint changed. Threads that disappear from `teams.db` keep
 /// their points, like sessions: the index outlives the app's lookback window.
 pub async fn sync_teams(
@@ -173,11 +251,53 @@ pub async fn sync_teams(
     Ok(report)
 }
 
+/// Indexes every meeting whose transcript changed, into the same `teams` collection. Meeting
+/// state ids are prefixed `meeting:` and point ids `meeting/`, so they never collide with the
+/// thread/message ids that share the collection.
+pub async fn sync_meetings(
+    store: &Store,
+    embedder: &mut dyn Embedder,
+    counter: &dyn TokenCounter,
+    state: &State,
+    db: &TeamsDb,
+    config: &IndexConfig,
+    now_ms: i64,
+) -> Result<Report, IndexError> {
+    let meetings = db.meetings().map_err(|e| IndexError::Source(e.to_string()))?;
+    let mut report = Report { scanned: meetings.len(), ..Default::default() };
+    for m in &meetings {
+        let lines = db.transcript(&m.id).map_err(|e| IndexError::Source(e.to_string()))?;
+        let fingerprint = m.fingerprint(&lines);
+        let key = format!("meeting:{}", m.id);
+        if state.get(SOURCE, &key)?.is_some_and(|i| i.fingerprint == fingerprint) {
+            report.unchanged += 1;
+            continue;
+        }
+        let (chunks, redactions) = meeting_chunks(m, &lines, counter, config);
+        let scope = SearchFilter::default().eq("source", SOURCE).eq("meeting_id", m.id.clone());
+        let n = match write_chunks(store, embedder, config, &scope, &chunks).await {
+            Ok(n) => n,
+            Err(e) => {
+                report.failed.push((m.id.clone(), e.to_string()));
+                continue;
+            }
+        };
+        state.record(
+            &Record { source: SOURCE, session_id: &key, fingerprint: &fingerprint, project: "", chunks: n, redactions, turns: lines.len(), subagent: false },
+            now_ms,
+        )?;
+        report.indexed += 1;
+        report.chunks += n;
+        report.redactions += redactions;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tokens::WordCounter;
-    use sources::teams::{Channel, Message};
+    use sources::teams::{Channel, Message, Meeting, TranscriptLine};
 
     fn thread(texts: &[(&str, &str)]) -> Thread {
         Thread {
@@ -252,5 +372,93 @@ mod tests {
         let (chunks, n) = thread_chunks(&t, &WordCounter, &IndexConfig::default());
         assert!(n >= 1);
         assert!(chunks.iter().all(|c| !c.text.contains("Tajne123")), "thread, message and context lines are all redacted");
+    }
+
+    fn meeting_fx(lines: &[(Option<&str>, &str)], status: &str) -> (Meeting, Vec<TranscriptLine>) {
+        let m = Meeting {
+            id: "m1".into(),
+            chat: "c".into(),
+            title: "Standup".into(),
+            occurrence: "o".into(),
+            started_at: 1_790_330_400_000,
+            ended_at: 1_790_330_400_000 + 900_000,
+            summary: None,
+            summary_status: "unavailable".into(),
+            transcript_status: status.into(),
+        };
+        let lines = lines
+            .iter()
+            .enumerate()
+            .map(|(i, (sp, txt))| TranscriptLine {
+                meeting_id: "m1".into(),
+                idx: i as i64,
+                speaker: sp.map(str::to_string),
+                offset_s: Some(i as i64 * 5),
+                ts: 1_790_330_400_000 + i as i64 * 5000,
+                text: (*txt).into(),
+            })
+            .collect();
+        (m, lines)
+    }
+
+    #[test]
+    fn short_meeting_gives_transcript_and_meeting_chunks() {
+        let (m, lines) = meeting_fx(&[(None, "started transcription"), (Some("Tomasz"), "Zrobiłem migrację"), (Some("Anna"), "ok")], "available");
+        let (chunks, _) = meeting_chunks(&m, &lines, &WordCounter, &IndexConfig::default());
+        let kinds: Vec<&str> = chunks.iter().map(|c| c.payload["kind"].as_str().unwrap()).collect();
+        assert!(kinds.contains(&"transcript") && kinds.contains(&"meeting"), "{kinds:?}");
+        let tr = chunks.iter().find(|c| c.payload["kind"] == "transcript").unwrap();
+        assert!(tr.text.starts_with("[Standup · "));
+        assert!(tr.text.contains("— ("), "null speaker rendered as a dash");
+        assert!(tr.text.contains("Tomasz (") && tr.text.contains("Zrobiłem migrację"));
+        let mtg = chunks.iter().find(|c| c.payload["kind"] == "meeting").unwrap();
+        assert_eq!(mtg.payload["meeting_id"], "m1");
+        assert_eq!(mtg.payload["participants"], json!(["Anna", "Tomasz"]), "sorted, system line excluded");
+    }
+
+    #[test]
+    fn summary_is_indexed_only_when_status_is_available() {
+        let (mut m, lines) = meeting_fx(&[(Some("A"), "x")], "available");
+        m.summary = Some("Ustalono deploy na piątek".into());
+        m.summary_status = "available".into();
+        let (chunks, _) = meeting_chunks(&m, &lines, &WordCounter, &IndexConfig::default());
+        assert!(chunks.iter().find(|c| c.payload["kind"] == "meeting").unwrap().text.contains("Podsumowanie: Ustalono deploy"));
+
+        let (mut m2, lines2) = meeting_fx(&[(Some("A"), "x")], "available");
+        m2.summary = Some("secret plan".into());
+        m2.summary_status = "unavailable".into();
+        let (chunks2, _) = meeting_chunks(&m2, &lines2, &WordCounter, &IndexConfig::default());
+        assert!(!chunks2.iter().any(|c| c.text.contains("secret plan")), "summary omitted unless status is available");
+    }
+
+    #[test]
+    fn long_transcript_splits_within_budget() {
+        let long = vec!["słowo"; 1200].join(" ");
+        let (m, lines) = meeting_fx(&[(Some("Anna"), long.as_str())], "available");
+        let cfg = IndexConfig::default();
+        let (chunks, _) = meeting_chunks(&m, &lines, &WordCounter, &cfg);
+        assert!(chunks.iter().all(|c| c.tokens <= cfg.chunk.max_tokens), "{:?}", chunks.iter().map(|c| c.tokens).collect::<Vec<_>>());
+        assert!(chunks.iter().filter(|c| c.payload["kind"] == "transcript").count() >= 2, "long transcript spans several windows");
+    }
+
+    #[test]
+    fn meeting_ids_are_stable_distinct_and_redacted() {
+        let (m, lines) = meeting_fx(&[(Some("Anna"), "hasło do bazy to Tajne123!x"), (Some("Piotr"), "dzięki")], "available");
+        let (a, n) = meeting_chunks(&m, &lines, &WordCounter, &IndexConfig::default());
+        let (b, _) = meeting_chunks(&m, &lines, &WordCounter, &IndexConfig::default());
+        assert_eq!(a.iter().map(|c| c.id).collect::<Vec<_>>(), b.iter().map(|c| c.id).collect::<Vec<_>>(), "stable across runs");
+        let mut ids: Vec<_> = a.iter().map(|c| c.id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), a.len(), "distinct");
+        assert!(n >= 1 && a.iter().all(|c| !c.text.contains("Tajne123")), "transcript text redacted everywhere");
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_line_is_appended() {
+        let (m, mut lines) = meeting_fx(&[(Some("A"), "one")], "available");
+        let before = m.fingerprint(&lines);
+        lines.push(TranscriptLine { meeting_id: "m1".into(), idx: 1, speaker: Some("B".into()), offset_s: Some(5), ts: 1_790_330_405_000, text: "two".into() });
+        assert_ne!(before, m.fingerprint(&lines));
     }
 }

@@ -92,7 +92,17 @@ pub async fn run_teams_index(
     let mut config = IndexConfig::default();
     config.chunk.redactor = redactor.clone();
     let now = jiff::Timestamp::now().as_millisecond();
-    Ok(ingest::teams::sync_teams(store, embedder, counter, state, &db, &config, now).await?)
+    // Threads and meeting transcripts share the teams collection; both indexed each run.
+    let mut report = ingest::teams::sync_teams(store, embedder, counter, state, &db, &config, now).await?;
+    let meetings = ingest::teams::sync_meetings(store, embedder, counter, state, &db, &config, now).await?;
+    report.scanned += meetings.scanned;
+    report.indexed += meetings.indexed;
+    report.unchanged += meetings.unchanged;
+    report.empty += meetings.empty;
+    report.chunks += meetings.chunks;
+    report.redactions += meetings.redactions;
+    report.failed.extend(meetings.failed);
+    Ok(report)
 }
 
 /// Delta index of Jira issues (the keys mapped in `jira-projects.json`) into the jira collection.
@@ -191,7 +201,7 @@ pub fn daemon_runner(
                                         eprintln!("[teams]   FAILED thread {id}: {error}");
                                     }
                                     parts.push(format!(
-                                        "teams: {} threads, indexed {}, failed {}, {} chunks",
+                                        "teams: {} items (threads+meetings), indexed {}, failed {}, {} chunks",
                                         r.scanned,
                                         r.indexed,
                                         r.failed.len(),

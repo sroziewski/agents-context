@@ -87,6 +87,52 @@ pub struct FtsHit {
     pub text: String,
 }
 
+/// A recorded meeting (a standup, etc.). Its transcript lives in `transcript_lines`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Meeting {
+    pub id: String,
+    pub chat: String,
+    pub title: String,
+    pub occurrence: String,
+    pub started_at: i64,
+    pub ended_at: i64,
+    /// The AI "Podsumowanie": often absent (licence-gated), so optional.
+    pub summary: Option<String>,
+    pub summary_status: String,
+    pub transcript_status: String,
+}
+
+impl Meeting {
+    /// Changes when the transcript grows or its status changes (lines are append-only, never
+    /// edited), so an unchanged meeting is skipped on re-index.
+    pub fn fingerprint(&self, lines: &[TranscriptLine]) -> String {
+        let last = lines.last();
+        format!("{}-{}-{}-{}", lines.len(), last.map_or(0, |l| l.idx), last.map_or(0, |l| l.ts), self.transcript_status)
+    }
+}
+
+/// One line of a meeting transcript. `speaker`/`offset_s` are absent on system lines (e.g. the
+/// opening "started transcription"). `ts` is the absolute time the line was spoken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptLine {
+    pub meeting_id: String,
+    pub idx: i64,
+    pub speaker: Option<String>,
+    pub offset_s: Option<i64>,
+    pub ts: i64,
+    pub text: String,
+}
+
+/// One transcript FTS5 hit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptHit {
+    pub meeting_id: String,
+    pub idx: i64,
+    pub speaker: Option<String>,
+    pub ts: i64,
+    pub text: String,
+}
+
 pub struct TeamsDb {
     conn: Connection,
 }
@@ -211,6 +257,91 @@ impl TeamsDb {
         let k = name_key(needle);
         Ok(self.authors()?.into_iter().filter(|a| name_key(a).contains(&k)).collect())
     }
+
+    /// Every meeting, newest first.
+    pub fn meetings(&self) -> Result<Vec<Meeting>> {
+        let mut stmt = self.conn.prepare(
+            "select id, chat, title, occurrence, started_at, ended_at, summary, summary_status, transcript_status
+             from meetings order by started_at desc",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Meeting {
+                id: r.get(0)?,
+                chat: r.get(1)?,
+                title: r.get(2)?,
+                occurrence: r.get(3)?,
+                started_at: r.get(4)?,
+                ended_at: r.get(5)?,
+                summary: r.get(6)?,
+                summary_status: r.get(7)?,
+                transcript_status: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// One meeting's transcript, in spoken order.
+    pub fn transcript(&self, meeting_id: &str) -> Result<Vec<TranscriptLine>> {
+        let mut stmt =
+            self.conn.prepare("select meeting_id, idx, speaker, offset_s, ts, text from transcript_lines where meeting_id = ? order by idx")?;
+        let rows = stmt.query_map([meeting_id], |r| {
+            Ok(TranscriptLine { meeting_id: r.get(0)?, idx: r.get(1)?, speaker: r.get(2)?, offset_s: r.get(3)?, ts: r.get(4)?, text: r.get(5)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn meeting(&self, meeting_id: &str) -> Result<Meeting> {
+        self.meetings()?.into_iter().find(|m| m.id == meeting_id).ok_or_else(|| SourceError::NotFound(meeting_id.to_owned()))
+    }
+
+    /// FTS5 BM25 over transcript lines, best first, like [`Self::fts`]: valid FTS5 passes through,
+    /// otherwise it is retried as plain prefix words. Restricted to `meeting_ids` / `speakers`
+    /// when given (an empty list matches nothing).
+    pub fn transcript_fts(&self, query: &str, filter: &TranscriptFilter, limit: usize) -> Result<Vec<TranscriptHit>> {
+        match self.transcript_fts_with(&to_fts_query(query), filter, limit) {
+            Err(SourceError::Sqlite(_)) => self.transcript_fts_with(&plain_fts_query(query), filter, limit),
+            other => other,
+        }
+    }
+
+    fn transcript_fts_with(&self, fts_query: &str, filter: &TranscriptFilter, limit: usize) -> Result<Vec<TranscriptHit>> {
+        let mut sql = String::from(
+            "select l.meeting_id, l.idx, l.speaker, l.ts, l.text
+             from transcript_fts f join transcript_lines l on l.rowid = f.rowid
+             where transcript_fts match ?",
+        );
+        let mut args: Vec<rusqlite::types::Value> = vec![fts_query.to_owned().into()];
+        if let Some(ids) = &filter.meeting_ids {
+            push_in(&mut sql, &mut args, "l.meeting_id", ids);
+        }
+        if let Some(names) = &filter.speakers {
+            push_in(&mut sql, &mut args, "l.speaker", names);
+        }
+        if let Some(since) = filter.since {
+            sql.push_str(" and l.ts >= ?");
+            args.push(since.into());
+        }
+        if let Some(until) = filter.until {
+            sql.push_str(" and l.ts <= ?");
+            args.push(until.into());
+        }
+        sql.push_str(" order by bm25(transcript_fts) limit ?");
+        args.push((limit as i64).into());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok(TranscriptHit { meeting_id: r.get(0)?, idx: r.get(1)?, speaker: r.get(2)?, ts: r.get(3)?, text: r.get(4)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Distinct transcript speakers whose name contains `needle` (folded). NULL (system) lines
+    /// are excluded.
+    pub fn resolve_speakers(&self, needle: &str) -> Result<Vec<String>> {
+        let k = name_key(needle);
+        let mut stmt = self.conn.prepare("select distinct speaker from transcript_lines where speaker is not null order by speaker")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter(|s| name_key(s).contains(&k)).collect())
+    }
 }
 
 /// Query-side restrictions. `None` means unrestricted; `Some(empty)` matches nothing.
@@ -218,6 +349,16 @@ impl TeamsDb {
 pub struct Filter {
     pub channel_ids: Option<Vec<String>>,
     pub authors: Option<Vec<String>>,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+}
+
+/// Query-side restrictions for a transcript search. `None` means unrestricted; `Some(empty)`
+/// matches nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TranscriptFilter {
+    pub meeting_ids: Option<Vec<String>>,
+    pub speakers: Option<Vec<String>>,
     pub since: Option<i64>,
     pub until: Option<i64>,
 }
@@ -266,10 +407,37 @@ pub(crate) mod fixture {
              create virtual table messages_fts using fts5(text, author, content='messages', content_rowid='rowid',
                  tokenize='unicode61 remove_diacritics 2');
              create trigger messages_ai after insert on messages begin
-                 insert into messages_fts(rowid, text, author) values (new.rowid, new.text, new.author); end;",
+                 insert into messages_fts(rowid, text, author) values (new.rowid, new.text, new.author); end;
+             create table meetings (id text primary key, chat text not null, title text not null, occurrence text not null,
+                 started_at integer not null, ended_at integer not null, summary text, summary_status text not null,
+                 transcript_status text not null, indexed_at integer not null);
+             create table transcript_lines (rowid integer primary key, meeting_id text not null references meetings(id),
+                 idx integer not null, speaker text, offset_s integer, ts integer not null, text text not null,
+                 indexed_at integer not null, unique(meeting_id, idx));
+             create virtual table transcript_fts using fts5(text, speaker, content='transcript_lines', content_rowid='rowid',
+                 tokenize='unicode61 remove_diacritics 2');
+             create trigger transcript_ai after insert on transcript_lines begin
+                 insert into transcript_fts(rowid, text, speaker) values (new.rowid, new.text, coalesce(new.speaker, '')); end;",
         )
         .unwrap();
         c
+    }
+
+    pub fn meeting(c: &Connection, id: &str, title: &str, started: i64, ended: i64, transcript_status: &str) {
+        c.execute(
+            "insert into meetings (id, chat, title, occurrence, started_at, ended_at, summary, summary_status, transcript_status, indexed_at)
+             values (?1, 'chat', ?2, 'occ', ?3, ?4, null, 'unavailable', ?5, 0)",
+            params![id, title, started, ended, transcript_status],
+        )
+        .unwrap();
+    }
+
+    pub fn line(c: &Connection, meeting: &str, idx: i64, speaker: Option<&str>, ts: i64, text: &str) {
+        c.execute(
+            "insert into transcript_lines (meeting_id, idx, speaker, offset_s, ts, text, indexed_at) values (?1, ?2, ?3, null, ?4, ?5, 0)",
+            params![meeting, idx, speaker, ts, text],
+        )
+        .unwrap();
     }
 
     pub fn channel(c: &Connection, id: &str, team: &str, name: &str) {
@@ -353,6 +521,61 @@ mod tests {
         synced(&c, "c1", 500);
         synced(&c, "c2", 900);
         assert_eq!(TeamsDb::open(&path).unwrap().last_synced_at().unwrap(), Some(900), "newest across channels");
+    }
+
+    #[test]
+    fn meetings_are_newest_first_with_their_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.db");
+        let c = create(&path);
+        meeting(&c, "m1", "Standup 8 Sep", 800, 900, "available");
+        meeting(&c, "m2", "Standup 29 Sep", 2900, 3000, "available");
+        line(&c, "m2", 0, None, 2900, "started transcription");
+        line(&c, "m2", 1, Some("Tomasz Chmiel"), 2905, "Zrobiłem migrację bazy");
+        line(&c, "m2", 2, Some("Anna Fiałkowska"), 2910, "ok, dzięki");
+        drop(c);
+        let db = TeamsDb::open(&path).unwrap();
+        assert_eq!(db.meetings().unwrap().iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m2", "m1"], "newest first");
+        let lines = db.transcript("m2").unwrap();
+        assert_eq!(lines.iter().map(|l| l.idx).collect::<Vec<_>>(), [0, 1, 2], "idx order");
+        assert_eq!(lines[0].speaker, None, "system line kept, no speaker");
+        assert_eq!(lines[1].speaker.as_deref(), Some("Tomasz Chmiel"));
+        assert_eq!(db.meeting("m2").unwrap().title, "Standup 29 Sep");
+        assert!(db.meeting("nope").is_err());
+    }
+
+    #[test]
+    fn transcript_fts_finds_polish_without_diacritics_and_filters_speaker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.db");
+        let c = create(&path);
+        meeting(&c, "m1", "Standup", 100, 200, "available");
+        line(&c, "m1", 0, Some("Tomasz Chmiel"), 105, "Zrobiłem migrację bazy danych");
+        line(&c, "m1", 1, Some("Anna Fiałkowska"), 110, "ja testuję deployment");
+        drop(c);
+        let db = TeamsDb::open(&path).unwrap();
+        // remove_diacritics 2 folds ę→e, so the prefix "migracj" matches "migrację".
+        let hits = db.transcript_fts("migracj baz", &TranscriptFilter::default(), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].speaker.as_deref(), Some("Tomasz Chmiel"));
+        let anna = TranscriptFilter { speakers: Some(vec!["Anna Fiałkowska".into()]), ..Default::default() };
+        assert_eq!(db.transcript_fts("deployment testuje", &anna, 10).unwrap().len(), 1, "speaker filter keeps Anna");
+        let tomasz = TranscriptFilter { speakers: Some(vec!["Tomasz Chmiel".into()]), ..Default::default() };
+        assert!(db.transcript_fts("deployment", &tomasz, 10).unwrap().is_empty(), "speaker filter excludes others");
+    }
+
+    #[test]
+    fn resolve_speakers_is_folded_substring_and_skips_system_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.db");
+        let c = create(&path);
+        meeting(&c, "m1", "Standup", 100, 200, "available");
+        line(&c, "m1", 0, Some("Tomasz Chmiel"), 105, "x");
+        line(&c, "m1", 1, None, 106, "started transcription");
+        drop(c);
+        let db = TeamsDb::open(&path).unwrap();
+        assert_eq!(db.resolve_speakers("chmiel").unwrap(), ["Tomasz Chmiel"]);
+        assert!(db.resolve_speakers("nobody").unwrap().is_empty());
     }
 
     #[test]

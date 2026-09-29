@@ -92,16 +92,22 @@ pub async fn run_teams_index(
     let mut config = IndexConfig::default();
     config.chunk.redactor = redactor.clone();
     let now = jiff::Timestamp::now().as_millisecond();
-    // Threads and meeting transcripts share the teams collection; both indexed each run.
+    // Threads and meeting transcripts share the teams collection; both indexed each run. A
+    // teams.db from an older scraper without the meetings tables must not fail thread indexing,
+    // so a meetings failure is isolated and logged, keeping the thread report.
     let mut report = ingest::teams::sync_teams(store, embedder, counter, state, &db, &config, now).await?;
-    let meetings = ingest::teams::sync_meetings(store, embedder, counter, state, &db, &config, now).await?;
-    report.scanned += meetings.scanned;
-    report.indexed += meetings.indexed;
-    report.unchanged += meetings.unchanged;
-    report.empty += meetings.empty;
-    report.chunks += meetings.chunks;
-    report.redactions += meetings.redactions;
-    report.failed.extend(meetings.failed);
+    match ingest::teams::sync_meetings(store, embedder, counter, state, &db, &config, now).await {
+        Ok(m) => {
+            report.scanned += m.scanned;
+            report.indexed += m.indexed;
+            report.unchanged += m.unchanged;
+            report.empty += m.empty;
+            report.chunks += m.chunks;
+            report.redactions += m.redactions;
+            report.failed.extend(m.failed);
+        }
+        Err(e) => eprintln!("[meetings] FAILED: {e:#}"),
+    }
     Ok(report)
 }
 

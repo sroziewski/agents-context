@@ -32,7 +32,18 @@ fn fixture_db(path: &Path) {
              tokenize='unicode61 remove_diacritics 2');
          create trigger messages_ai after insert on messages begin
              insert into messages_fts(rowid, text, author) values (new.rowid, new.text, new.author); end;
-         insert into channels values ('hd', 'ZSUN-Helpdesk', 'Analiza_HD', null), ('sd', 'SEDN', 'daily_standup', null);",
+         create table meetings (id text primary key, chat text not null, title text not null, occurrence text not null,
+             started_at integer not null, ended_at integer not null, summary text, summary_status text not null,
+             transcript_status text not null, indexed_at integer not null);
+         create table transcript_lines (rowid integer primary key, meeting_id text not null references meetings(id),
+             idx integer not null, speaker text, offset_s integer, ts integer not null, text text not null,
+             indexed_at integer not null, unique(meeting_id, idx));
+         create virtual table transcript_fts using fts5(text, speaker, content='transcript_lines', content_rowid='rowid',
+             tokenize='unicode61 remove_diacritics 2');
+         create trigger transcript_ai after insert on transcript_lines begin
+             insert into transcript_fts(rowid, text, speaker) values (new.rowid, new.text, coalesce(new.speaker, '')); end;
+         insert into channels values ('hd', 'ZSUN-Helpdesk', 'Analiza_HD', null), ('sd', 'SEDN', 'daily_standup', null);
+         insert into meetings values ('mtg1', 'chat', 'Standup 29 Sep', 'occ', 6000, 6600, null, 'unavailable', 'available', 0);",
     )
     .unwrap();
     let msg = |id: &str, ch: &str, th: &str, author: &str, ts: i64, text: &str| {
@@ -46,6 +57,19 @@ fn fixture_db(path: &Path) {
     msg("20", "sd", "20", "Piotr Nowak", 4_000, "migracja bazy danych w piątek");
     // A listed secret in raw teams.db text: search output must not show it.
     msg("30", "hd", "30", "Piotr Nowak", 5_000, "tymczasowy klucz plainsecret1 do konta serwisowego");
+
+    let line = |idx: i64, speaker: Option<&str>, ts: i64, text: &str| {
+        c.execute(
+            "insert into transcript_lines (meeting_id, idx, speaker, offset_s, ts, text, indexed_at) values ('mtg1', ?1, ?2, null, ?3, ?4, 0)",
+            params![idx, speaker, ts, text],
+        )
+        .unwrap();
+    };
+    line(0, None, 6_000, "started transcription");
+    line(1, Some("Tomasz Chmiel"), 6_100, "zrobiłem migrację bazy danych na produkcji");
+    line(2, Some("Anna Fiałkowska"), 6_200, "ja testuję nowy deployment");
+    // A listed secret spoken aloud: transcript search/output must not show it.
+    line(3, Some("Piotr Nowak"), 6_300, "klucz plainsecret1 wrzuciłem do vaulta");
 }
 
 struct Env {
@@ -90,7 +114,7 @@ async fn env() -> Env {
         let s = queue.status();
         if s.runs == 1 && !s.running {
             assert!(s.last_error.is_none(), "{s:?}");
-            assert!(s.last_report.as_deref().unwrap().contains("teams: 4 threads, indexed 4, failed 0"), "{s:?}");
+            assert!(s.last_report.as_deref().unwrap().contains("teams: 5 items (threads+meetings), indexed 5, failed 0"), "{s:?}");
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -238,4 +262,37 @@ async fn thread_gone_from_teams_db_is_still_found_from_the_index() {
     let gone = r.hits.iter().find(|h| h.thread_id == "20").expect("kept in the index, so still a result");
     assert_eq!((gone.team.as_str(), gone.channel.as_str()), ("SEDN", "daily_standup"));
     assert!(gone.text.contains("migracja"), "{}", gone.text);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn meeting_search_finds_transcript_and_filters_by_speaker() {
+    let e = env().await;
+    let c = e.client(r"Z:\work\other", true).await;
+    // Prefix terms that survive diacritics folding (migracj- matches "migrację").
+    let out = ok(&c, "search_meetings", json!({"query": "migracj baz"})).await;
+    assert!(out.contains("Standup 29 Sep") && out.contains("meeting mtg1"), "{out}");
+    assert!(out.contains("Tomasz Chmiel"), "best matching line is Tomasz's: {out}");
+    // Speaker filter narrows the keyword half to Anna's line.
+    let anna = ok(&c, "search_meetings", json!({"query": "testuje deployment", "speaker": "fialkowska"})).await;
+    assert!(anna.contains("Anna Fiałkowska"), "{anna}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_meeting_assembles_the_transcript_speaker_labelled_and_ordered() {
+    let e = env().await;
+    let c = e.client(r"Z:\work\other", true).await;
+    let t = ok(&c, "get_meeting", json!({"meeting_id": "mtg1"})).await;
+    assert!(t.starts_with("Standup 29 Sep · "), "{t}");
+    assert!(t.contains("— ("), "the system line is shown with a neutral speaker");
+    assert!(t.find("migrację").unwrap() < t.find("deployment").unwrap(), "lines in spoken order");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn listed_secrets_never_appear_in_meeting_output() {
+    let e = env().await;
+    let c = e.client(r"Z:\work\other", true).await;
+    let found = ok(&c, "search_meetings", json!({"query": "klucz vault"})).await;
+    assert!(found.contains("mtg1") && !found.contains("plainsecret1"), "{found}");
+    let t = ok(&c, "get_meeting", json!({"meeting_id": "mtg1"})).await;
+    assert!(!t.contains("plainsecret1"), "{t}");
 }

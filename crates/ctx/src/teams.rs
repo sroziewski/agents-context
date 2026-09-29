@@ -15,7 +15,7 @@ use indexmap::IndexMap;
 use ingest::Redactor;
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use sources::teams::{Filter, FtsHit, TeamsDb, Thread, name_key};
+use sources::teams::{Filter, FtsHit, Meeting, TeamsDb, Thread, TranscriptFilter, TranscriptHit, name_key};
 use store::{SearchFilter, SearchMode, Store};
 
 /// Reciprocal rank fusion constant: the usual 60, so neither source dominates on rank 1.
@@ -176,6 +176,35 @@ pub struct TeamsResults {
     /// Groups whose channels were ranked higher for the current project.
     pub boosted_groups: Vec<String>,
     /// Half of the search that was unavailable, and why.
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MeetingQuery {
+    pub text: String,
+    /// Restrict to a speaker (folded substring); only narrows the keyword half.
+    pub speaker: Option<String>,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeetingHit {
+    pub meeting_id: String,
+    pub title: String,
+    pub score: f64,
+    pub started_at: i64,
+    pub ended_at: i64,
+    /// Best matching line: speaker (None for a system line), time, text (redacted).
+    pub speaker: Option<String>,
+    pub ts: i64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MeetingResults {
+    pub hits: Vec<MeetingHit>,
     pub notes: Vec<String>,
 }
 
@@ -405,6 +434,122 @@ impl TeamsSearch {
         }
         Ok(out.trim_end().to_owned())
     }
+
+    /// Search meeting transcripts: semantic (Qdrant `transcript`/`meeting` chunks) fused with
+    /// transcript FTS (speaker-filterable) per meeting. Either half may be unavailable; the
+    /// search then answers from the other and says so.
+    pub async fn search_meetings(&self, q: &MeetingQuery) -> anyhow::Result<MeetingResults> {
+        anyhow::ensure!(self.db.is_file(), "Teams is not set up: {} does not exist", self.db.display());
+        let redactor = Redactor::from_file(&self.redact)?;
+        let limit = q.limit.max(1);
+        let depth = limit * DEPTH;
+
+        // Local half: FTS lines + meeting metadata, gathered on a blocking thread.
+        let (db_path, text, speaker, since, until) = (self.db.clone(), q.text.clone(), q.speaker.clone(), q.since, q.until);
+        let (fts, meetings) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Result<Vec<TranscriptHit>, String>, HashMap<String, Meeting>)> {
+            let db = TeamsDb::open(&db_path)?;
+            let speakers = speaker.as_deref().map(|s| db.resolve_speakers(s)).transpose()?;
+            let filter = TranscriptFilter { speakers, meeting_ids: None, since, until };
+            let fts = db.transcript_fts(&text, &filter, depth).map_err(|e| e.to_string());
+            let meetings = db.meetings()?.into_iter().map(|m| (m.id.clone(), m)).collect();
+            Ok((fts, meetings))
+        })
+        .await??;
+
+        let mut notes = Vec::new();
+        let semantic = match self.semantic_meetings(q, depth).await {
+            Ok(h) => h,
+            Err(e) => {
+                notes.push(format!("semantic search unavailable ({e}); keyword matches only"));
+                Vec::new()
+            }
+        };
+        let fts = match fts {
+            Ok(h) => h,
+            Err(e) => {
+                notes.push(format!("keyword search unavailable ({e}); semantic matches only"));
+                Vec::new()
+            }
+        };
+
+        let mut score: HashMap<String, f64> = HashMap::new();
+        // Evidence per meeting: an FTS line (its speaker/time/text) is preferred; a semantic
+        // chunk is the fallback for a meeting that matched only semantically.
+        let mut evidence: HashMap<String, (Option<String>, i64, String)> = HashMap::new();
+
+        let mut rank = 0usize;
+        let mut seen: HashSet<String> = HashSet::new();
+        for h in &semantic {
+            let mid = string(&h.payload, "meeting_id");
+            if mid.is_empty() {
+                continue;
+            }
+            if seen.insert(mid.clone()) {
+                rank += 1;
+                *score.entry(mid.clone()).or_default() += 1.0 / (RRF_K + rank as f64);
+            }
+            evidence.entry(mid).or_insert((None, int(&h.payload, "ts"), strip_header(&string(&h.payload, "text"))));
+        }
+        let mut rank = 0usize;
+        let mut seen: HashSet<String> = HashSet::new();
+        for h in &fts {
+            if seen.insert(h.meeting_id.clone()) {
+                rank += 1;
+                *score.entry(h.meeting_id.clone()).or_default() += 1.0 / (RRF_K + rank as f64);
+                // Best (first) BM25 line for this meeting, overriding any semantic fallback.
+                evidence.insert(h.meeting_id.clone(), (h.speaker.clone(), h.ts, h.text.clone()));
+            }
+        }
+
+        let mut hits: Vec<MeetingHit> = score
+            .into_iter()
+            .filter_map(|(mid, s)| {
+                let m = meetings.get(&mid)?;
+                let (speaker, ts, text) = evidence.remove(&mid).unwrap_or((None, m.started_at, String::new()));
+                Some(MeetingHit {
+                    meeting_id: mid,
+                    title: m.title.clone(),
+                    score: s,
+                    started_at: m.started_at,
+                    ended_at: m.ended_at,
+                    speaker,
+                    ts,
+                    text: redactor.scrub(&text).0,
+                })
+            })
+            .collect();
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| b.started_at.cmp(&a.started_at)));
+        hits.truncate(limit);
+        Ok(MeetingResults { hits, notes })
+    }
+
+    async fn semantic_meetings(&self, q: &MeetingQuery, depth: usize) -> anyhow::Result<Vec<store::Hit>> {
+        // Dense (DEV-30: dense ≥ hybrid for Polish Teams text); transcript + meeting chunks only.
+        let f = SearchFilter::default().between(q.since, q.until).any_of("kind", vec!["transcript".to_owned(), "meeting".to_owned()]);
+        let embedder = self.embedder.clone();
+        let text = q.text.clone();
+        let query = tokio::task::spawn_blocking(move || embedder.lock().unwrap_or_else(|p| p.into_inner()).embed_one(&text)).await??;
+        Ok(self.store.search(&query, &f, depth as u64, SearchMode::Dense).await?)
+    }
+
+    /// The whole meeting transcript, speakers labelled per line, redacted, capped at `max_chars`.
+    pub fn meeting(&self, meeting_id: &str, max_chars: usize) -> anyhow::Result<String> {
+        let redactor = Redactor::from_file(&self.redact)?;
+        let db = TeamsDb::open(&self.db)?;
+        let m = db.meeting(meeting_id)?;
+        let lines = db.transcript(meeting_id)?;
+        let mut out = format!("{} · {} – {} · {} lines\n\n", m.title, datetime(m.started_at), datetime(m.ended_at), lines.len());
+        for (i, l) in lines.iter().enumerate() {
+            let who = l.speaker.as_deref().unwrap_or("—");
+            let line = format!("{who} ({}): {}\n", datetime(l.ts), redactor.scrub(l.text.trim()).0);
+            if out.len() + line.len() > max_chars {
+                out.push_str(&format!("[truncated: {i} of {} lines shown]", lines.len()));
+                return Ok(out);
+            }
+            out.push_str(&line);
+        }
+        Ok(out.trim_end().to_owned())
+    }
 }
 
 fn string(p: &Map<String, Value>, k: &str) -> String {
@@ -438,6 +583,47 @@ fn datetime(ts: i64) -> String {
 fn truncate(s: &str, max: usize) -> String {
     let s = s.trim();
     if s.chars().count() > max { format!("{}…", s.chars().take(max).collect::<String>()) } else { s.to_owned() }
+}
+
+/// A transcript chunk's text is `[title · date]\n<lines>`; the evidence snippet drops that
+/// leading header line.
+fn strip_header(text: &str) -> String {
+    text.lines().skip_while(|l| l.trim_start().starts_with('[')).collect::<Vec<_>>().join("\n").trim().to_owned()
+}
+
+pub fn format_meetings(r: &MeetingResults) -> String {
+    let mut out = String::new();
+    for n in &r.notes {
+        out.push_str(&format!("({n})\n"));
+    }
+    if r.hits.is_empty() {
+        out.push_str("No matching meetings.");
+        return out;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    let lines: Vec<String> = r
+        .hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let who = h.speaker.as_deref().unwrap_or("—");
+            format!(
+                "[{}] {} · {} – {} · meeting {}\n    {} ({}): {}",
+                i + 1,
+                h.title,
+                datetime(h.started_at),
+                datetime(h.ended_at),
+                h.meeting_id,
+                who,
+                datetime(h.ts),
+                truncate(&h.text, EVIDENCE_CHARS).replace('\n', "\n    ")
+            )
+        })
+        .collect();
+    out.push_str(&lines.join("\n\n"));
+    out
 }
 
 pub fn format_results(r: &TeamsResults) -> String {

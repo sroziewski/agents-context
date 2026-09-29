@@ -120,6 +120,26 @@ pub struct TeamsThreadArgs {
 /// Largest `get_teams_thread` answer.
 const MAX_THREAD_CHARS: usize = 40_000;
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MeetingArgs {
+    /// What to look for in the meeting transcripts.
+    pub query: String,
+    /// Restrict to a speaker (matched loosely, diacritics-insensitive), e.g. "Chmiel".
+    pub speaker: Option<String>,
+    /// Earliest date, YYYY-MM-DD.
+    pub since: Option<String>,
+    /// Latest date, YYYY-MM-DD.
+    pub until: Option<String>,
+    /// Max meetings to return (default 6).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MeetingGetArgs {
+    /// Meeting id as shown in search_meetings results.
+    pub meeting_id: String,
+}
+
 #[derive(Clone)]
 pub struct ContextServer {
     ctx: Context,
@@ -202,6 +222,37 @@ impl ContextServer {
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())
+    }
+
+    /// Search the organisation's Teams meeting transcripts (standups etc.) by meaning and
+    /// keywords; results are meetings with their best matching line and speaker. Filter by
+    /// speaker or date. Open the full transcript with get_meeting.
+    #[tool(name = "search_meetings")]
+    pub async fn search_meetings(&self, Parameters(a): Parameters<MeetingArgs>) -> Result<String, String> {
+        let teams = self.teams()?;
+        if a.query.trim().is_empty() {
+            return Err("query must not be empty".into());
+        }
+        let q = crate::teams::MeetingQuery {
+            text: a.query,
+            speaker: a.speaker,
+            since: a.since.as_deref().map(|d| parse_date(d, false)).transpose().map_err(|e| e.to_string())?,
+            until: a.until.as_deref().map(|d| parse_date(d, true)).transpose().map_err(|e| e.to_string())?,
+            limit: a.limit.unwrap_or(6).clamp(1, 20) as usize,
+        };
+        let r = teams.search_meetings(&q).await.map_err(|e| e.to_string())?;
+        Ok(crate::teams::format_meetings(&r))
+    }
+
+    /// A whole Teams meeting transcript, every line speaker-labelled (redacted).
+    #[tool(name = "get_meeting")]
+    pub async fn get_meeting(&self, Parameters(a): Parameters<MeetingGetArgs>) -> Result<String, String> {
+        let teams = self.teams()?.clone();
+        let id = a.meeting_id.trim().to_owned();
+        if id.is_empty() {
+            return Err("meeting_id must not be empty".into());
+        }
+        tokio::task::spawn_blocking(move || teams.meeting(&id, MAX_THREAD_CHARS)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
     }
 
     fn scope(&self, scope: Option<&str>, project: Option<&str>) -> Result<Scope, String> {
@@ -361,7 +412,8 @@ impl ServerHandler for ContextServer {
              Results cite session id, agent and date: quote them when you rely on a result, and \
              prefer recent sessions when results conflict. search_teams / get_teams_thread cover the \
              organisation's Teams channels, which are shared by all projects; author roles in brackets \
-             come from the team directory.",
+             come from the team directory. search_meetings / get_meeting cover Teams meeting transcripts \
+             (standups etc.), filterable by speaker and date.",
             self.current_project
         ))
     }

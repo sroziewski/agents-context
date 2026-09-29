@@ -136,6 +136,20 @@ enum Command {
     },
     /// Print a whole Teams thread.
     TeamsThread { thread_id: String },
+    /// Search Teams meeting transcripts by meaning and keywords.
+    SearchMeetings {
+        query: String,
+        #[arg(long)]
+        speaker: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long, default_value_t = 6)]
+        limit: usize,
+    },
+    /// Print a whole Teams meeting transcript.
+    Meeting { meeting_id: String },
     /// Read Jira issues (read-only).
     Jira {
         #[command(subcommand)]
@@ -546,6 +560,24 @@ async fn main() -> anyhow::Result<()> {
             let store = Arc::new(connect_store(&cfg)?);
             let ctx = Context { store, embedder: Arc::new(Mutex::new(Box::new(embed::HashEmbedder::new(1)))) };
             println!("{}", teams_search(&cfg, &ctx).thread(&thread_id, usize::MAX)?);
+            Ok(())
+        }
+        Command::SearchMeetings { query, speaker, since, until, limit } => {
+            let teams = teams_search(&cfg, &context(&cfg).await?);
+            let q = ctx::teams::MeetingQuery {
+                text: query,
+                speaker,
+                since: since.as_deref().map(|d| parse_date(d, false)).transpose()?,
+                until: until.as_deref().map(|d| parse_date(d, true)).transpose()?,
+                limit,
+            };
+            println!("{}", ctx::teams::format_meetings(&teams.search_meetings(&q).await?));
+            Ok(())
+        }
+        Command::Meeting { meeting_id } => {
+            let store = Arc::new(connect_store(&cfg)?);
+            let ctx = Context { store, embedder: Arc::new(Mutex::new(Box::new(embed::HashEmbedder::new(1)))) };
+            println!("{}", teams_search(&cfg, &ctx).meeting(&meeting_id, usize::MAX)?);
             Ok(())
         }
         Command::Jira { action } => {

@@ -171,7 +171,7 @@ pub fn meeting_chunks(m: &Meeting, lines: &[TranscriptLine], counter: &dyn Token
 
     // One meeting-level chunk: title, summary (only when actually available), participants.
     let mut body = String::new();
-    if let Some(sum) = m.summary.as_deref().filter(|s| !s.trim().is_empty() && m.summary_status.eq_ignore_ascii_case("available")) {
+    if let Some(sum) = m.summary.as_deref().filter(|_| m.has_summary()) {
         let (clean, n) = redactor.scrub(sum);
         redactions += n;
         body.push_str(&format!("\nPodsumowanie: {}", clean.trim()));
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn short_meeting_gives_transcript_and_meeting_chunks() {
-        let (m, lines) = meeting_fx(&[(None, "started transcription"), (Some("Tomasz"), "Zrobiłem migrację"), (Some("Anna"), "ok")], "available");
+        let (m, lines) = meeting_fx(&[(None, "started transcription"), (Some("Tomasz"), "Zrobiłem migrację"), (Some("Anna"), "ok")], "ok");
         let (chunks, _) = meeting_chunks(&m, &lines, &WordCounter, &IndexConfig::default());
         let kinds: Vec<&str> = chunks.iter().map(|c| c.payload["kind"].as_str().unwrap()).collect();
         assert!(kinds.contains(&"transcript") && kinds.contains(&"meeting"), "{kinds:?}");
@@ -417,24 +417,30 @@ mod tests {
     }
 
     #[test]
-    fn summary_is_indexed_only_when_status_is_available() {
-        let (mut m, lines) = meeting_fx(&[(Some("A"), "x")], "available");
+    fn summary_is_indexed_only_when_the_exporter_captured_it() {
+        let (mut m, lines) = meeting_fx(&[(Some("A"), "x")], "ok");
         m.summary = Some("Ustalono deploy na piątek".into());
-        m.summary_status = "available".into();
+        m.summary_status = "ok".into();
         let (chunks, _) = meeting_chunks(&m, &lines, &WordCounter, &IndexConfig::default());
         assert!(chunks.iter().find(|c| c.payload["kind"] == "meeting").unwrap().text.contains("Podsumowanie: Ustalono deploy"));
 
-        let (mut m2, lines2) = meeting_fx(&[(Some("A"), "x")], "available");
+        let (mut m2, lines2) = meeting_fx(&[(Some("A"), "x")], "ok");
         m2.summary = Some("secret plan".into());
         m2.summary_status = "unavailable".into();
         let (chunks2, _) = meeting_chunks(&m2, &lines2, &WordCounter, &IndexConfig::default());
-        assert!(!chunks2.iter().any(|c| c.text.contains("secret plan")), "summary omitted unless status is available");
+        assert!(!chunks2.iter().any(|c| c.text.contains("secret plan")), "summary omitted unless the exporter marked it ok");
+
+        let (mut m3, lines3) = meeting_fx(&[(Some("A"), "x")], "ok");
+        m3.summary = Some("Ustalono release".into());
+        m3.summary_status = "available".into();
+        let (chunks3, _) = meeting_chunks(&m3, &lines3, &WordCounter, &IndexConfig::default());
+        assert!(chunks3.iter().any(|c| c.text.contains("Podsumowanie: Ustalono release")), "legacy status still accepted");
     }
 
     #[test]
     fn long_transcript_splits_within_budget() {
         let long = vec!["słowo"; 1200].join(" ");
-        let (m, lines) = meeting_fx(&[(Some("Anna"), long.as_str())], "available");
+        let (m, lines) = meeting_fx(&[(Some("Anna"), long.as_str())], "ok");
         let cfg = IndexConfig::default();
         let (chunks, _) = meeting_chunks(&m, &lines, &WordCounter, &cfg);
         assert!(chunks.iter().all(|c| c.tokens <= cfg.chunk.max_tokens), "{:?}", chunks.iter().map(|c| c.tokens).collect::<Vec<_>>());
@@ -443,7 +449,7 @@ mod tests {
 
     #[test]
     fn meeting_ids_are_stable_distinct_and_redacted() {
-        let (m, lines) = meeting_fx(&[(Some("Anna"), "hasło do bazy to Tajne123!x"), (Some("Piotr"), "dzięki")], "available");
+        let (m, lines) = meeting_fx(&[(Some("Anna"), "hasło do bazy to Tajne123!x"), (Some("Piotr"), "dzięki")], "ok");
         let (a, n) = meeting_chunks(&m, &lines, &WordCounter, &IndexConfig::default());
         let (b, _) = meeting_chunks(&m, &lines, &WordCounter, &IndexConfig::default());
         assert_eq!(a.iter().map(|c| c.id).collect::<Vec<_>>(), b.iter().map(|c| c.id).collect::<Vec<_>>(), "stable across runs");
@@ -456,7 +462,7 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_when_a_line_is_appended() {
-        let (m, mut lines) = meeting_fx(&[(Some("A"), "one")], "available");
+        let (m, mut lines) = meeting_fx(&[(Some("A"), "one")], "ok");
         let before = m.fingerprint(&lines);
         lines.push(TranscriptLine { meeting_id: "m1".into(), idx: 1, speaker: Some("B".into()), offset_s: Some(5), ts: 1_790_330_405_000, text: "two".into() });
         assert_ne!(before, m.fingerprint(&lines));

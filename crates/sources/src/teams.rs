@@ -104,10 +104,18 @@ pub struct Meeting {
 
 impl Meeting {
     /// Changes when the transcript grows or its status changes (lines are append-only, never
-    /// edited), so an unchanged meeting is skipped on re-index.
+    /// edited), or when a summary arrives: Claude summarises after the transcript is stored, so
+    /// without it a late summary would never reach the index. An unchanged meeting is skipped.
     pub fn fingerprint(&self, lines: &[TranscriptLine]) -> String {
         let last = lines.last();
-        format!("{}-{}-{}-{}", lines.len(), last.map_or(0, |l| l.idx), last.map_or(0, |l| l.ts), self.transcript_status)
+        let summary = if self.has_summary() { self.summary.as_deref().map_or(0, |s| s.trim().len()) } else { 0 };
+        format!("{}-{}-{}-{}-s{summary}", lines.len(), last.map_or(0, |l| l.idx), last.map_or(0, |l| l.ts), self.transcript_status)
+    }
+
+    /// The exporter marks a captured summary "ok"; "available" is what earlier builds expected.
+    pub fn has_summary(&self) -> bool {
+        self.summary.as_deref().is_some_and(|s| !s.trim().is_empty())
+            && (self.summary_status.eq_ignore_ascii_case("ok") || self.summary_status.eq_ignore_ascii_case("available"))
     }
 }
 
@@ -649,5 +657,37 @@ mod tests {
         let (_d, db) = db();
         assert!(matches!(db.thread("nope"), Err(SourceError::NotFound(_))));
         assert_eq!(db.thread("200").unwrap().messages.len(), 1);
+    }
+
+    fn standup(summary: Option<&str>, summary_status: &str) -> Meeting {
+        Meeting {
+            id: "m1".into(),
+            chat: "c".into(),
+            title: "Standup".into(),
+            occurrence: "o".into(),
+            started_at: 1,
+            ended_at: 2,
+            summary: summary.map(str::to_string),
+            summary_status: summary_status.into(),
+            transcript_status: "ok".into(),
+        }
+    }
+
+    #[test]
+    fn summary_counts_when_the_exporter_marks_it_ok_or_the_legacy_available() {
+        assert!(standup(Some("Ustalono deploy"), "ok").has_summary());
+        assert!(standup(Some("Ustalono deploy"), "available").has_summary());
+        assert!(!standup(Some("Ustalono deploy"), "unavailable").has_summary());
+        assert!(!standup(Some("   "), "ok").has_summary());
+        assert!(!standup(None, "ok").has_summary());
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_summary_arrives_after_the_transcript() {
+        let line = TranscriptLine { meeting_id: "m1".into(), idx: 0, speaker: Some("A".into()), offset_s: Some(0), ts: 1, text: "x".into() };
+        let before = standup(None, "unavailable").fingerprint(std::slice::from_ref(&line));
+        let after = standup(Some("Ustalono deploy"), "ok").fingerprint(std::slice::from_ref(&line));
+        assert_ne!(before, after);
+        assert_eq!(after, standup(Some("Ustalono deploy"), "ok").fingerprint(std::slice::from_ref(&line)), "stable once summarised");
     }
 }

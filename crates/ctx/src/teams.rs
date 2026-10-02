@@ -524,27 +524,42 @@ impl TeamsSearch {
     }
 
     async fn semantic_meetings(&self, q: &MeetingQuery, depth: usize) -> anyhow::Result<Vec<store::Hit>> {
-        // Dense (DEV-30: dense ≥ hybrid for Polish Teams text); transcript + meeting chunks only.
-        let f = SearchFilter::default().between(q.since, q.until).any_of("kind", vec!["transcript".to_owned(), "meeting".to_owned()]);
+        // Dense (DEV-30: dense ≥ hybrid for Polish Teams text); meeting chunk kinds only.
+        let f = SearchFilter::default()
+            .between(q.since, q.until)
+            .any_of("kind", vec!["transcript".to_owned(), "meeting".to_owned(), "summary".to_owned()]);
         let embedder = self.embedder.clone();
         let text = q.text.clone();
         let query = tokio::task::spawn_blocking(move || embedder.lock().unwrap_or_else(|p| p.into_inner()).embed_one(&text)).await??;
         Ok(self.store.search(&query, &f, depth as u64, SearchMode::Dense).await?)
     }
 
-    /// The whole meeting transcript, speakers labelled per line, redacted, capped at `max_chars`.
+    /// A whole meeting: title, participants, the AI summary (when present), then the transcript,
+    /// speaker-labelled and redacted. Summary and participants lead so that even a transcript long
+    /// enough to hit `max_chars` can't bury the two things most useful for "who was there / what
+    /// was decided".
     pub fn meeting(&self, meeting_id: &str, max_chars: usize) -> anyhow::Result<String> {
         let redactor = Redactor::from_file(&self.redact)?;
         let db = TeamsDb::open(&self.db)?;
         let m = db.meeting(meeting_id)?;
         let lines = db.transcript(meeting_id)?;
-        let mut out = format!("{} · {} – {} · {} lines\n\n", m.title, datetime(m.started_at), datetime(m.ended_at), lines.len());
+        let participants = sources::teams::participants(&lines);
+        let mut out = format!("{} · {} – {} · {} lines\n", m.title, datetime(m.started_at), datetime(m.ended_at), lines.len());
+        if !participants.is_empty() {
+            out.push_str(&format!("Uczestnicy: {}\n", participants.join(", ")));
+        }
+        if m.has_summary()
+            && let Some(sum) = m.summary.as_deref()
+        {
+            out.push_str(&format!("\nPodsumowanie:\n{}\n", redactor.scrub(sum.trim()).0));
+        }
+        out.push_str("\nTranskrypcja:\n");
         for (i, l) in lines.iter().enumerate() {
             let who = l.speaker.as_deref().unwrap_or("—");
             let line = format!("{who} ({}): {}\n", datetime(l.ts), redactor.scrub(l.text.trim()).0);
             if out.len() + line.len() > max_chars {
-                out.push_str(&format!("[truncated: {i} of {} lines shown]", lines.len()));
-                return Ok(out);
+                out.push_str(&format!("[transcript truncated: {i} of {} lines shown]", lines.len()));
+                return Ok(out.trim_end().to_owned());
             }
             out.push_str(&line);
         }

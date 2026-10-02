@@ -30,6 +30,10 @@ pub const TEAMS_FIELDS: &[Field] = &[
 /// Context lines in a message chunk are cut to this many characters.
 const CONTEXT_CHARS: usize = 150;
 
+/// The meeting card shows only a short head of the summary, so the card stays one small chunk;
+/// the full summary is in the `summary` chunks.
+const CARD_SUMMARY_HEAD: usize = 80;
+
 fn date(ts: i64, with_time: bool) -> String {
     let fmt = if with_time { "%Y-%m-%d %H:%M" } else { "%Y-%m-%d" };
     jiff::Timestamp::from_millisecond(ts)
@@ -125,31 +129,32 @@ fn base_payload(t: &Thread, kind: &str, text: &str) -> Map<String, Value> {
     m
 }
 
+/// Bump when `meeting_chunks`' layout changes, so already-indexed meetings re-chunk even though
+/// their content fingerprint is unchanged (see `sync_meetings`). Narrower than `CHUNKER_VERSION`,
+/// which would re-embed every session too.
+pub const MEETING_LAYOUT: u32 = 2;
+
 /// Chunks for one meeting. `transcript` chunks pack the spoken lines into window-sized pieces for
-/// topic search ("what was discussed"); one `meeting` chunk holds the title, the AI summary when
-/// present, and the participants for meeting-level search ("which standup was about X"). Per-line
-/// speaker precision ("who said X") is left to the FTS half of the search, so the multi-speaker
-/// vector windows stay simple. Returns `(chunks, redactions)`.
+/// topic search ("what was discussed"); `summary` chunks hold the full AI summary, split so all of
+/// it is embedded; one compact `meeting` card chunk carries the title, participants and the head of
+/// the summary for meeting-level matching. Per-line speaker precision ("who said X") is left to the
+/// FTS half of the search, so the multi-speaker vector windows stay simple. Returns
+/// `(chunks, redactions)`.
 pub fn meeting_chunks(m: &Meeting, lines: &[TranscriptLine], counter: &dyn TokenCounter, cfg: &IndexConfig) -> (Vec<Chunk>, usize) {
     let redactor = &cfg.chunk.redactor;
     let mut redactions = 0;
     let header = format!("[{} · {}]\n", m.title, date(m.started_at, false));
     let budget = cfg.chunk.max_tokens.saturating_sub(counter.count(&header)).max(16);
 
+    let participants = sources::teams::participants(lines);
     let mut rendered: Vec<String> = Vec::new();
-    let mut participants: Vec<String> = Vec::new();
     for l in lines {
         let (clean, n) = redactor.scrub(&l.text);
         redactions += n;
         // System lines (e.g. "started transcription") have no speaker; show a neutral marker.
         let who = l.speaker.as_deref().unwrap_or("—");
-        if let Some(s) = &l.speaker {
-            participants.push(s.clone());
-        }
         rendered.push(format!("{who} ({}): {}", date(l.ts, true), clean.trim()));
     }
-    participants.sort_unstable();
-    participants.dedup();
 
     let mut chunks = Vec::new();
 
@@ -169,22 +174,45 @@ pub fn meeting_chunks(m: &Meeting, lines: &[TranscriptLine], counter: &dyn Token
         }
     }
 
-    // One meeting-level chunk: title, summary (only when actually available), participants.
-    let mut body = String::new();
-    if let Some(sum) = m.summary.as_deref().filter(|_| m.has_summary()) {
-        let (clean, n) = redactor.scrub(sum);
+    // The AI summary, scrubbed once, split like the transcript so all of it is embedded — a
+    // ~2k-token summary in one chunk would otherwise be truncated by the embedder to its head.
+    let summary = m.summary.as_deref().filter(|_| m.has_summary()).map(|s| {
+        let (clean, n) = redactor.scrub(s);
         redactions += n;
-        body.push_str(&format!("\nPodsumowanie: {}", clean.trim()));
+        clean.trim().to_owned()
+    });
+    if let Some(sum) = summary.as_deref().filter(|s| !s.is_empty()) {
+        let sheader = format!("[{} · {}] Podsumowanie\n", m.title, date(m.started_at, false));
+        let sbudget = cfg.chunk.max_tokens.saturating_sub(counter.count(&sheader)).max(16);
+        let pieces = pack(split(sum, sbudget, counter), sbudget, cfg.chunk.overlap_tokens, counter);
+        let total = pieces.len();
+        for (i, piece) in pieces.into_iter().enumerate() {
+            let text = format!("{sheader}{piece}");
+            let mut p = meeting_payload(m, "summary", &text);
+            p.insert("chunk_index".into(), json!(i));
+            p.insert("chunk_count".into(), json!(total));
+            p.insert("ts".into(), json!(m.started_at));
+            chunks.push(Chunk { id: store::point_id(SOURCE, &format!("meeting/{}/sum{i}", m.id)), tokens: counter.count(&text), payload: p, text });
+        }
     }
+
+    // One compact meeting "card": title, participants, and just the head of the summary — small
+    // enough to stay a single chunk, for meeting-level matching. The whole summary is in the
+    // `summary` chunks above.
+    let mut body = String::new();
     if !participants.is_empty() {
         body.push_str(&format!("\nUczestnicy: {}", participants.join(", ")));
+    }
+    if let Some(sum) = summary.as_deref().filter(|s| !s.is_empty()) {
+        let head = split(sum, CARD_SUMMARY_HEAD, counter).into_iter().next().unwrap_or_default();
+        body.push_str(&format!("\nPodsumowanie: {head}"));
     }
     let text = format!("[{} · {}–{}]{body}", m.title, date(m.started_at, true), date(m.ended_at, true));
     let mut p = meeting_payload(m, "meeting", &text);
     p.insert("ts".into(), json!(m.started_at));
     p.insert("first_ts".into(), json!(m.started_at));
     p.insert("participants".into(), json!(participants));
-    chunks.push(Chunk { id: store::point_id(SOURCE, &format!("meeting/{}/summary", m.id)), tokens: counter.count(&text), payload: p, text });
+    chunks.push(Chunk { id: store::point_id(SOURCE, &format!("meeting/{}/card", m.id)), tokens: counter.count(&text), payload: p, text });
 
     (chunks, redactions)
 }
@@ -267,7 +295,9 @@ pub async fn sync_meetings(
     let mut report = Report { scanned: meetings.len(), ..Default::default() };
     for m in &meetings {
         let lines = db.transcript(&m.id).map_err(|e| IndexError::Source(e.to_string()))?;
-        let fingerprint = m.fingerprint(&lines);
+        // The layout tag forces a re-chunk when meeting_chunks changes shape, independent of the
+        // meeting's own content fingerprint.
+        let fingerprint = format!("{}-l{MEETING_LAYOUT}", m.fingerprint(&lines));
         let key = format!("meeting:{}", m.id);
         if state.get(SOURCE, &key)?.is_some_and(|i| i.fingerprint == fingerprint) {
             report.unchanged += 1;
@@ -466,5 +496,29 @@ mod tests {
         let before = m.fingerprint(&lines);
         lines.push(TranscriptLine { meeting_id: "m1".into(), idx: 1, speaker: Some("B".into()), offset_s: Some(5), ts: 1_790_330_405_000, text: "two".into() });
         assert_ne!(before, m.fingerprint(&lines));
+    }
+
+    #[test]
+    fn long_summary_is_split_into_summary_chunks_and_the_card_stays_small() {
+        let (mut m, lines) = meeting_fx(&[(Some("Anna"), "x")], "ok");
+        m.summary = Some(vec!["ustalenie"; 1500].join(" "));
+        m.summary_status = "ok".into();
+        let cfg = IndexConfig::default();
+        let (chunks, _) = meeting_chunks(&m, &lines, &WordCounter, &cfg);
+        let summaries: Vec<_> = chunks.iter().filter(|c| c.payload["kind"] == "summary").collect();
+        assert!(summaries.len() >= 2, "a long summary spans several chunks, got {}", summaries.len());
+        assert!(summaries.iter().all(|c| c.tokens <= cfg.chunk.max_tokens), "summary chunks within budget");
+        assert!(summaries.iter().all(|c| c.text.starts_with("[Standup · ") && c.payload["meeting_id"] == "m1"));
+        let card = chunks.iter().find(|c| c.payload["kind"] == "meeting").unwrap();
+        assert!(card.tokens <= cfg.chunk.max_tokens, "card stays within budget, {} tokens", card.tokens);
+        assert!(card.text.contains("Podsumowanie: ustalenie") && card.text.contains("Uczestnicy: Anna"));
+    }
+
+    #[test]
+    fn participants_are_cleaned_and_deduped_in_the_card() {
+        let (m, lines) = meeting_fx(&[(None, "start"), (Some("Anna Nowak 5 minutes"), "a"), (Some("Anna Nowak"), "b"), (Some("Piotr Kowalski"), "c")], "ok");
+        let (chunks, _) = meeting_chunks(&m, &lines, &WordCounter, &IndexConfig::default());
+        let card = chunks.iter().find(|c| c.payload["kind"] == "meeting").unwrap();
+        assert_eq!(card.payload["participants"], json!(["Anna Nowak", "Piotr Kowalski"]), "duration-variant merged, system line skipped");
     }
 }

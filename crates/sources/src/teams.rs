@@ -30,6 +30,40 @@ pub fn name_key(s: &str) -> String {
     folded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Teams sometimes suffixes a transcript speaker with a running duration, e.g.
+/// "Anna Wierzbicka 19 minutes". Strip a trailing " <n> <time-unit>" so the same person is one
+/// participant; anything else is returned with its whitespace normalised.
+pub fn clean_speaker(name: &str) -> String {
+    let words: Vec<&str> = name.split_whitespace().collect();
+    if words.len() >= 3 {
+        let unit = words[words.len() - 1].to_ascii_lowercase();
+        let num = words[words.len() - 2];
+        if num.chars().all(|c| c.is_ascii_digit())
+            && matches!(unit.trim_end_matches('s'), "minute" | "second" | "hour" | "min" | "sec" | "hr" | "minut" | "sekund" | "godzin")
+        {
+            return words[..words.len() - 2].join(" ");
+        }
+    }
+    words.join(" ")
+}
+
+/// Distinct participant display names from a transcript: null-speaker (system) lines skipped,
+/// each name cleaned by [`clean_speaker`], deduplicated by folded name, sorted.
+pub fn participants(lines: &[TranscriptLine]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for l in lines {
+        if let Some(s) = l.speaker.as_deref() {
+            let name = clean_speaker(s);
+            if !name.is_empty() && seen.insert(name_key(&name)) {
+                out.push(name);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Channel {
     pub id: String,
@@ -584,6 +618,17 @@ mod tests {
         let db = TeamsDb::open(&path).unwrap();
         assert_eq!(db.resolve_speakers("chmiel").unwrap(), ["Tomasz Chmiel"]);
         assert!(db.resolve_speakers("nobody").unwrap().is_empty());
+    }
+
+    #[test]
+    fn clean_speaker_strips_the_duration_suffix_and_participants_dedup() {
+        assert_eq!(clean_speaker("Anna Wierzbicka 19 minutes"), "Anna Wierzbicka");
+        assert_eq!(clean_speaker("Anna 1 minute"), "Anna");
+        assert_eq!(clean_speaker("Tomasz Chmiel"), "Tomasz Chmiel", "no suffix untouched");
+        assert_eq!(clean_speaker("Jan 3 Kowalski"), "Jan 3 Kowalski", "digit not at the tail is left alone");
+        let line = |sp: Option<&str>| TranscriptLine { meeting_id: "m".into(), idx: 0, speaker: sp.map(str::to_string), offset_s: None, ts: 0, text: "x".into() };
+        let lines = [line(None), line(Some("Anna Wierzbicka")), line(Some("Anna Wierzbicka 20 minutes")), line(Some("Tomasz Chmiel"))];
+        assert_eq!(participants(&lines), ["Anna Wierzbicka", "Tomasz Chmiel"], "system line skipped, duration-variant merged, sorted");
     }
 
     #[test]

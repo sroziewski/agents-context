@@ -43,7 +43,10 @@ fn fixture_db(path: &Path) {
          create trigger transcript_ai after insert on transcript_lines begin
              insert into transcript_fts(rowid, text, speaker) values (new.rowid, new.text, coalesce(new.speaker, '')); end;
          insert into channels values ('hd', 'ZSUN-Helpdesk', 'Analiza_HD', null), ('sd', 'SEDN', 'daily_standup', null);
-         insert into meetings values ('mtg1', 'chat', 'Standup 29 Sep', 'occ', 6000, 6600, null, 'unavailable', 'available', 0);",
+         insert into meetings values
+             ('mtg1', 'chat', 'Standup 29 Sep', 'occ', 6000, 6600, null, 'unavailable', 'available', 0),
+             ('mtg2', 'chat', 'Retro 30 Sep', 'occ', 7000, 7600,
+              'Na retrospektywie ustalono: wdrazamy feature flagi w pazdzierniku. Zespol skraca standupy.', 'ok', 'ok', 0);",
     )
     .unwrap();
     let msg = |id: &str, ch: &str, th: &str, author: &str, ts: i64, text: &str| {
@@ -70,6 +73,19 @@ fn fixture_db(path: &Path) {
     line(2, Some("Anna Fiałkowska"), 6_200, "ja testuję nowy deployment");
     // A listed secret spoken aloud: transcript search/output must not show it.
     line(3, Some("Piotr Nowak"), 6_300, "klucz plainsecret1 wrzuciłem do vaulta");
+
+    // mtg2 has a summary and a duration-suffixed speaker variant, to exercise summary chunks and
+    // participant cleaning.
+    let line2 = |idx: i64, speaker: Option<&str>, ts: i64, text: &str| {
+        c.execute(
+            "insert into transcript_lines (meeting_id, idx, speaker, offset_s, ts, text, indexed_at) values ('mtg2', ?1, ?2, null, ?3, ?4, 0)",
+            params![idx, speaker, ts, text],
+        )
+        .unwrap();
+    };
+    line2(0, Some("Jan Nowak 5 minutes"), 7_010, "zaczynamy retro");
+    line2(1, Some("Jan Nowak"), 7_020, "co poszło dobrze");
+    line2(2, Some("Ewa Lis"), 7_030, "deploy był płynny");
 }
 
 struct Env {
@@ -114,7 +130,7 @@ async fn env() -> Env {
         let s = queue.status();
         if s.runs == 1 && !s.running {
             assert!(s.last_error.is_none(), "{s:?}");
-            assert!(s.last_report.as_deref().unwrap().contains("teams: 5 items (threads+meetings), indexed 5, failed 0"), "{s:?}");
+            assert!(s.last_report.as_deref().unwrap().contains("teams: 6 items (threads+meetings), indexed 6, failed 0"), "{s:?}");
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -295,4 +311,26 @@ async fn listed_secrets_never_appear_in_meeting_output() {
     assert!(found.contains("mtg1") && !found.contains("plainsecret1"), "{found}");
     let t = ok(&c, "get_meeting", json!({"meeting_id": "mtg1"})).await;
     assert!(!t.contains("plainsecret1"), "{t}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn meeting_summary_is_indexed_as_its_own_chunks() {
+    let e = env().await;
+    // mtg2 has an "ok" summary, so it is indexed as at least one `summary` chunk (not folded into
+    // the oversized single chunk the old code produced).
+    let n = e.teams.store.count(&store::SearchFilter::default().eq("kind", "summary")).await.unwrap();
+    assert!(n >= 1, "summary indexed as its own chunk(s), got {n}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_meeting_leads_with_cleaned_participants_and_the_summary() {
+    let e = env().await;
+    let c = e.client(r"Z:\work\other", true).await;
+    let t = ok(&c, "get_meeting", json!({"meeting_id": "mtg2"})).await;
+    // The participants line is the cleaned roster (the raw per-line transcript labels stay faithful).
+    let roster = t.lines().find(|l| l.starts_with("Uczestnicy:")).expect("participants line");
+    assert_eq!(roster, "Uczestnicy: Ewa Lis, Jan Nowak", "cleaned, deduped, sorted");
+    assert!(t.contains("Podsumowanie:") && t.contains("feature flagi w pazdzierniku"), "{t}");
+    assert!(t.find("Uczestnicy:").unwrap() < t.find("Podsumowanie:").unwrap(), "participants first");
+    assert!(t.find("Podsumowanie:").unwrap() < t.find("Transkrypcja:").unwrap(), "summary leads the transcript");
 }

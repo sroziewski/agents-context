@@ -119,6 +119,9 @@ pub struct TeamsThreadArgs {
 
 /// Largest `get_teams_thread` answer.
 const MAX_THREAD_CHARS: usize = 40_000;
+/// Largest `get_meeting` answer. Bigger than a thread: a standup transcript runs long, and the
+/// whole meeting is the point of the tool (summary + participants lead, so the tail is what's cut).
+const MAX_MEETING_CHARS: usize = 120_000;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MeetingArgs {
@@ -252,7 +255,7 @@ impl ContextServer {
         if id.is_empty() {
             return Err("meeting_id must not be empty".into());
         }
-        tokio::task::spawn_blocking(move || teams.meeting(&id, MAX_THREAD_CHARS)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+        tokio::task::spawn_blocking(move || teams.meeting(&id, MAX_MEETING_CHARS)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
     }
 
     fn scope(&self, scope: Option<&str>, project: Option<&str>) -> Result<Scope, String> {

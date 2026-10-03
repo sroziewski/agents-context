@@ -122,8 +122,10 @@ async fn env() -> Env {
     };
     let sessions = Arc::new(Store::connect(&q.url, None, "sessions", DIM).unwrap());
     let teams_store = Arc::new(Store::connect(&q.url, None, "teams", DIM).unwrap());
+    let meetings_store = Arc::new(Store::connect(&q.url, None, "meetings", DIM).unwrap());
     let shared = SharedEmbedder::new(Box::new(HashEmbedder::new(DIM)));
-    let runner = ctx::daemon_runner(cfg.clone(), sessions.clone(), Arc::new(WordCounter), shared, "hash".into(), None, Some(teams_store.clone()), None);
+    let runner =
+        ctx::daemon_runner(cfg.clone(), sessions.clone(), Arc::new(WordCounter), shared, "hash".into(), None, Some(teams_store.clone()), Some(meetings_store.clone()), None);
     let queue = IndexQueue::start(runner, Duration::from_millis(10));
     queue.request(Target::Teams);
     for _ in 0..500 {
@@ -139,7 +141,7 @@ async fn env() -> Env {
     let redact = tmp.path().join("redact.txt");
     std::fs::write(&redact, "plainsecret1
 ").unwrap();
-    let teams = TeamsSearch { store: teams_store, embedder: embedder.clone(), db, people, projects, redact };
+    let teams = TeamsSearch { store: teams_store, meetings_store, embedder: embedder.clone(), db, people, projects, redact };
     Env { teams, ctx: Context { store: sessions, embedder }, cfg, _tmp: tmp, _q: q }
 }
 
@@ -314,12 +316,25 @@ async fn listed_secrets_never_appear_in_meeting_output() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn meeting_summary_is_indexed_as_its_own_chunks() {
+async fn meeting_chunks_live_in_the_meetings_collection_not_teams() {
     let e = env().await;
-    // mtg2 has an "ok" summary, so it is indexed as at least one `summary` chunk (not folded into
-    // the oversized single chunk the old code produced).
-    let n = e.teams.store.count(&store::SearchFilter::default().eq("kind", "summary")).await.unwrap();
-    assert!(n >= 1, "summary indexed as its own chunk(s), got {n}");
+    let f = |kind: &'static str| store::SearchFilter::default().eq("kind", kind);
+    // mtg2's summary is indexed as its own chunk(s) in the meetings collection.
+    assert!(e.teams.meetings_store.count(&f("summary")).await.unwrap() >= 1, "summary indexed in the meetings collection");
+    // and no meeting chunk pollutes the teams (channel) collection.
+    for kind in ["transcript", "summary", "meeting"] {
+        assert_eq!(e.teams.store.count(&f(kind)).await.unwrap(), 0, "a {kind} chunk leaked into the teams collection");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_search_never_returns_meeting_content() {
+    let e = env().await;
+    let c = e.client(r"Z:\work\other", true).await;
+    // "retro" / "zaczynamy" only occur in a meeting transcript (mtg2); whatever channel threads
+    // rank, none may carry meeting content.
+    let out = ok(&c, "search_teams", json!({"query": "zaczynamy retro deploy"})).await;
+    assert!(!out.contains("zaczynamy retro") && !out.contains("Retro 30 Sep"), "meeting content leaked into channel search: {out}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

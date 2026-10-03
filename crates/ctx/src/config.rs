@@ -30,6 +30,9 @@ pub struct Config {
     /// The Teams app's who-is-who file (groups, roles, VIPs).
     pub teams_people: PathBuf,
     pub teams_collection: String,
+    /// Qdrant collection for indexed Teams meeting transcripts, separate from channel threads so
+    /// the two never leak into each other's search.
+    pub meetings_collection: String,
     /// Project → Teams groups whose channels rank higher when searching from that project.
     pub teams_projects: PathBuf,
     /// Re-run the Teams scraper when its store goes stale (`CTX_TEAMS_SYNC_CMD` and friends). Off
@@ -129,6 +132,7 @@ impl Config {
             teams_db: path("CTX_TEAMS_DB", PathBuf::from(r"D:\dev\my\teams\data\teams.db")),
             teams_people: path("CTX_TEAMS_PEOPLE", PathBuf::from(r"D:\dev\my\teams\people.json")),
             teams_collection: get("CTX_TEAMS_COLLECTION").unwrap_or_else(|| "teams".into()),
+            meetings_collection: get("CTX_MEETINGS_COLLECTION").unwrap_or_else(|| "meetings".into()),
             teams_projects: path("CTX_TEAMS_PROJECTS", Self::config_dir().join("teams-projects.json")),
             teams_watch: crate::teams_watch::WatchConfig {
                 cmd: get("CTX_TEAMS_SYNC_CMD").map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()),

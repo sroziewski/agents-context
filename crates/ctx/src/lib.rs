@@ -78,6 +78,7 @@ pub async fn run_index(
 pub async fn run_teams_index(
     cfg: &config::Config,
     store: &Store,
+    meetings_store: Option<&Store>,
     embedder: &mut dyn Embedder,
     model: &str,
     counter: &dyn TokenCounter,
@@ -92,21 +93,24 @@ pub async fn run_teams_index(
     let mut config = IndexConfig::default();
     config.chunk.redactor = redactor.clone();
     let now = jiff::Timestamp::now().as_millisecond();
-    // Threads and meeting transcripts share the teams collection; both indexed each run. A
-    // teams.db from an older scraper without the meetings tables must not fail thread indexing,
-    // so a meetings failure is isolated and logged, keeping the thread report.
+    // Channel threads go to the teams collection; meeting transcripts to their own `meetings`
+    // collection so the two never surface each other's chunks. A teams.db from an older scraper
+    // without the meetings tables must not fail thread indexing, so the meeting sync is isolated.
     let mut report = ingest::teams::sync_teams(store, embedder, counter, state, &db, &config, now).await?;
-    match ingest::teams::sync_meetings(store, embedder, counter, state, &db, &config, now).await {
-        Ok(m) => {
-            report.scanned += m.scanned;
-            report.indexed += m.indexed;
-            report.unchanged += m.unchanged;
-            report.empty += m.empty;
-            report.chunks += m.chunks;
-            report.redactions += m.redactions;
-            report.failed.extend(m.failed);
+    if let Some(meetings) = meetings_store {
+        meetings.ensure_collection(ingest::teams::MEETING_FIELDS).await?;
+        match ingest::teams::sync_meetings(meetings, embedder, counter, state, &db, &config, now).await {
+            Ok(m) => {
+                report.scanned += m.scanned;
+                report.indexed += m.indexed;
+                report.unchanged += m.unchanged;
+                report.empty += m.empty;
+                report.chunks += m.chunks;
+                report.redactions += m.redactions;
+                report.failed.extend(m.failed);
+            }
+            Err(e) => eprintln!("[meetings] FAILED: {e:#}"),
         }
-        Err(e) => eprintln!("[meetings] FAILED: {e:#}"),
     }
     Ok(report)
 }
@@ -161,12 +165,14 @@ pub fn daemon_runner(
     model: String,
     summarizer: Option<std::sync::Arc<dyn ingest::Summarizer>>,
     teams_store: Option<std::sync::Arc<Store>>,
+    meetings_store: Option<std::sync::Arc<Store>>,
     jira_store: Option<std::sync::Arc<Store>>,
 ) -> queue::Runner {
     std::sync::Arc::new(move |target: queue::Target| {
         let (cfg, store, counter, mut embedder, model) = (cfg.clone(), store.clone(), counter.clone(), embedder.clone(), model.clone());
         let summarizer = summarizer.clone();
         let teams_store = teams_store.clone();
+        let meetings_store = meetings_store.clone();
         let jira_store = jira_store.clone();
         Box::pin(async move {
             let handle = tokio::runtime::Handle::current();
@@ -201,7 +207,7 @@ pub fn daemon_runner(
                         if cfg.teams_db.is_file() {
                             // Isolated: a locked or broken teams.db must not stop session
                             // indexing or the summaries below.
-                            match run_teams_index(&cfg, teams, &mut embedder, &model, counter.as_ref(), &state, &redactor).await {
+                            match run_teams_index(&cfg, teams, meetings_store.as_deref(), &mut embedder, &model, counter.as_ref(), &state, &redactor).await {
                                 Ok(r) => {
                                     for (id, error) in &r.failed {
                                         eprintln!("[teams]   FAILED thread {id}: {error}");

@@ -27,6 +27,10 @@ pub const TEAMS_FIELDS: &[Field] = &[
     Field::Keyword("meeting_id"),
 ];
 
+/// Payload fields for the meetings collection (transcript/summary/meeting-card chunks). Separate
+/// from `teams` so channel-thread search and meeting search never surface each other's chunks.
+pub const MEETING_FIELDS: &[Field] = &[Field::Keyword("kind"), Field::Keyword("meeting_id")];
+
 /// Context lines in a message chunk are cut to this many characters.
 const CONTEXT_CHARS: usize = 150;
 

@@ -210,7 +210,11 @@ pub struct MeetingResults {
 
 #[derive(Clone)]
 pub struct TeamsSearch {
+    /// The `teams` collection: channel threads/messages.
     pub store: Arc<Store>,
+    /// The `meetings` collection: meeting transcript/summary/card chunks (searched by
+    /// `search_meetings`), kept separate so it never mixes with channel search.
+    pub meetings_store: Arc<Store>,
     pub embedder: Arc<Mutex<Box<dyn Embedder>>>,
     pub db: PathBuf,
     pub people: PathBuf,
@@ -403,8 +407,9 @@ impl TeamsSearch {
 
     async fn semantic(&self, q: &TeamsQuery, local: &Local, depth: usize, mode: SearchMode) -> anyhow::Result<Vec<store::Hit>> {
         // Thread chunks carry the thread's last message time as `ts`, so a date window selects
-        // threads active in it; message chunks carry their own time.
-        let mut f = SearchFilter::default().between(q.since, q.until);
+        // threads active in it; message chunks carry their own time. Restrict to channel kinds so
+        // any stray meeting chunk in the collection can never surface as an id-less "thread" hit.
+        let mut f = SearchFilter::default().between(q.since, q.until).any_of("kind", vec!["thread".to_owned(), "message".to_owned()]);
         if let Some(ids) = &local.channel_ids {
             f = f.any_of("channel_id", ids.clone());
         }
@@ -531,7 +536,7 @@ impl TeamsSearch {
         let embedder = self.embedder.clone();
         let text = q.text.clone();
         let query = tokio::task::spawn_blocking(move || embedder.lock().unwrap_or_else(|p| p.into_inner()).embed_one(&text)).await??;
-        Ok(self.store.search(&query, &f, depth as u64, SearchMode::Dense).await?)
+        Ok(self.meetings_store.search(&query, &f, depth as u64, SearchMode::Dense).await?)
     }
 
     /// A whole meeting: title, participants, the AI summary (when present), then the transcript,

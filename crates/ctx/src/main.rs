@@ -344,6 +344,7 @@ async fn main() -> anyhow::Result<()> {
                 )) as Arc<dyn ingest::Summarizer>
             });
             let teams_store = Arc::new(Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.teams_collection, embed::BGEM3_DIM)?);
+            let meetings_store = Arc::new(Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.meetings_collection, embed::BGEM3_DIM)?);
             // Jira store only when Jira is configured; the twice-daily schedule drives it.
             let jira_store = cfg.jira().map(|_| Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.jira_collection, embed::BGEM3_DIM)).transpose()?.map(Arc::new);
             let sessions_store = Arc::new(connect_store(&cfg)?);
@@ -367,6 +368,7 @@ async fn main() -> anyhow::Result<()> {
                 model.clone(),
                 summarizer,
                 Some(teams_store),
+                Some(meetings_store),
                 jira_store.clone(),
             );
             let queue = IndexQueue::start(runner, Duration::from_secs(20));
@@ -779,10 +781,12 @@ async fn main() -> anyhow::Result<()> {
 
 /// Teams search sharing the context's embedder, over the teams collection.
 fn teams_search(cfg: &Config, ctx: &Context) -> ctx::teams::TeamsSearch {
-    let store = Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.teams_collection, embed::BGEM3_DIM)
-        .expect("Qdrant client construction does not connect");
+    let connect = |collection: &str| {
+        Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), collection, embed::BGEM3_DIM).expect("Qdrant client construction does not connect")
+    };
     ctx::teams::TeamsSearch {
-        store: Arc::new(store),
+        store: Arc::new(connect(&cfg.teams_collection)),
+        meetings_store: Arc::new(connect(&cfg.meetings_collection)),
         embedder: ctx.embedder.clone(),
         db: cfg.teams_db.clone(),
         people: cfg.teams_people.clone(),

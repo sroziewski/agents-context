@@ -133,10 +133,11 @@ fn base_payload(t: &Thread, kind: &str, text: &str) -> Map<String, Value> {
     m
 }
 
-/// Bump when `meeting_chunks`' layout changes, so already-indexed meetings re-chunk even though
-/// their content fingerprint is unchanged (see `sync_meetings`). Narrower than `CHUNKER_VERSION`,
-/// which would re-embed every session too.
-pub const MEETING_LAYOUT: u32 = 2;
+/// Bump when `meeting_chunks`' layout *or target collection* changes, so already-indexed meetings
+/// re-chunk/re-write even though their content fingerprint is unchanged (see `sync_meetings`).
+/// Narrower than `CHUNKER_VERSION`, which would re-embed every session too. 3: moved meeting
+/// chunks to their own `meetings` collection (DEV-51).
+pub const MEETING_LAYOUT: u32 = 3;
 
 /// Chunks for one meeting. `transcript` chunks pack the spoken lines into window-sized pieces for
 /// topic search ("what was discussed"); `summary` chunks hold the full AI summary, split so all of

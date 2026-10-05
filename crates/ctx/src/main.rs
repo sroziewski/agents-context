@@ -318,6 +318,10 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => e.exit(),
     };
     let cfg = Config::load();
+    // Box the dispatch future onto the heap: in a debug build this match compiles to a very large
+    // async state machine, and on Windows the main thread's stack is only 1 MB, so leaving it
+    // inline overflows the stack even for a trivial `ctx hook`.
+    Box::pin(async move {
     match cli.command {
         Command::EmbedServer { addr, provider, model_dir, index_every } => {
             let dir = model_dir.unwrap_or_else(|| cfg.model_dir.clone());
@@ -777,6 +781,8 @@ async fn main() -> anyhow::Result<()> {
             mcp::serve_stdio(server).await
         }
     }
+    })
+    .await
 }
 
 /// Teams search sharing the context's embedder, over the teams collection.

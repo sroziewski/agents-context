@@ -243,6 +243,7 @@ mod tests {
             updated: "2026-09-27T10:00:00.000+0200".into(),
             url: "https://j/browse/HD-1".into(),
             comments: vec![],
+            attachments: vec![],
         };
         let out = format_issues(std::slice::from_ref(&base), "jql", &red);
         assert!(out.contains("[1] HD-1 · Bug · Open · Anna · updated 2026-09-27") && !out.contains("s3cr3tp4ss"), "{out}");

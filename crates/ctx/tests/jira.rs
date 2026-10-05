@@ -159,7 +159,7 @@ async fn sync_jira_indexes_then_skips_unchanged_and_reindexes_changed() {
         async move {
             let mut emb = embed::HashEmbedder::new(64);
             let client = Jira::new(&url, "tok");
-            ingest::jira::sync_jira(store, &mut emb, &ingest::WordCounter, state, &client, keys, cfg, 0).await.unwrap()
+            ingest::jira::sync_jira(store, &mut emb, &ingest::WordCounter, state, &client, keys, cfg, None, 0).await.unwrap()
         }
     };
 

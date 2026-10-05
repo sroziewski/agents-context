@@ -5,6 +5,7 @@ pub mod embed_server;
 pub mod eval;
 pub mod factcheck;
 pub mod hook;
+pub mod image;
 pub mod inject;
 pub mod jira;
 pub mod mcp;
@@ -135,7 +136,14 @@ pub async fn run_jira_index(
     let mut config = IndexConfig::default();
     config.chunk.redactor = redactor.clone();
     let now = jiff::Timestamp::now().as_millisecond();
-    Ok(ingest::jira::sync_jira(store, embedder, counter, state, &jira, &keys, &config, now).await?)
+    // Opt-in image descriptions: screenshots on issues become searchable text. Off by default.
+    let describer = cfg
+        .jira_image_describe
+        .then(|| crate::image::ClaudeImageDescriber::new(cfg.claude_exe.clone(), &cfg.vision_model, cfg.data_dir.join("vision"), std::time::Duration::from_secs(120)));
+    let opts = describer
+        .as_ref()
+        .map(|d| ingest::jira::ImageOpts { describer: d, max_images: cfg.jira_image_max, max_bytes: cfg.jira_image_max_bytes });
+    Ok(ingest::jira::sync_jira(store, embedder, counter, state, &jira, &keys, &config, opts.as_ref(), now).await?)
 }
 
 pub fn format_report(r: &Report, elapsed: std::time::Duration) -> String {

@@ -38,6 +38,22 @@ pub struct JiraComment {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct JiraAttachment {
+    pub id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+    /// Absolute URL to the raw bytes (Jira returns a full URL here); fetch with [`Jira::download`].
+    pub content_url: String,
+}
+
+impl JiraAttachment {
+    pub fn is_image(&self) -> bool {
+        self.mime_type.to_ascii_lowercase().starts_with("image/")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct JiraIssue {
     pub key: String,
     pub summary: String,
@@ -48,6 +64,7 @@ pub struct JiraIssue {
     pub updated: String,
     pub url: String,
     pub comments: Vec<JiraComment>,
+    pub attachments: Vec<JiraAttachment>,
 }
 
 /// One page of a search: the issues plus the total matching, for pagination.
@@ -59,7 +76,7 @@ pub struct SearchPage {
 
 /// Fields fetched when indexing (full text incl. description and comments), so a page has
 /// everything and the indexer needs no per-issue follow-up call.
-const FULL_FIELDS: &str = "summary,description,status,issuetype,assignee,updated,comment";
+const FULL_FIELDS: &str = "summary,description,status,issuetype,assignee,updated,comment,attachment";
 /// Fields for a quick list (no comments/description).
 const LIST_FIELDS: &str = "summary,status,issuetype,assignee,updated";
 
@@ -135,6 +152,29 @@ impl Jira {
         self.post_json(&format!("/rest/api/2/issue/{key}/comment"), serde_json::json!({ "body": body }))
     }
 
+    /// Raw bytes of an attachment from its absolute `content` URL, capped at `max_bytes` (a larger
+    /// body is refused without being fully read). Bearer PAT like every other call.
+    pub fn download(&self, content_url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        use std::io::Read;
+        match self.agent.get(content_url).header("Authorization", format!("Bearer {}", self.token)).call() {
+            Ok(mut resp) => {
+                let mut buf = Vec::new();
+                resp.body_mut()
+                    .as_reader()
+                    .take(max_bytes as u64 + 1)
+                    .read_to_end(&mut buf)
+                    .map_err(|e| JiraError::Http(e.to_string()))?;
+                if buf.len() > max_bytes {
+                    return Err(JiraError::Http(format!("attachment exceeds {max_bytes} bytes")));
+                }
+                Ok(buf)
+            }
+            Err(ureq::Error::StatusCode(401 | 403)) => Err(JiraError::Auth),
+            Err(ureq::Error::StatusCode(404)) => Err(JiraError::NotFound(content_url.to_owned())),
+            Err(e) => Err(JiraError::Http(e.to_string())),
+        }
+    }
+
     /// Available transitions for an issue as `(id, name)`.
     pub fn transitions(&self, key: &str) -> Result<Vec<(String, String)>> {
         let v = self.get_json(&format!("/rest/api/2/issue/{key}/transitions"))?;
@@ -166,6 +206,21 @@ impl Jira {
                     .collect()
             })
             .unwrap_or_default();
+        let attachments = f
+            .get("attachment")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|a| JiraAttachment {
+                        id: string(a, "id"),
+                        filename: string(a, "filename"),
+                        mime_type: string(a, "mimeType"),
+                        size: a.get("size").and_then(Value::as_u64).unwrap_or(0),
+                        content_url: string(a, "content"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         JiraIssue {
             url: format!("{}/browse/{key}", self.base),
             summary: string(&f, "summary"),
@@ -175,6 +230,7 @@ impl Jira {
             assignee: f.get("assignee").filter(|a| !a.is_null()).map(|a| string(a, "displayName")).unwrap_or_else(|| "Unassigned".to_owned()),
             updated: string(&f, "updated"),
             comments,
+            attachments,
             key,
         }
     }
@@ -223,6 +279,32 @@ mod tests {
         assert_eq!((i.key.as_str(), i.status.as_str(), i.issue_type.as_str(), i.assignee.as_str()), ("HD-1410", "In Progress", "Bug", "Szymon Roziewski"));
         assert_eq!(i.url, "https://jira.example.org/browse/HD-1410");
         assert_eq!(i.comments.len(), 1);
+    }
+
+    #[test]
+    fn parses_attachments_and_detects_images() {
+        let v = json!({
+            "key": "HD-9", "fields": {
+                "summary": "x", "status": {"name": "Open"},
+                "attachment": [
+                    {"id": "10001", "filename": "screen.png", "mimeType": "image/png", "size": 4533, "content": "https://jira.example.org/secure/attachment/10001/screen.png"},
+                    {"id": "10002", "filename": "log.txt", "mimeType": "text/plain", "size": 20, "content": "https://jira.example.org/secure/attachment/10002/log.txt"}
+                ]
+            }
+        });
+        let i = jira().parse_issue(&v);
+        assert_eq!(i.attachments.len(), 2);
+        let png = &i.attachments[0];
+        assert_eq!((png.id.as_str(), png.filename.as_str(), png.size), ("10001", "screen.png", 4533));
+        assert!(png.content_url.ends_with("/10001/screen.png"));
+        assert!(png.is_image(), "image/png is an image");
+        assert!(!i.attachments[1].is_image(), "text/plain is not");
+    }
+
+    #[test]
+    fn missing_attachment_field_is_empty() {
+        let i = jira().parse_issue(&json!({"key": "HD-8", "fields": {"summary": "x", "status": {"name": "Open"}}}));
+        assert!(i.attachments.is_empty());
     }
 
     #[test]

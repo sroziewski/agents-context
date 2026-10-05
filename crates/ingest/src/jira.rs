@@ -33,6 +33,82 @@ pub const JIRA_FIELDS: &[Field] = &[
     Field::Keyword("author"),
 ];
 
+/// Describes an image (e.g. a screenshot) as text so its content is searchable. Implemented in
+/// `ctx` by a headless vision model; kept abstract here so the indexer can be tested with a fake.
+pub trait ImageDescriber: Send + Sync {
+    fn describe(&self, bytes: &[u8], filename: &str, mime: &str) -> Result<String, String>;
+}
+
+/// How `sync_jira` turns image attachments into text: the describer and the per-issue / per-file
+/// caps. Absent ⇒ images are not fetched or described at all (the default).
+pub struct ImageOpts<'a> {
+    pub describer: &'a dyn ImageDescriber,
+    pub max_images: usize,
+    pub max_bytes: usize,
+}
+
+/// FNV-1a 64-bit, stable forever and dependency-free — a recorded guard for a cached description,
+/// not a security hash.
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// A description for one image: the cache first (no download on a hit), otherwise `fetch` the
+/// bytes and `describe` them, caching the result. `None` (logged) on a fetch/describe failure, so
+/// a bad image never fails its issue. `fetch` is a closure so this is testable without Jira.
+fn resolve_description(
+    state: &State,
+    describer: &dyn ImageDescriber,
+    id: &str,
+    filename: &str,
+    mime: &str,
+    now_ms: i64,
+    fetch: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Option<String> {
+    if let Ok(Some(desc)) = state.get_image_desc(id) {
+        return Some(desc);
+    }
+    let bytes = match fetch() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[jira-image] download {filename} failed: {e}");
+            return None;
+        }
+    };
+    match describer.describe(&bytes, filename, mime) {
+        Ok(desc) => {
+            let desc = desc.trim().to_owned();
+            if desc.is_empty() {
+                return None;
+            }
+            let _ = state.put_image_desc(id, &fnv1a_hex(&bytes), &desc, now_ms);
+            Some(desc)
+        }
+        Err(e) => {
+            eprintln!("[jira-image] describe {filename} failed: {e}");
+            None
+        }
+    }
+}
+
+/// `filename: description` lines for an issue's image attachments (cache-first), capped at
+/// `max_images`. Empty when there are no images or nothing could be described.
+fn image_notes(issue: &JiraIssue, client: &Jira, opts: &ImageOpts<'_>, state: &State, now_ms: i64) -> String {
+    let mut lines = Vec::new();
+    for a in issue.attachments.iter().filter(|a| a.is_image()).take(opts.max_images) {
+        let fetch = || client.download(&a.content_url, opts.max_bytes).map_err(|e| e.to_string());
+        if let Some(desc) = resolve_description(state, opts.describer, &a.id, &a.filename, &a.mime_type, now_ms, fetch) {
+            lines.push(format!("{}: {}", a.filename, desc));
+        }
+    }
+    lines.join("\n")
+}
+
 fn first_line(text: &str, max: usize) -> String {
     let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     if line.chars().count() > max { format!("{}…", line.chars().take(max).collect::<String>()) } else { line.to_owned() }
@@ -76,8 +152,10 @@ fn base_payload(issue: &JiraIssue, kind: &str, text: &str) -> Map<String, Value>
     m
 }
 
-/// All chunks of one issue, redacted. Returns `(chunks, redactions)`.
-pub fn jira_chunks(issue: &JiraIssue, counter: &dyn TokenCounter, cfg: &IndexConfig) -> (Vec<Chunk>, usize) {
+/// All chunks of one issue, redacted. `image_notes` (vision descriptions of image attachments,
+/// may be empty) is appended to the issue body and redacted with everything else. Returns
+/// `(chunks, redactions)`.
+pub fn jira_chunks(issue: &JiraIssue, counter: &dyn TokenCounter, cfg: &IndexConfig, image_notes: &str) -> (Vec<Chunk>, usize) {
     let redactor = &cfg.chunk.redactor;
     let mut redactions = 0;
     let mut scrub = |s: &str| {
@@ -87,12 +165,20 @@ pub fn jira_chunks(issue: &JiraIssue, counter: &dyn TokenCounter, cfg: &IndexCon
     };
     let summary = scrub(&issue.summary);
     let description = scrub(&issue.description);
+    let notes = scrub(image_notes);
     let header = format!("[{} · {} · {}] {}\n", issue.key, issue.issue_type, issue.status, summary);
     let budget = cfg.chunk.max_tokens.saturating_sub(counter.count(&header)).max(16);
 
     let mut chunks = Vec::new();
-    // Issue chunk(s): header + description.
-    let body = if description.trim().is_empty() { summary.clone() } else { description };
+    // Issue chunk(s): header + description + image descriptions.
+    let mut body = if description.trim().is_empty() { summary.clone() } else { description };
+    if !notes.trim().is_empty() {
+        if !body.trim().is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str("Obrazy:\n");
+        body.push_str(notes.trim());
+    }
     let pieces = pack(split(body.trim(), budget, counter), budget, cfg.chunk.overlap_tokens, counter);
     let total = pieces.len().max(1);
     for (i, piece) in pieces.into_iter().enumerate() {
@@ -133,6 +219,7 @@ pub async fn sync_jira(
     client: &Jira,
     keys: &[String],
     config: &IndexConfig,
+    images: Option<&ImageOpts<'_>>,
     now_ms: i64,
 ) -> Result<Report, IndexError> {
     if keys.is_empty() {
@@ -157,7 +244,8 @@ pub async fn sync_jira(
                 report.unchanged += 1;
                 continue;
             }
-            let (chunks, redactions) = jira_chunks(issue, counter, config);
+            let notes = images.map(|o| image_notes(issue, client, o, state, now_ms)).unwrap_or_default();
+            let (chunks, redactions) = jira_chunks(issue, counter, config, &notes);
             let scope = SearchFilter::default().eq("source", SOURCE).eq("issue_key", issue.key.clone());
             let n = match write_chunks(store, embedder, config, &scope, &chunks).await {
                 Ok(n) => n,
@@ -203,12 +291,13 @@ mod tests {
             updated: "2026-09-27T10:00:00.000+0200".into(),
             url: format!("https://j/browse/{key}"),
             comments: comments.iter().map(|(a, b)| JiraComment { author: (*a).into(), created: "2026-09-27T11:00:00.000+0200".into(), body: (*b).into() }).collect(),
+            attachments: Vec::new(),
         }
     }
 
     #[test]
     fn one_issue_chunk_and_one_per_comment_with_context() {
-        let (chunks, _) = jira_chunks(&issue("HD-1", &[("Piotr", "restarted the service"), ("Anna", "ok, works")]), &WordCounter, &IndexConfig::default());
+        let (chunks, _) = jira_chunks(&issue("HD-1", &[("Piotr", "restarted the service"), ("Anna", "ok, works")]), &WordCounter, &IndexConfig::default(), "");
         let kinds: Vec<&str> = chunks.iter().map(|c| c.payload["kind"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["issue", "comment", "comment"]);
         assert_eq!(chunks[0].payload["project"], "HD");
@@ -224,15 +313,15 @@ mod tests {
         cfg.chunk.redactor = crate::Redactor::new(["Tajne123".to_string()]);
         let mut i = issue("HD-2", &[("A", "hasło Tajne123 tutaj")]);
         i.description = "secret Tajne123 in body".into();
-        let (chunks, n) = jira_chunks(&i, &WordCounter, &cfg);
+        let (chunks, n) = jira_chunks(&i, &WordCounter, &cfg, "");
         assert!(n >= 2);
         assert!(chunks.iter().all(|c| !c.text.contains("Tajne123")));
     }
 
     #[test]
     fn ids_are_stable_and_distinct() {
-        let (a, _) = jira_chunks(&issue("HD-3", &[("A", "x")]), &WordCounter, &IndexConfig::default());
-        let (b, _) = jira_chunks(&issue("HD-3", &[("A", "x")]), &WordCounter, &IndexConfig::default());
+        let (a, _) = jira_chunks(&issue("HD-3", &[("A", "x")]), &WordCounter, &IndexConfig::default(), "");
+        let (b, _) = jira_chunks(&issue("HD-3", &[("A", "x")]), &WordCounter, &IndexConfig::default(), "");
         assert_eq!(a.iter().map(|c| c.id).collect::<Vec<_>>(), b.iter().map(|c| c.id).collect::<Vec<_>>());
         let mut ids: Vec<_> = a.iter().map(|c| c.id).collect();
         ids.sort();
@@ -253,5 +342,59 @@ mod tests {
         assert!(updated_ms("2026-09-27T10:00:00.000+0200").is_some());
         assert!(updated_ms("2026-09-27T10:00:00+0000").is_some());
         assert_eq!(updated_ms("garbage"), None);
+    }
+
+    struct FakeDescriber {
+        calls: std::sync::atomic::AtomicUsize,
+        out: Result<String, String>,
+    }
+    impl ImageDescriber for FakeDescriber {
+        fn describe(&self, _bytes: &[u8], _filename: &str, _mime: &str) -> Result<String, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.out.clone()
+        }
+    }
+
+    #[test]
+    fn image_notes_land_in_the_issue_chunk_and_are_redacted() {
+        let mut cfg = IndexConfig::default();
+        cfg.chunk.redactor = crate::Redactor::new(["Tajne123".to_string()]);
+        let (chunks, n) = jira_chunks(&issue("HD-7", &[]), &WordCounter, &cfg, "screen.png: error 500 token Tajne123 visible");
+        assert!(n >= 1);
+        let issue_chunk = chunks.iter().find(|c| c.payload["kind"] == "issue").unwrap();
+        assert!(issue_chunk.text.contains("Obrazy:") && issue_chunk.text.contains("screen.png: error 500"), "{}", issue_chunk.text);
+        assert!(!issue_chunk.text.contains("Tajne123"), "the image description is redacted too");
+    }
+
+    #[test]
+    fn description_is_cached_after_the_first_describe() {
+        use std::sync::atomic::Ordering;
+        let state = State::in_memory().unwrap();
+        let d = FakeDescriber { calls: std::sync::atomic::AtomicUsize::new(0), out: Ok("a login error screen".into()) };
+        let fetched = std::cell::Cell::new(0);
+        let r = resolve_description(&state, &d, "att-1", "s.png", "image/png", 0, || {
+            fetched.set(fetched.get() + 1);
+            Ok(vec![1u8, 2, 3])
+        });
+        assert_eq!(r.as_deref(), Some("a login error screen"));
+        // Second time: cache hit — neither fetch nor describe runs again.
+        let r2 = resolve_description(&state, &d, "att-1", "s.png", "image/png", 0, || {
+            fetched.set(fetched.get() + 1);
+            Ok(vec![1u8, 2, 3])
+        });
+        assert_eq!(r2.as_deref(), Some("a login error screen"));
+        assert_eq!(d.calls.load(Ordering::SeqCst), 1, "described exactly once");
+        assert_eq!(fetched.get(), 1, "fetched exactly once");
+    }
+
+    #[test]
+    fn a_failed_fetch_or_describe_yields_no_note_and_caches_nothing() {
+        let state = State::in_memory().unwrap();
+        let boom = FakeDescriber { calls: std::sync::atomic::AtomicUsize::new(0), out: Err("model down".into()) };
+        assert!(resolve_description(&state, &boom, "att-2", "s.png", "image/png", 0, || Ok(vec![9])).is_none());
+        assert!(state.get_image_desc("att-2").unwrap().is_none(), "a failed describe is not cached");
+        let ok = FakeDescriber { calls: std::sync::atomic::AtomicUsize::new(0), out: Ok("x".into()) };
+        assert!(resolve_description(&state, &ok, "att-3", "s.png", "image/png", 0, || Err("404".into())).is_none());
+        assert_eq!(ok.calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no describe when the fetch fails");
     }
 }

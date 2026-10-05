@@ -67,6 +67,13 @@ pub struct Config {
     pub jira_collection: String,
     /// Local times to index Jira at (`CTX_JIRA_INDEX_TIMES`, e.g. "10:00,17:00").
     pub jira_index_times: Vec<(u32, u32)>,
+    /// Describe Jira image attachments with a vision model so screenshots are searchable
+    /// (`CTX_JIRA_IMAGE_DESCRIBE`). Off by default: it sends images to the model and costs per
+    /// image. `vision_model` picks the model; the caps bound cost per issue and per file.
+    pub jira_image_describe: bool,
+    pub vision_model: String,
+    pub jira_image_max: usize,
+    pub jira_image_max_bytes: usize,
 }
 
 /// Off: on the real query set (2026-09-27, 33 queries) every weight tried lowered MRR and none
@@ -167,6 +174,10 @@ impl Config {
             jira_write: on("JIRA_WRITE", false),
             jira_collection: get("CTX_JIRA_COLLECTION").unwrap_or_else(|| "jira".into()),
             jira_index_times: parse_times(get("CTX_JIRA_INDEX_TIMES").as_deref().unwrap_or("10:00,17:00")),
+            jira_image_describe: on("CTX_JIRA_IMAGE_DESCRIBE", false),
+            vision_model: get("CTX_VISION_MODEL").unwrap_or_else(|| "haiku".into()),
+            jira_image_max: get("CTX_JIRA_IMAGE_MAX").and_then(|v| v.trim().parse().ok()).unwrap_or(6),
+            jira_image_max_bytes: get("CTX_JIRA_IMAGE_MAX_BYTES").and_then(|v| v.trim().parse().ok()).unwrap_or(5 * 1024 * 1024),
         }
     }
 }

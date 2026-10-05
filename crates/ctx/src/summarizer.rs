@@ -61,62 +61,64 @@ impl Summarizer for ClaudeCli {
     }
 
     fn summarize(&self, prompt: &str, timeout: Duration) -> Result<String, String> {
-        let timeout = self.timeout.min(timeout);
-        let _ = std::fs::create_dir_all(&self.workdir);
-        let mut child = Command::new(&self.exe)
-            .args(self.args())
-            .current_dir(&self.workdir)
-            .env(SUMMARIZER_ENV, "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("cannot start {}: {e}", self.exe.display()))?;
-
-        // Feed stdin and drain both pipes on their own threads: a child blocked writing a full
-        // pipe would otherwise never exit and the timeout below would be the only way out.
-        let mut stdin = child.stdin.take().expect("piped");
-        let input = prompt.to_owned();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(input.as_bytes());
-        });
-        let mut out = child.stdout.take().expect("piped");
-        let mut err = child.stderr.take().expect("piped");
-        let (out_tx, out_rx) = std::sync::mpsc::channel();
-        let (err_tx, err_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = out.read_to_string(&mut s);
-            let _ = out_tx.send(s);
-        });
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = err.read_to_string(&mut s);
-            let _ = err_tx.send(s);
-        });
-
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() >= deadline => {
-                    kill_tree(&mut child);
-                    return Err(format!("claude timed out after {timeout:?}"));
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(e) => return Err(format!("waiting for claude: {e}")),
-            }
-        };
-        let _ = writer.join();
-        // Bounded: a grandchild that inherited the pipes could keep them open after exit.
-        let stdout = out_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
-        let stderr = err_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
-        if !status.success() {
-            let tail: String = stderr.trim().chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
-            return Err(format!("claude exited with {status}: {tail}"));
-        }
-        parse_output(&stdout)
+        run_claude(&self.exe, &self.args(), &self.workdir, prompt, &[(SUMMARIZER_ENV, "1")], self.timeout.min(timeout))
     }
+}
+
+/// Runs `claude` headless, feeding `prompt` on stdin, and returns its parsed `result`. Shared by
+/// the summarizer and the image describer: it drains both pipes on their own threads (a child
+/// blocked writing a full pipe would otherwise hang), enforces `timeout` by killing the whole
+/// process tree, and reports a non-zero exit with the stderr tail.
+pub(crate) fn run_claude(exe: &std::path::Path, args: &[String], cwd: &std::path::Path, prompt: &str, env: &[(&str, &str)], timeout: Duration) -> Result<String, String> {
+    let _ = std::fs::create_dir_all(cwd);
+    let mut cmd = Command::new(exe);
+    cmd.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+
+    let mut stdin = child.stdin.take().expect("piped");
+    let input = prompt.to_owned();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let mut out = child.stdout.take().expect("piped");
+    let mut err = child.stderr.take().expect("piped");
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = out.read_to_string(&mut s);
+        let _ = out_tx.send(s);
+    });
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = err.read_to_string(&mut s);
+        let _ = err_tx.send(s);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                kill_tree(&mut child);
+                return Err(format!("claude timed out after {timeout:?}"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(format!("waiting for claude: {e}")),
+        }
+    };
+    let _ = writer.join();
+    // Bounded: a grandchild that inherited the pipes could keep them open after exit.
+    let stdout = out_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    let stderr = err_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    if !status.success() {
+        let tail: String = stderr.trim().chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
+        return Err(format!("claude exited with {status}: {tail}"));
+    }
+    parse_output(&stdout)
 }
 
 /// Kills the child and everything it started. `Child::kill` ends only the direct child: with a

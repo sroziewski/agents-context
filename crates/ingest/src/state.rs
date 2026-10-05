@@ -69,6 +69,12 @@ impl State {
                  attempts integer not null default 0,     -- consecutive failures since then
                  failed_turns integer not null default 0, -- turn count at the last failure
                  primary key (source, session_id)
+             );
+             create table if not exists jira_image_desc (
+                 attachment_id text primary key,
+                 hash text not null,          -- content hash, so a replaced attachment re-describes
+                 description text not null,
+                 created_ms integer not null
              );",
         )?;
         let state = Self { conn };
@@ -148,6 +154,24 @@ impl State {
         self.conn.execute(
             "insert into meta (key, value) values (?1, ?2) on conflict(key) do update set value = excluded.value",
             params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Cached vision description for a Jira attachment. Keyed by id alone: Jira attachment ids are
+    /// immutable and their bytes never change, so a hit needs no re-download. The stored `hash` is
+    /// a recorded guard, not part of the lookup.
+    pub fn get_image_desc(&self, attachment_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row("select description from jira_image_desc where attachment_id = ?1", params![attachment_id], |r| r.get(0))
+            .optional()
+    }
+
+    pub fn put_image_desc(&self, attachment_id: &str, hash: &str, description: &str, now_ms: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "insert into jira_image_desc (attachment_id, hash, description, created_ms) values (?1, ?2, ?3, ?4)
+             on conflict(attachment_id) do update set hash = excluded.hash, description = excluded.description, created_ms = excluded.created_ms",
+            params![attachment_id, hash, description, now_ms],
         )?;
         Ok(())
     }

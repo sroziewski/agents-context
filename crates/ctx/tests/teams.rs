@@ -128,15 +128,21 @@ async fn env() -> Env {
         ctx::daemon_runner(cfg.clone(), sessions.clone(), Arc::new(WordCounter), shared, "hash".into(), None, Some(teams_store.clone()), Some(meetings_store.clone()), None);
     let queue = IndexQueue::start(runner, Duration::from_millis(10));
     queue.request(Target::Teams);
-    for _ in 0..500 {
+    // Wait generously (gRPC is slow when many container-backed tests run at once) and fail loudly
+    // on timeout — a silent fall-through here used to leave the meetings collection uncreated and
+    // surface as a confusing "collection doesn't exist" in a later assertion.
+    let mut settled = false;
+    for _ in 0..3000 {
         let s = queue.status();
-        if s.runs == 1 && !s.running {
+        if s.runs >= 1 && !s.running {
             assert!(s.last_error.is_none(), "{s:?}");
             assert!(s.last_report.as_deref().unwrap().contains("teams: 6 items (threads+meetings), indexed 6, failed 0"), "{s:?}");
+            settled = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(settled, "teams index did not finish: {:?}", queue.status());
     let embedder: Arc<Mutex<Box<dyn Embedder>>> = Arc::new(Mutex::new(Box::new(HashEmbedder::new(DIM))));
     let redact = tmp.path().join("redact.txt");
     std::fs::write(&redact, "plainsecret1

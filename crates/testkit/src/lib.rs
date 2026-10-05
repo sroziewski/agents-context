@@ -1,33 +1,38 @@
 //! Shared test fixtures: a throwaway Qdrant per test via testcontainers.
 
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, TestcontainersError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Same version as docker-compose.yml, so tests exercise the server that runs for real.
 pub const QDRANT_TAG: &str = "v1.19.1";
 const GRPC: u16 = 6334;
 const CONTAINER_ATTEMPTS: usize = 3;
+/// Qdrant containers alive at once within one test binary. Too many (a binary's tests all run in
+/// parallel) overwhelm Docker's gRPC and indexing calls time out, so the permit is held for the
+/// container's whole lifetime, not just its startup — the rest of the tests queue behind it.
+const MAX_LIVE_CONTAINERS: usize = 4;
 
 pub struct Qdrant {
     pub url: String,
     _container: ContainerAsync<GenericImage>,
+    _permit: OwnedSemaphorePermit,
 }
 
-/// Container startups in flight at once within one test binary. Docker Desktop publishes port
-/// mappings slowly when a dozen containers start in the same second, which made port lookups
-/// time out; queueing the startup phase (not the containers' lifetimes) keeps it fast.
-static STARTUPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static LIVE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(MAX_LIVE_CONTAINERS)));
 
-/// Starts Qdrant and returns its gRPC URL. The container is removed when `Qdrant` drops.
+/// Starts Qdrant and returns its gRPC URL. The container is removed, and its concurrency permit
+/// released, when `Qdrant` drops.
 ///
 /// Docker Desktop occasionally reports a container as running but never publishes its port
 /// (`PortNotExposed` indefinitely, even with no load). Waiting longer does not help, so such a
 /// container is discarded and a fresh one started.
 pub async fn qdrant() -> Qdrant {
-    let _permit = STARTUPS.acquire().await.expect("semaphore never closed");
+    let permit = LIVE.clone().acquire_owned().await.expect("semaphore never closed");
     let mut last = None;
     for _ in 0..CONTAINER_ATTEMPTS {
         let container = GenericImage::new("qdrant/qdrant", QDRANT_TAG)
@@ -37,7 +42,7 @@ pub async fn qdrant() -> Qdrant {
             .await
             .expect("start qdrant container (is Docker running?)");
         match host_port(&container).await {
-            Ok(port) => return Qdrant { url: format!("http://127.0.0.1:{port}"), _container: container },
+            Ok(port) => return Qdrant { url: format!("http://127.0.0.1:{port}"), _container: container, _permit: permit },
             Err(e) => last = Some(e), // dropping `container` removes it
         }
     }

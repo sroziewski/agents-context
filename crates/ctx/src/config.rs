@@ -74,6 +74,11 @@ pub struct Config {
     pub vision_model: String,
     pub jira_image_max: usize,
     pub jira_image_max_bytes: usize,
+    /// OpenAI-compatible vision endpoint (`CTX_VISION_URL`, e.g. OPI's GLM at
+    /// `http://host:8000/v1`). When set, image describing uses it instead of the local `claude`
+    /// CLI; `vision_model` is the model id and `vision_api_key` the optional bearer token.
+    pub vision_url: Option<String>,
+    pub vision_api_key: Option<String>,
 }
 
 /// Off: on the real query set (2026-09-27, 33 queries) every weight tried lowered MRR and none
@@ -178,6 +183,8 @@ impl Config {
             vision_model: get("CTX_VISION_MODEL").unwrap_or_else(|| "haiku".into()),
             jira_image_max: get("CTX_JIRA_IMAGE_MAX").and_then(|v| v.trim().parse().ok()).unwrap_or(6),
             jira_image_max_bytes: get("CTX_JIRA_IMAGE_MAX_BYTES").and_then(|v| v.trim().parse().ok()).unwrap_or(5 * 1024 * 1024),
+            vision_url: get("CTX_VISION_URL").map(|u| u.trim().trim_end_matches('/').to_owned()).filter(|u| !u.is_empty()),
+            vision_api_key: get("CTX_VISION_API_KEY").filter(|k| !k.is_empty()),
         }
     }
 }

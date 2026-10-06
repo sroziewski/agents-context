@@ -137,11 +137,18 @@ pub async fn run_jira_index(
     config.chunk.redactor = redactor.clone();
     let now = jiff::Timestamp::now().as_millisecond();
     // Opt-in image descriptions: screenshots on issues become searchable text. Off by default.
-    let describer = cfg
-        .jira_image_describe
-        .then(|| crate::image::ClaudeImageDescriber::new(cfg.claude_exe.clone(), &cfg.vision_model, cfg.data_dir.join("vision"), std::time::Duration::from_secs(120)));
+    // A configured OpenAI-compatible vision endpoint (CTX_VISION_URL, e.g. OPI's GLM) is preferred
+    // over the local claude CLI.
+    let timeout = std::time::Duration::from_secs(120);
+    let describer: Option<Box<dyn ingest::jira::ImageDescriber>> = if !cfg.jira_image_describe {
+        None
+    } else if let Some(url) = &cfg.vision_url {
+        Some(Box::new(crate::image::OpenAiImageDescriber::new(url, &cfg.vision_model, cfg.vision_api_key.clone(), timeout)))
+    } else {
+        Some(Box::new(crate::image::ClaudeImageDescriber::new(cfg.claude_exe.clone(), &cfg.vision_model, cfg.data_dir.join("vision"), timeout)))
+    };
     let opts = describer
-        .as_ref()
+        .as_deref()
         .map(|d| ingest::jira::ImageOpts { describer: d, max_images: cfg.jira_image_max, max_bytes: cfg.jira_image_max_bytes });
     Ok(ingest::jira::sync_jira(store, embedder, counter, state, &jira, &keys, &config, opts.as_ref(), now).await?)
 }

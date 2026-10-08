@@ -76,7 +76,8 @@ pub struct TeamsArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JiraSearchArgs {
-    /// Text to match, or a bare issue key (HD-123), or raw JQL when jql=true.
+    /// Text to match, an issue key (HD-123) or a bare issue number (123, completed with the
+    /// project's Jira key), or raw JQL when jql=true.
     pub query: String,
     /// Scope to this project directory's mapped Jira keys instead of the current project.
     pub project: Option<String>,
@@ -90,7 +91,7 @@ pub struct JiraSearchArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JiraIssueArgs {
-    /// Issue key, e.g. HD-1410.
+    /// Issue key, e.g. HD-1410, or just the number (1410) for the current project's Jira key.
     pub key: String,
 }
 
@@ -365,7 +366,8 @@ impl ContextServer {
         if key.is_empty() {
             return Err("key must not be empty".into());
         }
-        tokio::task::spawn_blocking(move || jira.issue(&key)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+        let project = self.current_project.clone();
+        tokio::task::spawn_blocking(move || jira.issue_in(&key, &project)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
     }
 
     /// Add a comment to a Jira issue. A WRITE — off unless the daemon allows Jira writes
@@ -427,7 +429,18 @@ impl ContextServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ContextServer {
     fn get_info(&self) -> ServerConfig {
+        let jira_keys = self.jira.as_ref().and_then(|j| j.keys_for(&self.current_project).ok()).unwrap_or_default();
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(format!(
+            "{}{}",
+            self.base_instructions(),
+            jira_instructions(&jira_keys)
+        ))
+    }
+}
+
+impl ContextServer {
+    fn base_instructions(&self) -> String {
+        format!(
             "Memory of past Claude Code and OpenCode sessions (prompts, answers, tool summaries). \
              Current project: {}. Searches stay inside the current project unless you pass scope \"all\" \
              or another project path — only do that when the user asks about other projects. \
@@ -438,7 +451,23 @@ impl ServerHandler for ContextServer {
              Teams meetings (standups etc.), filterable by speaker and date; get_meeting answers with the \
              AI summary, and quotes must come from the transcript (get_meeting at=\"mm:ss\").",
             self.current_project
-        ))
+        )
+    }
+}
+
+/// The Jira part of the server instructions, so a bare "1910" from the user is known to mean
+/// this project's issue. Empty when the project has no mapped Jira key.
+pub fn jira_instructions(keys: &[String]) -> String {
+    match keys {
+        [] => String::new(),
+        [only] => format!(
+            " This project's Jira key is {only}: an issue number on its own (e.g. 1910) means {only}-1910 — \
+             fetch it with get_jira_issue."
+        ),
+        many => format!(
+            " This project's Jira keys are {}; when the user gives only an issue number, ask which one.",
+            many.join(", ")
+        ),
     }
 }
 

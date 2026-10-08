@@ -221,7 +221,8 @@ enum JiraAction {
         #[arg(long, default_value_t = 8)]
         limit: u32,
     },
-    /// Print one issue with its description and comments.
+    /// Print one issue with its description and comments. A bare number takes the current
+    /// directory's Jira key.
     Issue { key: String },
     /// Add a comment. Dry-run unless --write, and refused unless JIRA_WRITE=on.
     Comment {
@@ -660,7 +661,7 @@ async fn main() -> anyhow::Result<()> {
                     };
                     println!("{}", js.search(&query, project_key.as_deref(), jql, all, limit)?);
                 }
-                JiraAction::Issue { key } => println!("{}", js.issue(&key)?),
+                JiraAction::Issue { key } => println!("{}", js.issue_in(&key, &mcp::current_project())?),
                 JiraAction::Comment { key, body, write } => println!("{}", js.comment(&key, &body, write)?),
                 JiraAction::Transition { key, to, write } => println!("{}", js.transition(&key, &to, write)?),
             }

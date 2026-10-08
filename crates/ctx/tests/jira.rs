@@ -175,6 +175,40 @@ async fn sync_jira_indexes_then_skips_unchanged_and_reindexes_changed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_bare_number_fetches_the_current_projects_issue() {
+    let (url, _) = serve(false).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("jira-projects.json"), r#"{"sedn/sedn26": ["SEDN26"], "helpdesk": ["HD"]}"#).unwrap();
+    let js = ctx::jira::JiraSearch { projects: tmp.path().join("jira-projects.json"), ..search(&url, false) };
+    let sedn = sources::project::key("d:/dev/sedn/sedn26");
+    let unmapped = sources::project::key("d:/dev/other");
+
+    let (searched, fetched, kept, unscoped) = tokio::task::spawn_blocking(move || {
+        (
+            js.search("1910", Some(&sedn), false, false, 8).unwrap(),
+            js.issue_in("#1910", &sedn).unwrap(),
+            js.issue_in("HD-5", &sedn).unwrap(),
+            js.search("1910", Some(&unmapped), false, false, 8).unwrap(),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(searched.contains("SEDN26-1910") && searched.contains("Login fails"), "search fetches the issue itself:\n{searched}");
+    assert!(fetched.contains("SEDN26-1910"), "{fetched}");
+    assert!(kept.contains("HD-5") && !kept.contains("SEDN26"), "a full key is used as given:\n{kept}");
+    assert!(unscoped.contains("HD-1") && !unscoped.contains("SEDN26"), "no mapping → plain text search:\n{unscoped}");
+}
+
+#[test]
+fn server_instructions_name_the_projects_jira_key() {
+    let one = ctx::mcp::jira_instructions(&["SEDN26".into()]);
+    assert!(one.contains("SEDN26-1910") && one.contains("get_jira_issue"), "{one}");
+    let many = ctx::mcp::jira_instructions(&["HD".into(), "SEDN26".into()]);
+    assert!(many.contains("HD, SEDN26") && many.contains("ask which"), "{many}");
+    assert_eq!(ctx::mcp::jira_instructions(&[]), "");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_401_maps_to_the_auth_error() {
     let (url, _) = serve(true).await;
     let err = tokio::task::spawn_blocking(move || Jira::new(&url, "bad").issue("HD-1")).await.unwrap().unwrap_err();

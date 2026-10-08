@@ -59,6 +59,20 @@ pub fn detect_issue_key(text: &str) -> Option<String> {
     (code_ok && num_ok).then(|| t.to_owned())
 }
 
+/// The issue key `text` refers to: a full key as is, or a bare number (`1910`, `#1910`) completed
+/// with the project's Jira key. A bare number is completed only when the project maps to exactly
+/// one key; with several it is ambiguous and stays a text search.
+pub fn resolve_issue_key(text: &str, keys: &[String]) -> Option<String> {
+    if let Some(key) = detect_issue_key(text) {
+        return Some(key);
+    }
+    let num = text.trim().trim_start_matches('#');
+    match keys {
+        [only] if !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) => Some(format!("{only}-{num}")),
+        _ => None,
+    }
+}
+
 /// Builds a JQL query from plain text. Scopes to `keys` (`project in (…)`) when any are given,
 /// matches with `~`, and orders by most recently updated. Quotes are escaped so text cannot
 /// break out of the JQL string literal.
@@ -88,21 +102,32 @@ impl JiraSearch {
     /// Text or JQL search. A bare issue key (`HD-123`) is fetched directly. Scoped to
     /// `project_key`'s mapped Jira keys unless `all` or `raw_jql`.
     pub fn search(&self, query: &str, project_key: Option<&str>, raw_jql: bool, all: bool, limit: u32) -> anyhow::Result<String> {
-        if !raw_jql && let Some(key) = detect_issue_key(query) {
-            return self.issue(&key);
-        }
         let jql = if raw_jql {
             query.to_owned()
         } else {
             let keys = match (all, project_key) {
-                (false, Some(p)) => keys_for_project(p, &load_project_keys(&self.projects)?),
+                (false, Some(p)) => self.keys_for(p)?,
                 _ => Vec::new(),
             };
+            if let Some(key) = resolve_issue_key(query, &keys) {
+                return self.issue(&key);
+            }
             build_jql(query, &keys)
         };
         let issues = self.jira.search(&jql, limit).map_err(anyhow::Error::msg)?;
         let redactor = ingest::Redactor::from_file(&self.redact)?;
         Ok(format_issues(&issues, &jql, &redactor))
+    }
+
+    /// The Jira keys mapped to `project_key` in `jira-projects.json`.
+    pub fn keys_for(&self, project_key: &str) -> anyhow::Result<Vec<String>> {
+        Ok(keys_for_project(project_key, &load_project_keys(&self.projects)?))
+    }
+
+    /// One issue by key, where a bare number is completed with `project_key`'s Jira key.
+    pub fn issue_in(&self, key: &str, project_key: &str) -> anyhow::Result<String> {
+        let full = resolve_issue_key(key, &self.keys_for(project_key)?).unwrap_or_else(|| key.trim().to_owned());
+        self.issue(&full)
     }
 
     /// One issue with description and comments, redacted.
@@ -206,6 +231,19 @@ mod tests {
         assert_eq!(detect_issue_key("how did we fix HD-1410"), None);
         assert_eq!(detect_issue_key("lowercase-12"), None);
         assert_eq!(detect_issue_key("HD-"), None);
+    }
+
+    #[test]
+    fn a_bare_number_takes_the_projects_only_key() {
+        let one = ["SEDN26".to_string()];
+        assert_eq!(resolve_issue_key("1910", &one), Some("SEDN26-1910".into()));
+        assert_eq!(resolve_issue_key(" #1910 ", &one), Some("SEDN26-1910".into()));
+        assert_eq!(resolve_issue_key("HD-7", &one), Some("HD-7".into()), "a full key is kept, even from another project");
+        assert_eq!(resolve_issue_key("1910", &[]), None, "unmapped project: no key to complete with");
+        assert_eq!(resolve_issue_key("1910", &["HD".into(), "SEDN26".into()]), None, "two keys: ambiguous");
+        assert_eq!(resolve_issue_key("19 10", &one), None);
+        assert_eq!(resolve_issue_key("#", &one), None);
+        assert_eq!(resolve_issue_key("login 1910", &one), None);
     }
 
     #[test]

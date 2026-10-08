@@ -61,6 +61,14 @@ fn fixture_db(path: &Path) {
     // A listed secret in raw teams.db text: search output must not show it.
     msg("30", "hd", "30", "Piotr Nowak", 5_000, "tymczasowy klucz plainsecret1 do konta serwisowego");
 
+    // Private chats as the scraper stores them: team "Chat", the chat's name as channel, one
+    // thread per chat per day. "chat" is also the name both fixture meetings record as theirs.
+    c.execute_batch("insert into channels values ('jr', 'Chat', 'Joanna Raj', null), ('mc', 'Chat', 'chat', null);").unwrap();
+    msg("40", "jr", "jr#1", "Joanna Raj", 8_000, "hejka, czy zgłoszenie trafiło do Moniki Kozub?");
+    msg("41", "jr", "jr#2", "Szymon Roziewski", 90_000_000, "sprawdziłem, zgłoszenie jest u Moniki");
+    msg("50", "mc", "mc#1", "Dawid Lubicz", 6_400, "https://jira/browse/SEDN26-1955 plainsecret1");
+    msg("51", "mc", "mc#2", "Dawid Lubicz", 90_000_000, "wiadomość z innego dnia");
+
     let line = |idx: i64, speaker: Option<&str>, ts: i64, text: &str| {
         c.execute(
             "insert into transcript_lines (meeting_id, idx, speaker, offset_s, ts, text, indexed_at) values ('mtg1', ?1, ?2, null, ?3, ?4, 0)",
@@ -136,7 +144,7 @@ async fn env() -> Env {
         let s = queue.status();
         if s.runs >= 1 && !s.running {
             assert!(s.last_error.is_none(), "{s:?}");
-            assert!(s.last_report.as_deref().unwrap().contains("teams: 6 items (threads+meetings), indexed 6, failed 0"), "{s:?}");
+            assert!(s.last_report.as_deref().unwrap().contains("teams: 10 items (threads+meetings), indexed 10, failed 0"), "{s:?}");
             settled = true;
             break;
         }
@@ -354,4 +362,70 @@ async fn get_meeting_leads_with_cleaned_participants_and_the_summary() {
     assert!(t.contains("Podsumowanie:") && t.contains("feature flagi w pazdzierniku"), "{t}");
     assert!(t.find("Uczestnicy:").unwrap() < t.find("Podsumowanie:").unwrap(), "participants first");
     assert!(t.find("Podsumowanie:").unwrap() < t.find("Transkrypcja:").unwrap(), "summary leads the transcript");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chats_are_searchable_and_kind_narrows_to_chats_or_channels() {
+    let e = env().await;
+    let c = e.client(r"Z:\work\other", true).await;
+    let all = ok(&c, "search_teams", json!({"query": "zgłoszenie Moniki"})).await;
+    assert!(all.starts_with("[1] Chat: Joanna Raj · thread jr#"), "{all}");
+
+    let chats = ok(&c, "search_teams", json!({"query": "zgłoszenie", "kind": "chats", "channel": "joanna"})).await;
+    assert!(chats.contains("thread jr#1") && chats.contains("thread jr#2"), "{chats}");
+    assert!(!chats.contains("ZSUN-Helpdesk") && !chats.contains("SEDN /"), "{chats}");
+
+    let channels = ok(&c, "search_teams", json!({"query": "zgłoszenie migracja logowanie", "kind": "channels"})).await;
+    assert!(!channels.contains("Chat:"), "{channels}");
+    assert!(channels.contains("ZSUN-Helpdesk / Analiza_HD"), "{channels}");
+
+    let typo = call(&c, "search_teams", json!({"query": "x", "kind": "dms"})).await;
+    assert_eq!(typo.is_error, Some(true));
+    assert!(text(&typo).contains("unknown kind"), "{}", text(&typo));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_day_links_to_the_days_around_it_and_channels_do_not() {
+    let e = env().await;
+    let c = e.client(r"Z:\work\other", true).await;
+    let first = ok(&c, "get_teams_thread", json!({"thread_id": "jr#1"})).await;
+    assert!(first.starts_with("Chat: Joanna Raj · thread jr#1 · 1 messages\n(private chat, one thread per day; next day: thread jr#2)"), "{first}");
+    assert!(!first.contains("previous day"), "{first}");
+    let second = ok(&c, "get_teams_thread", json!({"thread_id": "jr#2"})).await;
+    assert!(second.contains("previous day: thread jr#1") && !second.contains("next day"), "{second}");
+    let channel = ok(&c, "get_teams_thread", json!({"thread_id": "1"})).await;
+    assert!(channel.starts_with("ZSUN-Helpdesk / Analiza_HD · thread 1 · 2 messages\n\n"), "{channel}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_meeting_shows_what_was_posted_in_its_chat_during_it() {
+    let e = env().await;
+    let c = e.client(r"Z:\work\other", true).await;
+    let t = ok(&c, "get_meeting", json!({"meeting_id": "mtg1"})).await;
+    let chat = t.find("Czat spotkania (chat):").expect("chat section");
+    assert!(chat < t.find("Transkrypcja:").unwrap(), "chat leads the transcript so truncation can't cut it: {t}");
+    assert!(t.contains("Dawid Lubicz (") && t.contains("SEDN26-1955"), "{t}");
+    assert!(!t.contains("innego dnia"), "only messages around the meeting: {t}");
+    assert!(!t.contains("plainsecret1"), "chat text is redacted: {t}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inject_leaves_private_chats_out_unless_opted_in() {
+    let e = env().await;
+    let injector = ctx::inject::Injector::new(
+        e.ctx.store.clone(),
+        Some(e.teams.store.clone()),
+        e.teams.embedder.clone(),
+        Arc::new(WordCounter),
+        ctx::rank::Recency::OFF,
+        ctx::inject::InjectConfig::default(),
+        e.cfg.redact_file.clone(),
+    );
+    let query = e.teams.embedder.lock().unwrap().embed_one("hejka, czy zgłoszenie trafiło do Moniki Kozub?").unwrap();
+    let teams_of = |hits: Vec<store::Hit>| hits.into_iter().map(|h| h.payload["team"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+
+    let opted_in = teams_of(injector.teams_candidates(&query, -1.0, true).await.unwrap());
+    assert_eq!(opted_in.first().map(String::as_str), Some("Chat"), "the chat is the best match: {opted_in:?}");
+    let default = teams_of(injector.teams_candidates(&query, -1.0, false).await.unwrap());
+    assert!(!default.is_empty() && default.iter().all(|t| t != "Chat"), "{default:?}");
 }

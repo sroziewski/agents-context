@@ -104,6 +104,7 @@ All in `%APPDATA%\agents-context\.env` (quote Windows paths with single quotes).
 | `CTX_INJECT_CLAUDE` | falls back to `CTX_INJECT` | Inject for Claude Code |
 | `CTX_INJECT_OPENCODE` | falls back to `CTX_INJECT` | Inject for OpenCode |
 | `CTX_INJECT_TEAMS` | `off` | Also inject relevant Teams threads |
+| `CTX_INJECT_CHATS` | `off` | Let those Teams threads include your private chats (needs `CTX_INJECT_TEAMS`) |
 | `CTX_INJECT_MIN_SCORE` | code default | Minimum score for a chunk to be injected |
 | `CTX_INJECT_MAX_TOKENS` | code default | Token budget for the injected block |
 

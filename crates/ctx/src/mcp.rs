@@ -55,11 +55,14 @@ pub struct ListArgs {
 pub struct TeamsArgs {
     /// What to look for, in Polish or English; matched by meaning and by keywords.
     pub query: String,
+    /// "chats" for only the user's private chats (1:1, group, meeting chats), "channels" for only
+    /// team channels; default both.
+    pub kind: Option<String>,
     /// A people.json group (e.g. "SEDN"): only its channels.
     pub group: Option<String>,
     /// Substring of the Teams team name (case- and accent-insensitive).
     pub team: Option<String>,
-    /// Substring of the channel name.
+    /// Substring of the channel name; for a chat, its name (the other person, or the meeting).
     pub channel: Option<String>,
     /// Substring of the author's name.
     pub author: Option<String>,
@@ -192,10 +195,11 @@ impl ContextServer {
         self.teams.as_ref().ok_or_else(|| "Teams search is not configured".to_owned())
     }
 
-    /// Search the organisation's Microsoft Teams channel messages (shared, not project-scoped),
-    /// by meaning and by keywords; results are threads with their best matching message and
-    /// author roles. Threads in the current project's groups rank higher. Open one with
-    /// get_teams_thread.
+    /// Search Microsoft Teams messages (shared, not project-scoped) by meaning and by keywords:
+    /// the organisation's team channels and the user's private chats (1:1, group and meeting
+    /// chats, shown as "Chat: <name>", one thread per chat per day). Results are threads with
+    /// their best matching message and author roles. Threads in the current project's groups
+    /// rank higher. Open one with get_teams_thread.
     #[tool(name = "search_teams")]
     pub async fn search_teams(&self, Parameters(a): Parameters<TeamsArgs>) -> Result<String, String> {
         let teams = self.teams()?;
@@ -204,6 +208,7 @@ impl ContextServer {
         }
         let q = crate::teams::TeamsQuery {
             text: a.query,
+            kind: crate::teams::Conversations::parse(a.kind.as_deref().unwrap_or_default()).map_err(|e| e.to_string())?,
             group: a.group,
             team: a.team,
             channel: a.channel,
@@ -216,7 +221,8 @@ impl ContextServer {
         Ok(crate::teams::format_results(&r))
     }
 
-    /// A whole Teams thread (root and replies) with author roles.
+    /// A whole Teams thread (root and replies) with author roles. For a private chat this is one
+    /// day of it, with the ids of the previous and next day.
     #[tool(name = "get_teams_thread")]
     pub async fn get_teams_thread(&self, Parameters(a): Parameters<TeamsThreadArgs>) -> Result<String, String> {
         let teams = self.teams()?.clone();
@@ -247,7 +253,8 @@ impl ContextServer {
         Ok(crate::teams::format_meetings(&r))
     }
 
-    /// A whole Teams meeting transcript, every line speaker-labelled (redacted).
+    /// A whole Teams meeting: participants, AI summary, what was posted in the meeting's chat
+    /// during it (links, ticket ids), then the transcript, every line speaker-labelled (redacted).
     #[tool(name = "get_meeting")]
     pub async fn get_meeting(&self, Parameters(a): Parameters<MeetingGetArgs>) -> Result<String, String> {
         let teams = self.teams()?.clone();
@@ -414,9 +421,9 @@ impl ServerHandler for ContextServer {
              or another project path — only do that when the user asks about other projects. \
              Results cite session id, agent and date: quote them when you rely on a result, and \
              prefer recent sessions when results conflict. search_teams / get_teams_thread cover the \
-             organisation's Teams channels, which are shared by all projects; author roles in brackets \
-             come from the team directory. search_meetings / get_meeting cover Teams meeting transcripts \
-             (standups etc.), filterable by speaker and date.",
+             organisation's Teams channels and the user's private Teams chats, shared by all projects; \
+             author roles in brackets come from the team directory. search_meetings / get_meeting cover \
+             Teams meeting transcripts (standups etc.), filterable by speaker and date.",
             self.current_project
         ))
     }

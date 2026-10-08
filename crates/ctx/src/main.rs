@@ -119,6 +119,9 @@ enum Command {
     /// Search Teams channel messages by meaning and keywords.
     SearchTeams {
         query: String,
+        /// "chats", "channels" or "all".
+        #[arg(long, default_value = "all")]
+        kind: String,
         #[arg(long)]
         group: Option<String>,
         #[arg(long)]
@@ -546,10 +549,11 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", format_results(&results));
             Ok(())
         }
-        Command::SearchTeams { query, group, team, channel, author, since, until, limit } => {
+        Command::SearchTeams { query, kind, group, team, channel, author, since, until, limit } => {
             let teams = teams_search(&cfg, &context(&cfg).await?);
             let q = ctx::teams::TeamsQuery {
                 text: query,
+                kind: ctx::teams::Conversations::parse(&kind)?,
                 group,
                 team,
                 channel,

@@ -51,6 +51,10 @@ pub struct InjectConfig {
     pub enabled_opencode: bool,
     /// Also inject matching Teams threads (`CTX_INJECT_TEAMS`).
     pub teams: bool,
+    /// Let those Teams threads include the user's private chats (`CTX_INJECT_CHATS`). Separate
+    /// and off by default: chats are private, injected text goes to the model provider, and the
+    /// Teams threshold was calibrated on channel threads only (DEV-31).
+    pub chats: bool,
     pub min_score: f32,
     /// Separate cosine gate for Teams threads: message chunks are short, so their similarity
     /// distribution differs from session summaries', and they need their own threshold
@@ -66,6 +70,7 @@ impl Default for InjectConfig {
             enabled_claude: false,
             enabled_opencode: false,
             teams: false,
+            chats: false,
             min_score: DEFAULT_MIN_SCORE,
             teams_min_score: DEFAULT_MIN_SCORE,
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -219,6 +224,7 @@ impl Injector {
         exclude_session: &str,
         min_score: f32,
         teams: bool,
+        chats: bool,
         now_ms: i64,
         skip: &(dyn Fn(&str) -> bool + Sync),
     ) -> anyhow::Result<Selection> {
@@ -238,7 +244,7 @@ impl Injector {
         let mut threads = Vec::new();
         if teams {
             // Teams is optional: an unreachable or missing collection must not cost the sessions.
-            let cands = self.teams_candidates(query, self.config.teams_min_score).await.unwrap_or_default();
+            let cands = self.teams_candidates(query, self.config.teams_min_score, chats).await.unwrap_or_default();
             threads = cands.into_iter().filter(|h| !skip(&format!("t:{}", string(&h.payload, "thread_id")))).take(MAX_THREADS).collect();
         }
         Ok(Selection { sessions, threads })
@@ -246,10 +252,12 @@ impl Injector {
 
     /// Top distinct Teams threads (best first) scoring at least `min_score`, capped at what
     /// inject shows. Its own dense search over the teams collection — shared by the runtime
-    /// inject path and the DEV-31 threshold sweep. Empty when Teams is not attached.
-    pub async fn teams_candidates(&self, query: &Embedding, min_score: f32) -> anyhow::Result<Vec<Hit>> {
+    /// inject path and the DEV-31 threshold sweep. Empty when Teams is not attached. Private
+    /// chats only when `chats`.
+    pub async fn teams_candidates(&self, query: &Embedding, min_score: f32, chats: bool) -> anyhow::Result<Vec<Hit>> {
         let Some(store) = &self.teams else { return Ok(Vec::new()) };
-        let hits = store.search(query, &SearchFilter::default(), (MAX_THREADS * 6) as u64, SearchMode::Dense).await?;
+        let filter = if chats { SearchFilter::default() } else { SearchFilter::default().ne("team", sources::teams::CHAT_TEAM) };
+        let hits = store.search(query, &filter, (MAX_THREADS * 6) as u64, SearchMode::Dense).await?;
         let mut seen = HashSet::new();
         Ok(hits.into_iter().filter(|h| h.score >= min_score && seen.insert(string(&h.payload, "thread_id"))).take(MAX_THREADS).collect())
     }
@@ -275,7 +283,7 @@ impl Injector {
         let now = jiff::Timestamp::now().as_millisecond();
         let sel = {
             let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner()).snapshot(&req.session_id);
-            self.select(&query, &project, &req.session_id, config.min_score, config.teams, now, &|id| seen.contains(id)).await?
+            self.select(&query, &project, &req.session_id, config.min_score, config.teams, config.chats, now, &|id| seen.contains(id)).await?
         };
         let redactor = Redactor::from_file(&self.redact_file)?;
         let resp = render(&sel, self.counter.as_ref(), config.max_tokens, &redactor);
@@ -396,7 +404,8 @@ pub fn render(sel: &Selection, counter: &dyn TokenCounter, max_tokens: usize, re
     for h in &sel.threads {
         let p = &h.payload;
         let id = string(p, "thread_id");
-        let head = clean(&format!("\n[T{}] Teams {} / {} · {} · thread {id}\n", out.threads.len() + 1, string(p, "team"), string(p, "channel"), date(p)));
+        let place = crate::teams::place(&string(p, "team"), &string(p, "channel"));
+        let head = clean(&format!("\n[T{}] Teams {place} · {} · thread {id}\n", out.threads.len() + 1, date(p)));
         let room = budget.saturating_sub(counter.count(&head));
         let body = clean(string(p, "text").trim());
         if body.trim().is_empty() {
@@ -516,6 +525,17 @@ mod tests {
         let r = render(&Selection { sessions: vec![], threads: vec![t] }, &WordCounter, 1500, &Redactor::default());
         assert!(r.context.contains("[T1] Teams ZSUN / HD · 2026-"), "{}", r.context);
         assert_eq!(r.threads, ["t9"]);
+    }
+
+    #[test]
+    fn chat_threads_are_labelled_as_chats() {
+        let t = Hit {
+            id: uuid::Uuid::nil(),
+            score: 0.9,
+            payload: json!({"thread_id": "c#d", "team": "Chat", "channel": "Joanna Raj", "ts": 1_790_000_000_000i64, "text": "hejka"}).as_object().cloned().unwrap(),
+        };
+        let r = render(&Selection { sessions: vec![], threads: vec![t] }, &WordCounter, 1500, &Redactor::default());
+        assert!(r.context.contains("[T1] Teams Chat: Joanna Raj · 2026-"), "{}", r.context);
     }
 
     #[test]

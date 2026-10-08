@@ -15,7 +15,7 @@ use indexmap::IndexMap;
 use ingest::Redactor;
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use sources::teams::{Filter, FtsHit, Meeting, TeamsDb, Thread, TranscriptFilter, TranscriptHit, name_key};
+use sources::teams::{CHAT_TEAM, Filter, FtsHit, Meeting, TeamsDb, Thread, TranscriptFilter, TranscriptHit, name_key};
 use store::{SearchFilter, SearchMode, Store};
 
 /// Reciprocal rank fusion constant: the usual 60, so neither source dominates on rank 1.
@@ -26,6 +26,9 @@ pub const PROJECT_BOOST: f64 = 1.5;
 /// Candidates taken from each source before fusion, per result asked for.
 const DEPTH: usize = 5;
 const EVIDENCE_CHARS: usize = 500;
+/// How far around a meeting its chat is read for `get_meeting`: links and notes are often posted
+/// just before it starts or right after it ends.
+const MEETING_CHAT_MARGIN_MS: i64 = 15 * 60 * 1000;
 
 /// people.json. Insertion-ordered like the app's objects, so a person's tags come out in the
 /// same order as in the app.
@@ -117,9 +120,40 @@ pub fn load_project_groups(path: &Path) -> anyhow::Result<HashMap<String, Vec<St
     }
 }
 
+/// Which conversations a Teams search covers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Conversations {
+    #[default]
+    All,
+    /// Only the user's private chats (1:1, group and meeting chats).
+    Chats,
+    /// Only team channels.
+    Channels,
+}
+
+impl Conversations {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "all" => Ok(Self::All),
+            "chats" | "chat" => Ok(Self::Chats),
+            "channels" | "channel" => Ok(Self::Channels),
+            other => anyhow::bail!("unknown kind {other:?}; use \"chats\", \"channels\" or \"all\""),
+        }
+    }
+
+    fn only_chats(self) -> Option<bool> {
+        match self {
+            Self::All => None,
+            Self::Chats => Some(true),
+            Self::Channels => Some(false),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TeamsQuery {
     pub text: String,
+    pub kind: Conversations,
     pub group: Option<String>,
     pub team: Option<String>,
     pub channel: Option<String>,
@@ -314,7 +348,8 @@ impl TeamsSearch {
             if ids.is_empty() {
                 return Ok(HashMap::new());
             }
-            Ok(TeamsDb::open(&db)?.threads()?.into_iter().filter(|t| ids.contains(&t.id)).map(|t| (t.id.clone(), t)).collect())
+            let ids: Vec<String> = ids.into_iter().collect();
+            Ok(TeamsDb::open(&db)?.threads_by_ids(&ids)?.into_iter().map(|t| (t.id.clone(), t)).collect())
         })
         .await??;
 
@@ -381,8 +416,9 @@ impl TeamsSearch {
                 Some(channels.to_vec())
             }
         };
-        let channel_ids = (q.team.is_some() || q.channel.is_some() || group_paths.is_some())
-            .then(|| db.resolve_channels(q.team.as_deref(), q.channel.as_deref(), group_paths.as_deref()))
+        let chats = q.kind.only_chats();
+        let channel_ids = (q.team.is_some() || q.channel.is_some() || group_paths.is_some() || chats.is_some())
+            .then(|| db.resolve_channels(q.team.as_deref(), q.channel.as_deref(), group_paths.as_deref(), chats))
             .transpose()?;
         let authors = q.author.as_deref().map(|a| db.resolve_authors(a)).transpose()?;
         let fts = db
@@ -397,7 +433,7 @@ impl TeamsSearch {
         {
             for g in groups {
                 if let Some((name, paths)) = dir.group(g) {
-                    boost_channels.extend(db.resolve_channels(None, None, Some(paths))?);
+                    boost_channels.extend(db.resolve_channels(None, None, Some(paths), None)?);
                     boosted_groups.push(name.to_owned());
                 }
             }
@@ -427,8 +463,26 @@ impl TeamsSearch {
     pub fn thread(&self, thread_id: &str, max_chars: usize) -> anyhow::Result<String> {
         let dir = Directory::load(&self.people)?;
         let redactor = Redactor::from_file(&self.redact)?;
-        let t = TeamsDb::open(&self.db)?.thread(thread_id)?;
-        let mut out = format!("{} / {} · thread {} · {} messages\n\n", t.channel.team, t.channel.name, t.id, t.messages.len());
+        let db = TeamsDb::open(&self.db)?;
+        let t = db.thread(thread_id)?;
+        let mut out = format!("{} · thread {} · {} messages\n", place(&t.channel.team, &t.channel.name), t.id, t.messages.len());
+        if t.channel.is_chat() {
+            // A chat is stored one thread per day, so a day alone often starts mid-conversation.
+            let days = db.channel_thread_ids(&t.channel.id)?;
+            if let Some(i) = days.iter().position(|d| *d == t.id) {
+                let mut nav = Vec::new();
+                if let Some(prev) = i.checked_sub(1).and_then(|p| days.get(p)) {
+                    nav.push(format!("previous day: thread {prev}"));
+                }
+                if let Some(next) = days.get(i + 1) {
+                    nav.push(format!("next day: thread {next}"));
+                }
+                if !nav.is_empty() {
+                    out.push_str(&format!("(private chat, one thread per day; {})\n", nav.join(" · ")));
+                }
+            }
+        }
+        out.push('\n');
         for (i, m) in t.messages.iter().enumerate() {
             let line = format!("{} ({}): {}\n\n", dir.label(&m.author), datetime(m.ts), redactor.scrub(m.text.trim()).0);
             if out.len() + line.len() > max_chars {
@@ -558,6 +612,15 @@ impl TeamsSearch {
         {
             out.push_str(&format!("\nPodsumowanie:\n{}\n", redactor.scrub(sum.trim()).0));
         }
+        // Ahead of the transcript so truncation can't cut it: the chat is where the links and
+        // ticket ids mentioned aloud were actually posted.
+        let chat = db.chat_messages(&m.chat, m.started_at - MEETING_CHAT_MARGIN_MS, m.ended_at + MEETING_CHAT_MARGIN_MS)?;
+        if !chat.is_empty() {
+            out.push_str(&format!("\nCzat spotkania ({}):\n", m.chat));
+            for c in &chat {
+                out.push_str(&format!("{} ({}): {}\n", c.author, datetime(c.ts), redactor.scrub(c.text.trim()).0));
+            }
+        }
         out.push_str("\nTranskrypcja:\n");
         for (i, l) in lines.iter().enumerate() {
             let who = l.speaker.as_deref().unwrap_or("—");
@@ -592,6 +655,11 @@ fn message_body(chunk: &str) -> String {
         Some((_, body)) => body.to_owned(),
         None => last,
     }
+}
+
+/// "Team / Channel", or "Chat: <name>" for a private chat, whose team is only the scraper's marker.
+pub fn place(team: &str, channel: &str) -> String {
+    if team == CHAT_TEAM { format!("{CHAT_TEAM}: {channel}") } else { format!("{team} / {channel}") }
 }
 
 fn datetime(ts: i64) -> String {
@@ -667,10 +735,9 @@ pub fn format_results(r: &TeamsResults) -> String {
         .enumerate()
         .map(|(i, h)| {
             format!(
-                "[{}] {} / {} · thread {} · {} messages · last {}\n    {} ({}): {}",
+                "[{}] {} · thread {} · {} messages · last {}\n    {} ({}): {}",
                 i + 1,
-                h.team,
-                h.channel,
+                place(&h.team, &h.channel),
                 h.thread_id,
                 h.message_count,
                 datetime(h.last_ts),
@@ -739,6 +806,20 @@ mod tests {
     fn message_body_strips_header_and_context() {
         let chunk = "[T / C · 2026-09-20]\nThread: opening\nPrevious: Piotr: sprawdzam\nAnna (2026-09-20 10:00): ok, zrobione";
         assert_eq!(message_body(chunk), "ok, zrobione");
+    }
+
+    #[test]
+    fn kind_parses_loosely_and_rejects_typos() {
+        assert_eq!(Conversations::parse(" Chats ").unwrap(), Conversations::Chats);
+        assert_eq!(Conversations::parse("channel").unwrap(), Conversations::Channels);
+        assert_eq!(Conversations::parse("").unwrap(), Conversations::All);
+        assert!(Conversations::parse("dms").unwrap_err().to_string().contains("\"chats\""));
+    }
+
+    #[test]
+    fn chats_are_labelled_by_name_not_as_a_team() {
+        assert_eq!(place("Chat", "Joanna Raj"), "Chat: Joanna Raj");
+        assert_eq!(place("SEDN", "daily"), "SEDN / daily");
     }
 
     #[test]

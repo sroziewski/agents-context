@@ -19,8 +19,11 @@ pub const SOURCE: &str = "teams";
 
 /// Payload fields the teams collection indexes. No project tenant: Teams is shared. `meeting_id`
 /// scopes meeting/transcript chunks (thread/message chunks simply never set it, and vice versa).
+/// `team` lets inject leave private chats (team "Chat") out without opening teams.db; every chunk
+/// has always carried it, so adding the index needed no re-index.
 pub const TEAMS_FIELDS: &[Field] = &[
     Field::Keyword("kind"),
+    Field::Keyword("team"),
     Field::Keyword("thread_id"),
     Field::Keyword("channel_id"),
     Field::Keyword("author"),

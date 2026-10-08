@@ -166,6 +166,7 @@ impl Config {
                 enabled_claude: on("CTX_INJECT_CLAUDE", on("CTX_INJECT", false)),
                 enabled_opencode: on("CTX_INJECT_OPENCODE", on("CTX_INJECT", false)),
                 teams: on("CTX_INJECT_TEAMS", false),
+                chats: on("CTX_INJECT_CHATS", false),
                 min_score: number("CTX_INJECT_MIN_SCORE", crate::inject::DEFAULT_MIN_SCORE as f64) as f32,
                 teams_min_score: number("CTX_INJECT_TEAMS_MIN_SCORE", crate::inject::DEFAULT_TEAMS_MIN_SCORE as f64) as f32,
                 max_tokens: number("CTX_INJECT_MAX_TOKENS", crate::inject::DEFAULT_MAX_TOKENS as f64) as usize,
@@ -293,7 +294,7 @@ mod tests {
     #[test]
     fn inject_is_off_by_default_and_numbers_fall_back_on_garbage() {
         let c = Config::from_env(|_| None);
-        assert!(!c.inject.enabled && !c.inject.teams);
+        assert!(!c.inject.enabled && !c.inject.teams && !c.inject.chats);
         assert_eq!(c.recency.weight, DEFAULT_RECENCY_WEIGHT);
         let env: HashMap<&str, &str> = [("CTX_INJECT", "ON"), ("CTX_RECENCY_WEIGHT", "abc"), ("CTX_INJECT_MIN_SCORE", " 0.7 ")].into();
         let c = Config::from_env(|k| env.get(k).map(|v| v.to_string()));

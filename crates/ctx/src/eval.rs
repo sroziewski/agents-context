@@ -313,6 +313,7 @@ pub async fn run_teams(teams: &crate::teams::TeamsSearch, cases: &[Case], varian
         for c in &positives {
             let q = crate::teams::TeamsQuery {
                 text: c.query.clone(),
+                kind: Default::default(),
                 group: c.group.clone(),
                 team: c.team.clone(),
                 channel: c.channel.clone(),
@@ -340,7 +341,7 @@ pub async fn run_teams_inject(injector: &Injector, cases: &[Case], vectors: &Has
         let mut p = InjectPoint { min_score: t, hits: 0, positives: 0, false_injects: 0, negatives: 0, precision: 0.0 };
         let (mut expected, mut injected) = (0usize, 0usize);
         for c in &teams {
-            let cands = injector.teams_candidates(&vectors[&c.id], t).await?;
+            let cands = injector.teams_candidates(&vectors[&c.id], t, false).await?;
             let ids: Vec<String> = cands.iter().filter_map(|h| h.payload.get("thread_id")?.as_str().map(str::to_owned)).collect();
             if c.expect.is_empty() {
                 p.negatives += 1;
@@ -394,7 +395,7 @@ pub async fn run_inject(injector: &Injector, cases: &[Case], vectors: &HashMap<S
         let mut p = InjectPoint { min_score: t, hits: 0, positives: 0, false_injects: 0, negatives: 0, precision: 0.0 };
         let (mut expected, mut injected) = (0usize, 0usize);
         for (c, project) in &scoped {
-            let sel = injector.select(&vectors[&c.id], project, "", t, false, now, &|_| false).await?;
+            let sel = injector.select(&vectors[&c.id], project, "", t, false, false, now, &|_| false).await?;
             let ids: Vec<String> = sel.sessions.iter().filter_map(|h| h.payload.get("session_id")?.as_str().map(str::to_owned)).collect();
             if c.expect.is_empty() {
                 p.negatives += 1;

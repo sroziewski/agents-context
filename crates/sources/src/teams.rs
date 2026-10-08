@@ -64,6 +64,10 @@ pub fn participants(lines: &[TranscriptLine]) -> Vec<String> {
     out
 }
 
+/// The team name the scraper gives private chats (1:1, group and meeting chats). Each chat is a
+/// "channel" named after the chat, and each day of it a thread `<chat id>#YYYY-MM-DD`.
+pub const CHAT_TEAM: &str = "Chat";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Channel {
     pub id: String,
@@ -75,6 +79,10 @@ impl Channel {
     /// `Team/Channel`, the form `people.json` groups match against.
     pub fn path(&self) -> String {
         format!("{}/{}", self.team, self.name)
+    }
+
+    pub fn is_chat(&self) -> bool {
+        self.team == CHAT_TEAM
     }
 }
 
@@ -208,12 +216,27 @@ impl TeamsDb {
 
     /// Every thread with its messages, oldest message first.
     pub fn threads(&self) -> Result<Vec<Thread>> {
+        self.threads_where("", Vec::new())
+    }
+
+    /// Only the threads with these ids (unknown ids are skipped). Search and thread lookups use
+    /// this instead of [`Self::threads`]: with private chats the store holds several times more
+    /// messages than the handful a result needs.
+    pub fn threads_by_ids(&self, ids: &[String]) -> Result<Vec<Thread>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; ids.len()].join(",");
+        self.threads_where(&format!("where thread_id in ({marks})"), ids.iter().cloned().map(Into::into).collect())
+    }
+
+    fn threads_where(&self, clause: &str, args: Vec<rusqlite::types::Value>) -> Result<Vec<Thread>> {
         let channels: BTreeMap<String, Channel> = self.channels()?.into_iter().map(|c| (c.id.clone(), c)).collect();
         let mut stmt = self
             .conn
-            .prepare("select id, thread_id, channel_id, author, ts, text from messages order by thread_id, ts, rowid")?;
+            .prepare(&format!("select id, thread_id, channel_id, author, ts, text from messages {clause} order by thread_id, ts, rowid"))?;
         let mut threads: BTreeMap<String, Thread> = BTreeMap::new();
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params_from_iter(args), |r| {
             Ok((
                 Message { id: r.get(0)?, thread_id: r.get(1)?, author: r.get(3)?, ts: r.get(4)?, text: r.get(5)? },
                 r.get::<_, String>(2)?,
@@ -232,10 +255,31 @@ impl TeamsDb {
     }
 
     pub fn thread(&self, thread_id: &str) -> Result<Thread> {
-        self.threads()?
-            .into_iter()
-            .find(|t| t.id == thread_id)
-            .ok_or_else(|| SourceError::NotFound(thread_id.to_owned()))
+        self.threads_by_ids(&[thread_id.to_owned()])?.pop().ok_or_else(|| SourceError::NotFound(thread_id.to_owned()))
+    }
+
+    /// The threads of one channel in time order (by first message). For a chat these are its
+    /// days, so a day can point at the one before and after it.
+    pub fn channel_thread_ids(&self, channel_id: &str) -> Result<Vec<String>> {
+        let mut stmt =
+            self.conn.prepare("select thread_id from messages where channel_id = ? group by thread_id order by min(ts), thread_id")?;
+        let rows = stmt.query_map([channel_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Messages posted in the chat(s) named `chat` between `from` and `to` (inclusive, epoch ms),
+    /// oldest first. A meeting records only its chat's name, and names are not unique ("Wideoczat
+    /// z Dyrekcją" twice), so every chat of that name is read; the time window keeps unrelated
+    /// chats out in practice.
+    pub fn chat_messages(&self, chat: &str, from: i64, to: i64) -> Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(
+            "select m.id, m.thread_id, m.author, m.ts, m.text from messages m join channels c on c.id = m.channel_id
+             where c.team = ?1 and c.name = ?2 and m.ts between ?3 and ?4 order by m.ts, m.rowid",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![CHAT_TEAM, chat, from, to], |r| {
+            Ok(Message { id: r.get(0)?, thread_id: r.get(1)?, author: r.get(2)?, ts: r.get(3)?, text: r.get(4)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// FTS5 BM25 search, best first, restricted to `channel_ids` / `authors` when given (an
@@ -282,11 +326,13 @@ impl TeamsDb {
 
     /// Channel ids matching the app's filters: `team`/`channel` are substrings of the team and
     /// channel names, `paths` (a group) substrings of `Team/Channel`; all folded by [`name_key`].
-    pub fn resolve_channels(&self, team: Option<&str>, channel: Option<&str>, paths: Option<&[String]>) -> Result<Vec<String>> {
+    /// `chats` keeps only private chats (`Some(true)`) or only real channels (`Some(false)`).
+    pub fn resolve_channels(&self, team: Option<&str>, channel: Option<&str>, paths: Option<&[String]>, chats: Option<bool>) -> Result<Vec<String>> {
         let contains = |hay: &str, needle: &str| name_key(hay).contains(&name_key(needle));
         Ok(self
             .channels()?
             .into_iter()
+            .filter(|c| chats.is_none_or(|want| c.is_chat() == want))
             .filter(|c| team.is_none_or(|t| contains(&c.team, t)))
             .filter(|c| channel.is_none_or(|n| contains(&c.name, n)))
             .filter(|c| paths.is_none_or(|ps| ps.iter().any(|p| contains(&c.path(), p))))
@@ -634,12 +680,72 @@ mod tests {
     #[test]
     fn channel_resolution_uses_folded_substrings_like_the_app() {
         let (_d, db) = db();
-        assert_eq!(db.resolve_channels(Some("helpdesk"), None, None).unwrap(), ["c1"]);
-        assert_eq!(db.resolve_channels(None, Some("STANDUP"), None).unwrap(), ["c2"]);
+        assert_eq!(db.resolve_channels(Some("helpdesk"), None, None, None).unwrap(), ["c1"]);
+        assert_eq!(db.resolve_channels(None, Some("STANDUP"), None, None).unwrap(), ["c2"]);
         let group = vec!["ZSUN-Helpdesk/".to_owned()];
-        assert_eq!(db.resolve_channels(None, None, Some(&group)).unwrap(), ["c1"]);
-        assert!(db.resolve_channels(None, None, Some(&[])).unwrap().is_empty(), "empty group matches nothing");
-        assert_eq!(db.resolve_channels(None, None, None).unwrap().len(), 2);
+        assert_eq!(db.resolve_channels(None, None, Some(&group), None).unwrap(), ["c1"]);
+        assert!(db.resolve_channels(None, None, Some(&[]), None).unwrap().is_empty(), "empty group matches nothing");
+        assert_eq!(db.resolve_channels(None, None, None, None).unwrap().len(), 2);
+    }
+
+    /// The scraper's chat layout: team "Chat", the chat's name as channel, one thread per day.
+    fn with_chats() -> (tempfile::TempDir, TeamsDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.db");
+        let c = create(&path);
+        channel(&c, "c1", "ZSUN-Helpdesk", "Analiza_HD");
+        channel(&c, "ch1", CHAT_TEAM, "Joanna Raj");
+        channel(&c, "ch2", CHAT_TEAM, "[SEDN] sedn standup");
+        channel(&c, "ch3", CHAT_TEAM, "[SEDN] sedn standup");
+        message(&c, "1", "c1", "1", "Anna", 50, "kanał");
+        // Day ids sort differently from time on purpose: order must come from timestamps.
+        message(&c, "10", "ch1", "ch1#b", "Joanna Raj", 100, "hejka");
+        message(&c, "11", "ch1", "ch1#b", "Szymon", 110, "sprawdzę");
+        message(&c, "20", "ch1", "ch1#a", "Joanna Raj", 200, "dzięki");
+        message(&c, "30", "ch2", "ch2#a", "Dawid", 1_000, "https://jira/SEDN26-1955");
+        message(&c, "31", "ch2", "ch2#a", "Dawid", 5_000, "po spotkaniu");
+        message(&c, "40", "ch3", "ch3#a", "Ewa", 1_500, "inny czat o tej samej nazwie");
+        drop(c);
+        (dir, TeamsDb::open(&path).unwrap())
+    }
+
+    #[test]
+    fn chats_are_marked_and_can_be_kept_or_excluded() {
+        let (_d, db) = with_chats();
+        let only_chats = db.resolve_channels(None, None, None, Some(true)).unwrap();
+        assert_eq!(only_chats, ["ch1", "ch2", "ch3"]);
+        assert_eq!(db.resolve_channels(None, None, None, Some(false)).unwrap(), ["c1"]);
+        assert_eq!(db.resolve_channels(None, Some("joanna"), None, Some(true)).unwrap(), ["ch1"], "filters combine");
+        assert!(db.resolve_channels(None, Some("joanna"), None, Some(false)).unwrap().is_empty());
+        assert!(db.thread("ch1#a").unwrap().channel.is_chat());
+        assert!(!db.thread("1").unwrap().channel.is_chat());
+    }
+
+    #[test]
+    fn threads_by_ids_reads_only_those_threads() {
+        let (_d, db) = with_chats();
+        let got = db.threads_by_ids(&["ch1#b".into(), "nope".into(), "1".into()]).unwrap();
+        let ids: Vec<&str> = got.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["1", "ch1#b"]);
+        assert_eq!(got[1].messages.len(), 2);
+        assert!(db.threads_by_ids(&[]).unwrap().is_empty());
+        assert_eq!(db.threads_by_ids(&["ch1#b".into()]).unwrap()[0], db.threads().unwrap().into_iter().find(|t| t.id == "ch1#b").unwrap());
+    }
+
+    #[test]
+    fn chat_days_are_ordered_by_time_not_by_id() {
+        let (_d, db) = with_chats();
+        assert_eq!(db.channel_thread_ids("ch1").unwrap(), ["ch1#b", "ch1#a"]);
+        assert!(db.channel_thread_ids("none").unwrap().is_empty());
+    }
+
+    #[test]
+    fn chat_messages_cover_every_chat_of_that_name_inside_the_window() {
+        let (_d, db) = with_chats();
+        let ids = |v: Vec<Message>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(db.chat_messages("[SEDN] sedn standup", 900, 2_000).unwrap()), ["30", "40"]);
+        assert_eq!(ids(db.chat_messages("[SEDN] sedn standup", 900, 1_000).unwrap()), ["30"], "inclusive bounds, later posts excluded");
+        assert!(db.chat_messages("Analiza_HD", 0, i64::MAX).unwrap().is_empty(), "a channel of the same name is not a chat");
     }
 
     #[test]

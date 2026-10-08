@@ -80,7 +80,8 @@ pub enum SearchMode {
 }
 
 /// Payload filter. All conditions must hold. `ts_from`/`ts_to` are inclusive epoch milliseconds
-/// on the `ts` payload field.
+/// on the `ts` payload field. `not_equals` excludes points whose field has that value; a point
+/// without the field is kept.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SearchFilter {
     pub equals: Vec<(String, String)>,
@@ -88,6 +89,7 @@ pub struct SearchFilter {
     pub ints: Vec<(String, i64)>,
     /// `field` equals any of the values. An empty list matches nothing.
     pub any: Vec<(String, Vec<String>)>,
+    pub not_equals: Vec<(String, String)>,
     pub ts_from: Option<i64>,
     pub ts_to: Option<i64>,
 }
@@ -95,6 +97,11 @@ pub struct SearchFilter {
 impl SearchFilter {
     pub fn eq(mut self, field: impl Into<String>, value: impl Into<String>) -> Self {
         self.equals.push((field.into(), value.into()));
+        self
+    }
+
+    pub fn ne(mut self, field: impl Into<String>, value: impl Into<String>) -> Self {
+        self.not_equals.push((field.into(), value.into()));
         self
     }
 
@@ -144,7 +151,14 @@ impl SearchFilter {
                 },
             ));
         }
-        (!conditions.is_empty()).then(|| Filter::must(conditions))
+        let excluded: Vec<Condition> =
+            self.not_equals.iter().map(|(field, value)| Condition::matches(field.clone(), value.clone())).collect();
+        if conditions.is_empty() && excluded.is_empty() {
+            return None;
+        }
+        let mut f = Filter::must(conditions);
+        f.must_not = excluded;
+        Some(f)
     }
 }
 
@@ -248,7 +262,8 @@ impl Store {
     /// Deletes every point matching `filter` except `keep`. Used after re-upserting a session:
     /// upsert-then-prune never leaves a window where the session is missing from the index.
     pub async fn delete_matching_except(&self, filter: &SearchFilter, keep: &[Uuid]) -> Result<()> {
-        let Some(mut f) = filter.to_qdrant() else {
+        // An exclusion alone still selects nearly everything, so it counts as empty here.
+        let Some(mut f) = filter.to_qdrant().filter(|f| !f.must.is_empty()) else {
             // An empty filter would prune the whole collection; never what a caller means.
             return Err(StoreError::Payload("refusing to prune with an empty filter".into()));
         };
@@ -474,6 +489,15 @@ mod tests {
     fn ints_become_integer_match_conditions() {
         let f = SearchFilter::default().int("turn_index", 0).int("chunk_index", 0).to_qdrant().unwrap();
         assert_eq!(f.must.len(), 2);
+    }
+
+    #[test]
+    fn not_equals_becomes_must_not_alone_or_beside_must() {
+        let alone = SearchFilter::default().ne("team", "Chat").to_qdrant().unwrap();
+        assert!(alone.must.is_empty());
+        assert_eq!(alone.must_not.len(), 1);
+        let both = SearchFilter::default().eq("kind", "thread").ne("team", "Chat").to_qdrant().unwrap();
+        assert_eq!((both.must.len(), both.must_not.len()), (1, 1));
     }
 
     #[test]

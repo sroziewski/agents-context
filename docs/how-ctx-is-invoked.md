@@ -129,6 +129,8 @@ apply. Register it in `~/.claude/settings.json`:
 "statusLine": {"type": "command", "command": "…\\ctx.exe statusline"}
 ```
 
+How to read it and use it day to day: [status-line.md](status-line.md).
+
 ---
 
 ## Configuration reference

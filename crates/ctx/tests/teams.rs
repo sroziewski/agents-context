@@ -429,3 +429,42 @@ async fn inject_leaves_private_chats_out_unless_opted_in() {
     let default = teams_of(injector.teams_candidates(&query, -1.0, false).await.unwrap());
     assert!(!default.is_empty() && default.iter().all(|t| t != "Chat"), "{default:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn teams_threshold_edits_in_env_apply_without_a_restart() {
+    let e = env().await;
+    e.ctx.store.ensure_collection(ingest::SESSION_FIELDS).await.unwrap();
+    // Started with a gate nothing can clear; the .env, re-read per prompt, says otherwise.
+    let started = ctx::inject::InjectConfig {
+        enabled: true,
+        enabled_claude: true,
+        teams: true,
+        teams_min_score: 1.01,
+        ..Default::default()
+    };
+    let env_file = e.cfg.state_path.with_file_name("inject.env");
+    let write = |gate: &str| std::fs::write(&env_file, format!("CTX_INJECT=on\nCTX_INJECT_TEAMS=on\nCTX_INJECT_TEAMS_MIN_SCORE={gate}\n")).unwrap();
+    let injector = ctx::inject::Injector::new(
+        e.ctx.store.clone(),
+        Some(e.teams.store.clone()),
+        e.teams.embedder.clone(),
+        Arc::new(WordCounter),
+        ctx::rank::Recency::OFF,
+        started,
+        e.cfg.redact_file.clone(),
+    )
+    .with_env_file(env_file.clone());
+    let req = ctx::inject::ContextRequest {
+        prompt: "migracja bazy danych w piątek, kto to robi?".into(),
+        cwd: r"Z:\work\other".into(),
+        session_id: String::new(),
+        client: "claude".into(),
+    };
+
+    write("-1");
+    let open = injector.context(&req).await.unwrap();
+    assert!(!open.threads.is_empty(), "the .env gate applies, not the startup one: {open:?}");
+    write("1.01");
+    let closed = injector.context(&req).await.unwrap();
+    assert!(closed.threads.is_empty(), "and a later edit applies too: {closed:?}");
+}

@@ -78,6 +78,21 @@ impl Default for InjectConfig {
     }
 }
 
+/// How Teams threads are selected for one prompt. Built from the config read for that prompt,
+/// so `.env` edits to the Teams threshold apply without a daemon restart like the other settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TeamsGate {
+    pub min_score: f32,
+    pub chats: bool,
+}
+
+impl InjectConfig {
+    /// `None` when Teams threads are not injected at all.
+    pub fn teams_gate(&self) -> Option<TeamsGate> {
+        self.teams.then_some(TeamsGate { min_score: self.teams_min_score, chats: self.chats })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextRequest {
     pub prompt: String,
@@ -212,10 +227,10 @@ impl Injector {
         .await?
     }
 
-    /// Summaries of `project` (and Teams threads when `teams`) scoring at least `min_score`,
-    /// best first after the recency factor, without `exclude_session` and without ids `skip`
-    /// rejects (`s:<session>`, `t:<thread>`). Skipped ones are removed before the cut, so an
-    /// already injected session makes room for the next one instead of taking its slot.
+    /// Summaries of `project` (and Teams threads when `teams` is set) scoring at least
+    /// `min_score`, best first after the recency factor, without `exclude_session` and without
+    /// ids `skip` rejects (`s:<session>`, `t:<thread>`). Skipped ones are removed before the cut,
+    /// so an already injected session makes room for the next one instead of taking its slot.
     #[allow(clippy::too_many_arguments)]
     pub async fn select(
         &self,
@@ -223,8 +238,7 @@ impl Injector {
         project: &str,
         exclude_session: &str,
         min_score: f32,
-        teams: bool,
-        chats: bool,
+        teams: Option<TeamsGate>,
         now_ms: i64,
         skip: &(dyn Fn(&str) -> bool + Sync),
     ) -> anyhow::Result<Selection> {
@@ -242,9 +256,9 @@ impl Injector {
         let sessions = self.recency.rerank(hits, now_ms, MAX_SESSIONS);
 
         let mut threads = Vec::new();
-        if teams {
+        if let Some(gate) = teams {
             // Teams is optional: an unreachable or missing collection must not cost the sessions.
-            let cands = self.teams_candidates(query, self.config.teams_min_score, chats).await.unwrap_or_default();
+            let cands = self.teams_candidates(query, gate.min_score, gate.chats).await.unwrap_or_default();
             threads = cands.into_iter().filter(|h| !skip(&format!("t:{}", string(&h.payload, "thread_id")))).take(MAX_THREADS).collect();
         }
         Ok(Selection { sessions, threads })
@@ -283,7 +297,7 @@ impl Injector {
         let now = jiff::Timestamp::now().as_millisecond();
         let sel = {
             let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner()).snapshot(&req.session_id);
-            self.select(&query, &project, &req.session_id, config.min_score, config.teams, config.chats, now, &|id| seen.contains(id)).await?
+            self.select(&query, &project, &req.session_id, config.min_score, config.teams_gate(), now, &|id| seen.contains(id)).await?
         };
         let redactor = Redactor::from_file(&self.redact_file)?;
         let resp = render(&sel, self.counter.as_ref(), config.max_tokens, &redactor);

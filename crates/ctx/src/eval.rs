@@ -395,7 +395,7 @@ pub async fn run_inject(injector: &Injector, cases: &[Case], vectors: &HashMap<S
         let mut p = InjectPoint { min_score: t, hits: 0, positives: 0, false_injects: 0, negatives: 0, precision: 0.0 };
         let (mut expected, mut injected) = (0usize, 0usize);
         for (c, project) in &scoped {
-            let sel = injector.select(&vectors[&c.id], project, "", t, false, false, now, &|_| false).await?;
+            let sel = injector.select(&vectors[&c.id], project, "", t, None, now, &|_| false).await?;
             let ids: Vec<String> = sel.sessions.iter().filter_map(|h| h.payload.get("session_id")?.as_str().map(str::to_owned)).collect();
             if c.expect.is_empty() {
                 p.negatives += 1;

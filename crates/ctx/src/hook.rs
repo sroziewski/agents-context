@@ -98,19 +98,6 @@ pub fn delegate_index(embed_url: &str, target: Target, wait: Duration) -> anyhow
     anyhow::bail!("daemon accepted the request but did not finish within {wait:?}; check `/index/status`")
 }
 
-/// Drains the hook payload from stdin. Claude Code writes JSON there and may block if the pipe
-/// is never read; its content is not needed because the daemon re-scans incrementally.
-/// Skipped on a console: nothing would ever close it and the hook would hang until Claude's
-/// hook timeout.
-pub fn drain_stdin() {
-    use std::io::IsTerminal;
-    if std::io::stdin().is_terminal() {
-        return;
-    }
-    let mut sink = Vec::new();
-    let _ = std::io::stdin().take(1 << 20).read_to_end(&mut sink);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

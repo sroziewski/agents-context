@@ -94,6 +94,43 @@ tool use.
 
 ---
 
+## 4. Keeping the context small — `/clear` handoff and the status line
+
+Claude Code cannot be cleared or compacted from outside: no hook, SDK call or other
+process can run `/clear` or `/compact`. The cheap way to keep context small is to
+`/clear` often, so ctx makes clearing lose nothing and tells you when to do it.
+
+**Handoff after `/clear`.** On `/clear`, Claude Code ends the old session
+(`SessionEnd`, reason `clear`) and starts a new one (`SessionStart`, source `clear`):
+
+```json
+"SessionStart": [{"matcher": "clear", "hooks": [{"command": "…\\ctx.exe", "args": ["hook", "--source", "claude"]}]}]
+```
+
+The `SessionEnd` hook records which transcript was cleared; the `SessionStart` hook
+adds a `<previous-session>` block to the new conversation. The block holds the last
+prompts, the files edited, the end of the last answer, and the ctx summary when
+one has been written yet. It is built from the transcript, so it is immediate and
+uses no LLM. `CTX_HANDOFF=off` turns it off. After `/compact` nothing is added:
+Claude Code's own compaction summary is already in the conversation.
+
+**Status line.** `ctx statusline` shows the model, how full the context is, and
+health markers:
+
+```
+Opus 5.5 · ctx ▰▰▰▰▰▰▰▰▱▱ 81% · /clear → ctx hands over · ctx daemon down
+```
+
+The usage turns yellow at `CTX_STATUS_WARN` and red, with the `/clear` hint, at
+`CTX_STATUS_CRIT`. "ctx daemon down" and a dim "Teams stale" appear only when they
+apply. Register it in `~/.claude/settings.json`:
+
+```json
+"statusLine": {"type": "command", "command": "…\\ctx.exe statusline"}
+```
+
+---
+
 ## Configuration reference
 
 All in `%APPDATA%\agents-context\.env` (quote Windows paths with single quotes).
@@ -107,6 +144,10 @@ All in `%APPDATA%\agents-context\.env` (quote Windows paths with single quotes).
 | `CTX_INJECT_CHATS` | `off` | Let those Teams threads include your private chats (needs `CTX_INJECT_TEAMS`) |
 | `CTX_INJECT_MIN_SCORE` | code default | Minimum score for a chunk to be injected |
 | `CTX_INJECT_MAX_TOKENS` | code default | Token budget for the injected block |
+| `CTX_HANDOFF` | `on` | After `/clear`, hand the cleared session over to the new one |
+| `CTX_STATUS_WARN` | `50` | Status line: context usage (%) shown in yellow |
+| `CTX_STATUS_CRIT` | `75` | Status line: context usage (%) shown in red, with the `/clear` hint |
+| `CTX_DATA_DIR` | `%LOCALAPPDATA%\agents-context` | Local working data (state DB, handoff records, …) |
 
 The `.env` is re-read by the daemon each run, so `ctx redact add` and inject
 setting changes apply without a restart. Injection scope stays within the current

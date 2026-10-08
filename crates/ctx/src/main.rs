@@ -39,6 +39,8 @@ enum Command {
         index_every: u64,
     },
     /// Called by agent hooks: asks the daemon to re-index and exits 0 immediately, always.
+    /// On `/clear` it also hands the cleared session over to the new one (SessionEnd records it,
+    /// SessionStart prints it; see `ctx::handoff`).
     Hook {
         #[arg(long, value_enum, default_value_t = SourceArg::All)]
         source: SourceArg,
@@ -47,6 +49,9 @@ enum Command {
         #[arg(long)]
         inject: bool,
     },
+    /// Claude Code status line: model, context usage with a /clear nudge, daemon and Teams
+    /// health. Reads the status JSON on stdin.
+    Statusline,
     /// Auto-inject of past-session summaries into Claude Code prompts.
     Inject {
         #[command(subcommand)]
@@ -414,6 +419,15 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Statusline => {
+            let mut s = ctx::statusline::parse(&hook::read_stdin());
+            s.daemon_up = Some(ctx::statusline::daemon_up(&cfg.embed_url, Duration::from_millis(150)));
+            let synced = cfg.teams_db.is_file().then(|| sources::teams::TeamsDb::open(&cfg.teams_db).ok()?.last_synced_at().ok()?).flatten();
+            s.teams_stale = synced.is_some_and(|ms| ctx::handoff::now_ms() - ms > cfg.teams_watch.stale_after.as_millis() as i64);
+            let t = ctx::statusline::Thresholds { warn: cfg.status_warn, crit: cfg.status_crit, handoff: cfg.handoff };
+            println!("{}", ctx::statusline::render(&s, t));
+            Ok(())
+        }
         Command::Inject { action } => {
             let env_file = Config::env_file();
             match action {
@@ -471,7 +485,36 @@ async fn main() -> anyhow::Result<()> {
             run_eval(cfg, file, save_baseline, check, sweep, compare, rerank_model, rerank_pool, rerank_threads, target).await
         }
         Command::Hook { source, .. } => {
-            hook::drain_stdin();
+            let payload = hook::read_stdin();
+            if std::env::var(hook::SUMMARIZER_ENV).is_ok() {
+                return Ok(());
+            }
+            let event: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            let field = |k: &str| event.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            match field("hook_event_name").as_str() {
+                // Nothing to index at the start of a session; only a /clear handoff to give.
+                "SessionStart" => {
+                    if cfg.handoff && field("source") == "clear" {
+                        let redactor = ingest::Redactor::from_file(&cfg.redact_file).unwrap_or_default();
+                        let store = connect_store(&cfg).ok();
+                        if let Some(json) = ctx::handoff::on_session_start(&event, &cfg.data_dir, &redactor, store.as_ref()).await {
+                            println!("{json}");
+                        }
+                    }
+                    return Ok(());
+                }
+                "SessionEnd" if cfg.handoff && field("reason") == "clear" => {
+                    let cleared = ctx::handoff::Cleared {
+                        session_id: field("session_id"),
+                        transcript: PathBuf::from(field("transcript_path")),
+                        at_ms: ctx::handoff::now_ms(),
+                    };
+                    let file = ctx::handoff::records_path(&cfg.data_dir);
+                    // Best effort: without the record the new session falls back to the newest transcript.
+                    let _ = ctx::handoff::record_clear(&file, &sources::project::key(&field("cwd")), cleared);
+                }
+                _ => {}
+            }
             let target = to_target(source);
             let url = cfg.embed_url.clone();
             let _ = tokio::task::spawn_blocking(move || {

@@ -50,6 +50,11 @@ pub struct Config {
     /// working directory.
     pub rerank_cache_dir: PathBuf,
     pub inject: crate::inject::InjectConfig,
+    /// After `/clear`, hand the cleared session over to the new one (`CTX_HANDOFF`, default on).
+    pub handoff: bool,
+    /// Status-line context thresholds in percent (`CTX_STATUS_WARN` / `CTX_STATUS_CRIT`).
+    pub status_warn: f64,
+    pub status_crit: f64,
     /// Model that fact-checks memory suggestions against the sessions they came from.
     pub verify_model: String,
     /// The retrieval eval's query set. It names real projects and topics, so it lives with the
@@ -118,8 +123,8 @@ impl Config {
 
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let data = dirs::data_local_dir().unwrap_or_else(|| home.clone()).join("agents-context");
         let path = |key: &str, default: PathBuf| get(key).map(PathBuf::from).unwrap_or(default);
+        let data = path("CTX_DATA_DIR", dirs::data_local_dir().unwrap_or_else(|| home.clone()).join("agents-context"));
         let number = |key: &str, default: f64| get(key).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(default);
         let on = |key: &str, default: bool| match get(key).map(|v| v.trim().to_ascii_lowercase()) {
             Some(v) if matches!(v.as_str(), "on" | "1" | "true" | "yes") => true,
@@ -171,6 +176,9 @@ impl Config {
                 teams_min_score: number("CTX_INJECT_TEAMS_MIN_SCORE", crate::inject::DEFAULT_TEAMS_MIN_SCORE as f64) as f32,
                 max_tokens: number("CTX_INJECT_MAX_TOKENS", crate::inject::DEFAULT_MAX_TOKENS as f64) as usize,
             },
+            handoff: on("CTX_HANDOFF", true),
+            status_warn: number("CTX_STATUS_WARN", 50.0),
+            status_crit: number("CTX_STATUS_CRIT", 75.0),
             verify_model: get("CTX_VERIFY_MODEL").unwrap_or_else(|| "sonnet".into()),
             eval_file: path("CTX_EVAL_FILE", Self::config_dir().join("eval").join("sessions.jsonl")),
             eval_baseline: path("CTX_EVAL_BASELINE", data.join("eval-baseline.json")),

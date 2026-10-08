@@ -173,3 +173,27 @@ async fn list_sessions_is_not_polluted_by_summary_points() {
     let out = call(&client, "list_sessions", json!({})).await;
     assert_eq!(out.lines().count(), 1, "{out}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clear_handoff_includes_the_stored_summary_and_says_when_it_lags() {
+    let e = env().await;
+    e.daemon_run().await;
+    // The session went on after it was summarised, then the user ran /clear.
+    let dir = e.cfg.claude_dir.join("a");
+    let old = dir.join("alpha-db.jsonl");
+    let more = session(ALPHA, &["and drop the legacy column"]).replace("\"u0\"", "\"u9\"");
+    let text = fs::read_to_string(&old).unwrap() + "\n" + &more;
+    fs::write(&old, text).unwrap();
+    let new = dir.join("fresh.jsonl");
+    fs::write(&new, "").unwrap();
+    let data = e._tmp.path().join("data");
+    let at_ms = ctx::handoff::now_ms();
+    ctx::handoff::record_clear(&ctx::handoff::records_path(&data), &sources::project::key(ALPHA), ctx::handoff::Cleared { session_id: "alpha-db".into(), transcript: old, at_ms }).unwrap();
+
+    let start = json!({"hook_event_name": "SessionStart", "source": "clear", "session_id": "fresh", "transcript_path": new, "cwd": ALPHA});
+    let out = ctx::handoff::on_session_start(&start, &data, &ingest::Redactor::default(), Some(&e.store)).await.expect("a handoff");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(ctx.contains("ctx summary, as of turn 2 of 3:\n## Goal\n- migrate the database schema\n"), "{ctx}");
+    assert!(ctx.contains("- and drop the legacy column\n"), "the turn after the summary is in the tail: {ctx}");
+}

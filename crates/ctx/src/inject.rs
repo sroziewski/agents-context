@@ -364,10 +364,15 @@ fn fit(text: &str, max_tokens: usize, counter: &dyn TokenCounter) -> Option<Stri
 /// Breaks every opening or closing `past-sessions` tag in any case or spacing (`</PAST-SESSIONS >`,
 /// `< /past-sessions`), so text from a session can neither close the block nor open a fake one.
 fn neutralise_tag(text: &str) -> String {
+    neutralise(text, TAG)
+}
+
+/// [`neutralise_tag`] for any lower-case `tag`: every `<tag` / `</tag` loses its `<`.
+pub(crate) fn neutralise(text: &str, tag: &str) -> String {
     let lower = text.to_ascii_lowercase();
     let mut out = String::with_capacity(text.len());
     let mut last = 0;
-    for (i, _) in lower.match_indices(TAG) {
+    for (i, _) in lower.match_indices(tag) {
         let before = lower[..i].trim_end();
         let before = before.strip_suffix('/').map_or(before, str::trim_end);
         if before.ends_with('<') {

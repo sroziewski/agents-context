@@ -145,3 +145,44 @@ async fn preview_and_hook_agree_and_respect_the_token_cap() {
     assert!(!r.context.is_empty());
     assert!(ingest::TokenCounter::count(&WordCounter, &r.context) <= 60, "{}", r.context);
 }
+
+async fn mock_context(delay: Duration) -> String {
+    let app = axum::Router::new().route(
+        "/context",
+        axum::routing::post(move || async move {
+            tokio::time::sleep(delay).await;
+            axum::Json(json!({"context": "session mock · 2026-10-01: the fix"}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
+fn timed_inject(url: String, timeout: Duration) -> (Option<String>, Duration) {
+    let payload = json!({"session_id": "s", "cwd": ALPHA, "prompt": "how did we fix the directml gpu hang timeout"}).to_string();
+    let start = std::time::Instant::now();
+    let out = ctx::hook::inject(&url, &payload, timeout, |_| None);
+    (out, start.elapsed())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_daemon_costs_only_what_is_left_of_the_budget() {
+    let url = mock_context(Duration::from_secs(5)).await;
+    let left = ctx::hook::inject_timeout(Duration::from_millis(800)).unwrap();
+    assert_eq!(left, Duration::from_millis(2200));
+    let (out, took) = tokio::task::spawn_blocking(move || timed_inject(url, left)).await.unwrap();
+    assert_eq!(out, None);
+    assert!(took >= Duration::from_millis(2100), "gave up before the timeout: {took:?}");
+    assert!(took < Duration::from_millis(2900), "the remainder, not a fixed 3 s, bounds the call: {took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_responsive_daemon_still_injects_within_the_remaining_budget() {
+    let url = mock_context(Duration::from_millis(50)).await;
+    let left = ctx::hook::inject_timeout(Duration::from_millis(1000)).unwrap();
+    let (out, _) = tokio::task::spawn_blocking(move || timed_inject(url, left)).await.unwrap();
+    let v: Value = serde_json::from_str(&out.expect("context is injected")).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["additionalContext"], "session mock · 2026-10-01: the fix");
+}

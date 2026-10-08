@@ -329,6 +329,7 @@ enum SourceArg {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         // Claude Code treats exit code 2 (clap's usage error) from a Stop/PreCompact hook as a
@@ -421,9 +422,11 @@ async fn main() -> anyhow::Result<()> {
             let payload = hook::read_stdin();
             // Fast path: skip the HTTP call when Claude inject is off. The daemon gates per
             // client too, so this only saves a round-trip.
-            if cfg.inject.enabled_claude {
+            if cfg.inject.enabled_claude
+                && let Some(timeout) = hook::inject_timeout(started.elapsed())
+            {
                 let url = cfg.embed_url.clone();
-                let out = tokio::task::spawn_blocking(move || hook::inject(&url, &payload, Duration::from_secs(3), |k| std::env::var(k).ok())).await;
+                let out = tokio::task::spawn_blocking(move || hook::inject(&url, &payload, timeout, |k| std::env::var(k).ok())).await;
                 if let Ok(Some(json)) = out {
                     println!("{json}");
                 }

@@ -37,9 +37,10 @@ const MIN_PROMPT_WORDS: usize = 3;
 const MAX_CONVERSATIONS: usize = 256;
 const TAG: &str = "past-sessions";
 /// Longest the lookup waits for the embedder while the indexer holds it (one batch can take
-/// ~2 s on the GPU). Past this the prompt goes without context: the hook's own timeout is 3 s,
-/// and an answer the hook no longer waits for would still mark its sessions as injected.
-const EMBED_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// ~2 s on the GPU). Past this the prompt goes without context. An answer the hook no longer
+/// waits for would still mark its sessions as injected, so the hook only calls when it can wait
+/// longer than this (`hook::MIN_INJECT_CALL`).
+pub(crate) const EMBED_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InjectConfig {

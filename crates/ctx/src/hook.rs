@@ -38,6 +38,20 @@ pub fn notify(embed_url: &str, target: Target, timeout: Duration, env: impl Fn(&
     }
 }
 
+/// Whole-process budget for `hook --inject`, counted from the start of `main`. A per-request cap
+/// alone is not enough: under memory pressure, start-up and stdin can eat the headroom, and
+/// Claude Code then kills the hook at its `timeout`, after the user has already waited for it.
+pub const INJECT_BUDGET: Duration = Duration::from_millis(3000);
+/// Less time than this left: skip the call. The daemon may wait `EMBED_WAIT` for the embedder
+/// and then embed and search; a hook that leaves before that still gets those sessions marked as
+/// injected for its conversation, so they would never be shown in it.
+const MIN_INJECT_CALL: Duration = crate::inject::EMBED_WAIT.saturating_add(Duration::from_millis(500));
+
+/// The timeout for the `/context` call when `elapsed` of the budget is gone, or `None` to skip it.
+pub fn inject_timeout(elapsed: Duration) -> Option<Duration> {
+    INJECT_BUDGET.checked_sub(elapsed).filter(|left| *left >= MIN_INJECT_CALL)
+}
+
 /// The `UserPromptSubmit` hook: asks the daemon for context matching the prompt in the hook
 /// payload and returns what to print, or `None` to add nothing. Like every hook here it never
 /// fails the prompt: a slow or absent daemon just means no context this time.
@@ -148,6 +162,15 @@ mod tests {
             (k == SUMMARIZER_ENV).then(|| "1".to_owned())
         });
         assert_eq!(outcome, Outcome::SkippedSummarizer);
+    }
+
+    #[test]
+    fn inject_gets_what_is_left_of_the_budget_or_is_skipped() {
+        assert_eq!(inject_timeout(Duration::ZERO), Some(INJECT_BUDGET));
+        assert_eq!(inject_timeout(Duration::from_millis(400)), Some(Duration::from_millis(2600)));
+        assert_eq!(inject_timeout(Duration::from_millis(1000)), Some(MIN_INJECT_CALL), "exactly the minimum still goes");
+        assert_eq!(inject_timeout(Duration::from_millis(1100)), None, "could leave before the daemon records what it injected");
+        assert_eq!(inject_timeout(Duration::from_secs(9)), None, "past the budget");
     }
 
     #[test]

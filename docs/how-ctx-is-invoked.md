@@ -22,9 +22,17 @@ Registered as a `UserPromptSubmit` hook in `~/.claude/settings.json`:
 "UserPromptSubmit": [
   { "hooks": [ { "type": "command",
       "command": "…\\agents-context\\bin\\ctx.exe",
-      "args": ["hook", "--inject"], "timeout": 5 } ] }
+      "args": ["hook", "--inject"], "timeout": 10 } ] }
 ]
 ```
+
+The hook gives up on its own about 3 s after `main` starts (`INJECT_BUDGET`). It
+skips the lookup when less than 2 s of that is left, because the daemon may wait
+1.5 s for the embedder, and a hook that leaves early would still have those
+sessions marked as already shown. The `timeout: 10` is a safety margin
+for a machine that stalls before the hook even runs, for example under memory
+pressure or on the first launch of a freshly installed `ctx.exe`. With `5` such a
+stall gets the hook killed, which means a warning and no context.
 
 On **every message you send**, `ctx hook --inject`:
 

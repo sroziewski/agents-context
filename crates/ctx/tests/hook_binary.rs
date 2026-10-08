@@ -50,3 +50,65 @@ fn other_commands_keep_normal_usage_errors() {
     let out = ctx().args(["no-such-command"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2), "usage errors outside hooks must stay visible");
 }
+
+async fn mock_daemon(delay: Duration) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let app = axum::Router::new().route(
+        "/context",
+        axum::routing::post(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                tokio::time::sleep(delay).await;
+                axum::Json(serde_json::json!({"context": "session mock: the fix"}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, calls)
+}
+
+fn run_inject_hook(url: &str) -> (std::process::Output, Duration) {
+    use std::io::Write;
+    ctx().arg("--help").output().unwrap();
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ctx"))
+        .args(["hook", "--inject"])
+        .env("CTX_EMBED_URL", url)
+        .env("CTX_INJECT_CLAUDE", "on")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"session_id":"s","cwd":"D:\\x","prompt":"how did we fix the directml gpu hang timeout","hook_event_name":"UserPromptSubmit"}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out, start.elapsed())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inject_hook_prints_context_from_a_responsive_daemon() {
+    let (url, calls) = mock_daemon(Duration::from_millis(50)).await;
+    let (out, _) = tokio::task::spawn_blocking(move || run_inject_hook(&url)).await.unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(r#""additionalContext":"session mock: the fix""#), "{stdout}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inject_hook_gives_up_on_a_slow_daemon_within_its_budget() {
+    let (url, calls) = mock_daemon(Duration::from_secs(10)).await;
+    let (out, took) = tokio::task::spawn_blocking(move || run_inject_hook(&url)).await.unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the call was made, then abandoned");
+    assert!(took < ctx::hook::INJECT_BUDGET + Duration::from_millis(700), "the whole process stays near the 3 s budget: {took:?}");
+}

@@ -157,7 +157,17 @@ enum Command {
         limit: usize,
     },
     /// Print a whole Teams meeting transcript.
-    Meeting { meeting_id: String },
+    Meeting {
+        meeting_id: String,
+        /// Transcript around this point ("mm:ss", as cited in the summary).
+        #[arg(long)]
+        at: Option<String>,
+        /// The whole transcript instead of the summary (paged with --from-line).
+        #[arg(long)]
+        transcript: bool,
+        #[arg(long, default_value_t = 0)]
+        from_line: usize,
+    },
     /// Read Jira issues (read-only).
     Jira {
         #[command(subcommand)]
@@ -627,10 +637,15 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", ctx::teams::format_meetings(&teams.search_meetings(&q).await?));
             Ok(())
         }
-        Command::Meeting { meeting_id } => {
+        Command::Meeting { meeting_id, at, transcript, from_line } => {
+            let view = match (at, transcript) {
+                (Some(at), _) => ctx::teams::MeetingView::Around { offset_s: ctx::teams::parse_offset(&at)? },
+                (None, true) => ctx::teams::MeetingView::Transcript { from_line },
+                (None, false) => ctx::teams::MeetingView::Summary,
+            };
             let store = Arc::new(connect_store(&cfg)?);
             let ctx = Context { store, embedder: Arc::new(Mutex::new(Box::new(embed::HashEmbedder::new(1)))) };
-            println!("{}", teams_search(&cfg, &ctx).meeting(&meeting_id, usize::MAX)?);
+            println!("{}", teams_search(&cfg, &ctx).meeting(&meeting_id, view)?);
             Ok(())
         }
         Command::Jira { action } => {

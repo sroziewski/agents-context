@@ -29,6 +29,57 @@ const EVIDENCE_CHARS: usize = 500;
 /// How far around a meeting its chat is read for `get_meeting`: links and notes are often posted
 /// just before it starts or right after it ends.
 const MEETING_CHAT_MARGIN_MS: i64 = 15 * 60 * 1000;
+/// One transcript page of `get_meeting`: ~8k tokens, under Claude Code's 10k MCP-output warning.
+pub const TRANSCRIPT_PAGE_CHARS: usize = 30_000;
+/// `get_meeting` at a cited `[mm:ss]`: a minute of lead-in, two minutes after.
+const AROUND_BEFORE_S: i64 = 60;
+const AROUND_AFTER_S: i64 = 120;
+
+/// What `get_meeting` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingView {
+    /// Participants, the AI summary, the meeting chat; the transcript only when there is no summary.
+    Summary,
+    /// The transcript around this many seconds into the meeting.
+    Around { offset_s: i64 },
+    /// The transcript, one page from this line (0-based).
+    Transcript { from_line: usize },
+}
+
+/// "39:20", "1:02:03" or plain seconds "2360" → seconds into the meeting.
+pub fn parse_offset(s: &str) -> anyhow::Result<i64> {
+    let parts: Vec<&str> = s.trim().trim_matches(|c| c == '[' || c == ']').split(':').collect();
+    let nums: Option<Vec<i64>> = parts.iter().map(|p| p.trim().parse::<i64>().ok().filter(|n| *n >= 0)).collect();
+    match nums.as_deref() {
+        Some([s]) => Ok(*s),
+        Some([m, s]) if *s < 60 => Ok(m * 60 + s),
+        Some([h, m, s]) if *m < 60 && *s < 60 => Ok(h * 3600 + m * 60 + s),
+        _ => anyhow::bail!("invalid time {s:?}; use mm:ss as cited in the summary, e.g. \"39:20\""),
+    }
+}
+
+fn mmss(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs >= 3600 { format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60) } else { format!("{:02}:{:02}", secs / 60, secs % 60) }
+}
+
+/// Appends transcript lines from `from_line` until the page is full, then where to continue.
+fn page(out: &mut String, lines: &[sources::teams::TranscriptLine], from_line: usize, render: &dyn Fn(&sources::teams::TranscriptLine) -> String) {
+    if from_line >= lines.len() && !lines.is_empty() {
+        out.push_str(&format!("(from_line {from_line} is past the end: {} lines)", lines.len()));
+        return;
+    }
+    let mut used = 0;
+    for (i, l) in lines.iter().enumerate().skip(from_line) {
+        let line = render(l);
+        if used + line.len() > TRANSCRIPT_PAGE_CHARS && used > 0 {
+            out.push_str(&format!("[lines {from_line}–{} of {}; continue with transcript=true, from_line={i}]", i - 1, lines.len()));
+            return;
+        }
+        used += line.len();
+        out.push_str(&line);
+    }
+}
 
 /// people.json. Insertion-ordered like the app's objects, so a person's tags come out in the
 /// same order as in the app.
@@ -593,43 +644,73 @@ impl TeamsSearch {
         Ok(self.meetings_store.search(&query, &f, depth as u64, SearchMode::Dense).await?)
     }
 
-    /// A whole meeting: title, participants, the AI summary (when present), then the transcript,
-    /// speaker-labelled and redacted. Summary and participants lead so that even a transcript long
-    /// enough to hit `max_chars` can't bury the two things most useful for "who was there / what
-    /// was decided".
-    pub fn meeting(&self, meeting_id: &str, max_chars: usize) -> anyhow::Result<String> {
+    /// One meeting, in the requested [`MeetingView`], redacted.
+    ///
+    /// The default view is the AI summary, not the transcript (DEV-60): a standup transcript runs to
+    /// ~35k tokens, while what was discussed, decided and assigned is in the summary, checked
+    /// against the transcripts to be faithful (its `[mm:ss]` citations all land inside the meeting,
+    /// and it reconstructs task ids the speech-to-text splits up). The transcript stays the source
+    /// for exact wording, reached cheaply through a cited `[mm:ss]` or page by page.
+    pub fn meeting(&self, meeting_id: &str, view: MeetingView) -> anyhow::Result<String> {
         let redactor = Redactor::from_file(&self.redact)?;
         let db = TeamsDb::open(&self.db)?;
         let m = db.meeting(meeting_id)?;
         let lines = db.transcript(meeting_id)?;
-        let participants = sources::teams::participants(&lines);
-        let mut out = format!("{} · {} – {} · {} lines\n", m.title, datetime(m.started_at), datetime(m.ended_at), lines.len());
-        if !participants.is_empty() {
-            out.push_str(&format!("Uczestnicy: {}\n", participants.join(", ")));
-        }
-        if m.has_summary()
-            && let Some(sum) = m.summary.as_deref()
-        {
-            out.push_str(&format!("\nPodsumowanie:\n{}\n", redactor.scrub(sum.trim()).0));
-        }
-        // Ahead of the transcript so truncation can't cut it: the chat is where the links and
-        // ticket ids mentioned aloud were actually posted.
-        let chat = db.chat_messages(&m.chat, m.started_at - MEETING_CHAT_MARGIN_MS, m.ended_at + MEETING_CHAT_MARGIN_MS)?;
-        if !chat.is_empty() {
-            out.push_str(&format!("\nCzat spotkania ({}):\n", m.chat));
-            for c in &chat {
-                out.push_str(&format!("{} ({}): {}\n", c.author, datetime(c.ts), redactor.scrub(c.text.trim()).0));
+        let offset = |l: &sources::teams::TranscriptLine| l.offset_s.unwrap_or((l.ts - m.started_at) / 1000).max(0);
+        let render_line = |l: &sources::teams::TranscriptLine| {
+            format!("[{}] {}: {}\n", mmss(offset(l)), l.speaker.as_deref().unwrap_or("—"), redactor.scrub(l.text.trim()).0)
+        };
+        let mut out = format!("{} · {} – {} · meeting {} · {} transcript lines\n", m.title, datetime(m.started_at), datetime(m.ended_at), m.id, lines.len());
+        let summary = m.summary.as_deref().filter(|_| m.has_summary());
+
+        match view {
+            MeetingView::Summary => {
+                let participants = sources::teams::participants(&lines);
+                if !participants.is_empty() {
+                    out.push_str(&format!("Uczestnicy: {}\n", participants.join(", ")));
+                }
+                if let Some(sum) = summary {
+                    out.push_str(&format!(
+                        "\nPodsumowanie (AI-written; [mm:ss] point into the transcript):\n{}\n",
+                        redactor.scrub(sum.trim()).0
+                    ));
+                }
+                // The chat is where the links and ticket ids mentioned aloud were actually posted.
+                let chat = db.chat_messages(&m.chat, m.started_at - MEETING_CHAT_MARGIN_MS, m.ended_at + MEETING_CHAT_MARGIN_MS)?;
+                if !chat.is_empty() {
+                    out.push_str(&format!("\nCzat spotkania ({}):\n", m.chat));
+                    for c in &chat {
+                        out.push_str(&format!("{} ({}): {}\n", c.author, datetime(c.ts), redactor.scrub(c.text.trim()).0));
+                    }
+                }
+                if summary.is_some() {
+                    out.push_str(&format!(
+                        "\nTranskrypcja: {} lines, not shown. To quote or check exact wording, call get_meeting with \
+                         at=\"mm:ss\" (that moment) or transcript=true (paged); don't quote the summary.",
+                        lines.len()
+                    ));
+                } else {
+                    // Without a summary the transcript is all there is: show its first page.
+                    out.push_str("\nTranskrypcja (no AI summary for this meeting):\n");
+                    page(&mut out, &lines, 0, &render_line);
+                }
             }
-        }
-        out.push_str("\nTranskrypcja:\n");
-        for (i, l) in lines.iter().enumerate() {
-            let who = l.speaker.as_deref().unwrap_or("—");
-            let line = format!("{who} ({}): {}\n", datetime(l.ts), redactor.scrub(l.text.trim()).0);
-            if out.len() + line.len() > max_chars {
-                out.push_str(&format!("[transcript truncated: {i} of {} lines shown]", lines.len()));
-                return Ok(out.trim_end().to_owned());
+            MeetingView::Around { offset_s } => {
+                let (from, to) = (offset_s - AROUND_BEFORE_S, offset_s + AROUND_AFTER_S);
+                out.push_str(&format!("\nTranskrypcja {}–{}:\n", mmss(from.max(0)), mmss(to)));
+                let window: Vec<_> = lines.iter().filter(|l| (from..=to).contains(&offset(l))).collect();
+                if window.is_empty() {
+                    let last = lines.last().map_or(0, offset);
+                    out.push_str(&format!("(no transcript lines there; the transcript runs 00:00–{})", mmss(last)));
+                }
+                for l in window {
+                    out.push_str(&render_line(l));
+                }
             }
-            out.push_str(&line);
+            MeetingView::Transcript { from_line } => {
+                out.push_str("\nTranskrypcja:\n");
+                page(&mut out, &lines, from_line, &render_line);
+            }
         }
         Ok(out.trim_end().to_owned())
     }
@@ -806,6 +887,17 @@ mod tests {
     fn message_body_strips_header_and_context() {
         let chunk = "[T / C · 2026-09-20]\nThread: opening\nPrevious: Piotr: sprawdzam\nAnna (2026-09-20 10:00): ok, zrobione";
         assert_eq!(message_body(chunk), "ok, zrobione");
+    }
+
+    #[test]
+    fn offsets_parse_as_cited_and_render_back() {
+        assert_eq!(parse_offset("39:20").unwrap(), 2360);
+        assert_eq!(parse_offset(" [1:02:03] ").unwrap(), 3723);
+        assert_eq!(parse_offset("95").unwrap(), 95);
+        for bad in ["", "1:75", "a:b", "-3", "1:2:3:4", "1:60:00"] {
+            assert!(parse_offset(bad).is_err(), "{bad}");
+        }
+        assert_eq!((mmss(2360), mmss(5), mmss(3723), mmss(-4)), ("39:20".into(), "00:05".into(), "1:02:03".into(), "00:00".into()));
     }
 
     #[test]

@@ -315,7 +315,8 @@ async fn get_meeting_assembles_the_transcript_speaker_labelled_and_ordered() {
     let c = e.client(r"Z:\work\other", true).await;
     let t = ok(&c, "get_meeting", json!({"meeting_id": "mtg1"})).await;
     assert!(t.starts_with("Standup 29 Sep · "), "{t}");
-    assert!(t.contains("— ("), "the system line is shown with a neutral speaker");
+    assert!(t.contains("[00:00] —: started transcription"), "the system line is shown with a neutral speaker: {t}");
+    assert!(t.contains("Transkrypcja (no AI summary for this meeting):"), "no summary, so the transcript is shown: {t}");
     assert!(t.find("migrację").unwrap() < t.find("deployment").unwrap(), "lines in spoken order");
 }
 
@@ -359,9 +360,9 @@ async fn get_meeting_leads_with_cleaned_participants_and_the_summary() {
     // The participants line is the cleaned roster (the raw per-line transcript labels stay faithful).
     let roster = t.lines().find(|l| l.starts_with("Uczestnicy:")).expect("participants line");
     assert_eq!(roster, "Uczestnicy: Ewa Lis, Jan Nowak", "cleaned, deduped, sorted");
-    assert!(t.contains("Podsumowanie:") && t.contains("feature flagi w pazdzierniku"), "{t}");
-    assert!(t.find("Uczestnicy:").unwrap() < t.find("Podsumowanie:").unwrap(), "participants first");
-    assert!(t.find("Podsumowanie:").unwrap() < t.find("Transkrypcja:").unwrap(), "summary leads the transcript");
+    assert!(t.contains("Podsumowanie (AI-written") && t.contains("feature flagi w pazdzierniku"), "{t}");
+    assert!(t.find("Uczestnicy:").unwrap() < t.find("Podsumowanie (").unwrap(), "participants first");
+    assert!(t.find("Podsumowanie (").unwrap() < t.find("Transkrypcja:").unwrap(), "summary leads the transcript pointer");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -403,7 +404,7 @@ async fn get_meeting_shows_what_was_posted_in_its_chat_during_it() {
     let c = e.client(r"Z:\work\other", true).await;
     let t = ok(&c, "get_meeting", json!({"meeting_id": "mtg1"})).await;
     let chat = t.find("Czat spotkania (chat):").expect("chat section");
-    assert!(chat < t.find("Transkrypcja:").unwrap(), "chat leads the transcript so truncation can't cut it: {t}");
+    assert!(chat < t.find("Transkrypcja").unwrap(), "chat leads the transcript: {t}");
     assert!(t.contains("Dawid Lubicz (") && t.contains("SEDN26-1955"), "{t}");
     assert!(!t.contains("innego dnia"), "only messages around the meeting: {t}");
     assert!(!t.contains("plainsecret1"), "chat text is redacted: {t}");
@@ -467,4 +468,91 @@ async fn teams_threshold_edits_in_env_apply_without_a_restart() {
     write("1.01");
     let closed = injector.context(&req).await.unwrap();
     assert!(closed.threads.is_empty(), "and a later edit applies too: {closed:?}");
+}
+
+/// A summarised meeting with real offsets: lines at 00:00, 01:40, 39:20, 40:00, 43:20 plus `filler`
+/// long lines after them, for paging.
+fn summarised_meeting(e: &Env, filler: usize) {
+    let c = Connection::open(&e.teams.db).unwrap();
+    c.execute(
+        "insert into meetings values ('mtg3', 'chat3', 'Planowanie', 'occ', 100000, 4000000, ?1, 'ok', 'ok', 0)",
+        params!["## Decyzje\n- Tomasz usunął 1293 zduplikowane zadania [39:20]."],
+    )
+    .unwrap();
+    let line = |idx: i64, offset: i64, speaker: &str, text: &str| {
+        c.execute(
+            "insert into transcript_lines (meeting_id, idx, speaker, offset_s, ts, text, indexed_at) values ('mtg3', ?1, ?2, ?3, ?4, ?5, 0)",
+            params![idx, speaker, offset, 100000 + offset * 1000, text],
+        )
+        .unwrap();
+    };
+    line(0, 0, "Anna Lis", "zaczynamy planowanie");
+    line(1, 100, "Jan Nowak", "lista ekspertów gotowa");
+    line(2, 2360, "Tomasz Chmiel", "usunąłem tysiąc dwieście dziewięćdziesiąt trzy zduplikowane zadania, klucz plainsecret1");
+    line(3, 2400, "Anna Lis", "dzięki, to zamyka błąd 500");
+    line(4, 2600, "Jan Nowak", "kończymy");
+    for i in 0..filler as i64 {
+        line(5 + i, 2700 + i, "Ewa Lis", &format!("wypełniacz {i} {}", "x".repeat(1_000)));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_meeting_defaults_to_the_summary_and_points_at_the_transcript() {
+    let e = env().await;
+    summarised_meeting(&e, 0);
+    let c = e.client(r"Z:\work\other", true).await;
+    let t = ok(&c, "get_meeting", json!({"meeting_id": "mtg3"})).await;
+    assert!(t.contains("Podsumowanie (AI-written; [mm:ss] point into the transcript):\n## Decyzje"), "{t}");
+    assert!(t.contains("Transkrypcja: 5 lines, not shown") && t.contains("at=\"mm:ss\""), "{t}");
+    assert!(!t.contains("zaczynamy planowanie") && !t.contains("zamyka błąd"), "no transcript lines by default: {t}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_meeting_at_a_cited_time_returns_only_that_stretch_redacted() {
+    let e = env().await;
+    summarised_meeting(&e, 0);
+    let c = e.client(r"Z:\work\other", true).await;
+    let t = ok(&c, "get_meeting", json!({"meeting_id": "mtg3", "at": "39:20"})).await;
+    assert!(t.contains("Transkrypcja 38:20–41:20:\n[39:20] Tomasz Chmiel: usunąłem"), "{t}");
+    assert!(t.contains("[40:00] Anna Lis: dzięki"), "{t}");
+    assert!(!t.contains("[01:40]") && !t.contains("[43:20]") && !t.contains("Podsumowanie"), "only the window: {t}");
+    assert!(!t.contains("plainsecret1") && t.contains("[REDACTED:listed]"), "{t}");
+
+    let empty = ok(&c, "get_meeting", json!({"meeting_id": "mtg3", "at": "1:30:00"})).await;
+    assert!(empty.contains("(no transcript lines there; the transcript runs 00:00–43:20)"), "{empty}");
+    let bad = call(&c, "get_meeting", json!({"meeting_id": "mtg3", "at": "39:75"})).await;
+    assert_eq!(bad.is_error, Some(true));
+    assert!(text(&bad).contains("invalid time"), "{}", text(&bad));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_meeting_transcript_pages_until_the_end() {
+    let e = env().await;
+    summarised_meeting(&e, 60);
+    let c = e.client(r"Z:\work\other", true).await;
+    let first = ok(&c, "get_meeting", json!({"meeting_id": "mtg3", "transcript": true})).await;
+    assert!(first.len() < ctx::teams::TRANSCRIPT_PAGE_CHARS + 1_000, "one page: {}", first.len());
+    assert!(first.contains("[00:00] Anna Lis: zaczynamy planowanie") && !first.contains("Podsumowanie"), "starts at line 0, transcript only");
+    assert!(!first.contains("plainsecret1"), "redacted in pages too");
+    let next: usize = first.rsplit("from_line=").next().unwrap().trim_end_matches(']').parse().unwrap();
+    assert!(first.trim_end().ends_with(&format!("of 65; continue with transcript=true, from_line={next}]")), "{}", &first[first.len() - 120..]);
+
+    let mut from = next;
+    let mut pages = 1;
+    loop {
+        let p = ok(&c, "get_meeting", json!({"meeting_id": "mtg3", "transcript": true, "from_line": from})).await;
+        pages += 1;
+        assert!(p.contains(&format!("wypełniacz {} ", from - 5)), "page starts where the last one stopped");
+        match p.rsplit_once("from_line=") {
+            Some((_, n)) if p.trim_end().ends_with(']') => from = n.trim_end_matches(']').parse().unwrap(),
+            _ => {
+                assert!(p.contains("wypełniacz 59 "), "the last page reaches the end");
+                break;
+            }
+        }
+        assert!(pages < 10, "paging must terminate");
+    }
+    assert!(pages >= 3, "60 long lines span several pages: {pages}");
+    let past = ok(&c, "get_meeting", json!({"meeting_id": "mtg3", "transcript": true, "from_line": 500})).await;
+    assert!(past.contains("(from_line 500 is past the end: 65 lines)"), "{past}");
 }

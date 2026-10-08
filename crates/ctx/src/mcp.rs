@@ -122,9 +122,6 @@ pub struct TeamsThreadArgs {
 
 /// Largest `get_teams_thread` answer.
 const MAX_THREAD_CHARS: usize = 40_000;
-/// Largest `get_meeting` answer. Bigger than a thread: a standup transcript runs long, and the
-/// whole meeting is the point of the tool (summary + participants lead, so the tail is what's cut).
-const MAX_MEETING_CHARS: usize = 120_000;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MeetingArgs {
@@ -144,6 +141,13 @@ pub struct MeetingArgs {
 pub struct MeetingGetArgs {
     /// Meeting id as shown in search_meetings results.
     pub meeting_id: String,
+    /// Transcript around this point, "mm:ss" as cited in the summary (e.g. "39:20"): a minute
+    /// before to two minutes after. Use it to quote or check a summary point.
+    pub at: Option<String>,
+    /// The whole transcript instead of the summary, paged.
+    pub transcript: Option<bool>,
+    /// With transcript=true: first line of the page (0-based), as given at the end of a page.
+    pub from_line: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -235,7 +239,8 @@ impl ContextServer {
 
     /// Search the organisation's Teams meeting transcripts (standups etc.) by meaning and
     /// keywords; results are meetings with their best matching line and speaker. Filter by
-    /// speaker or date. Open the full transcript with get_meeting.
+    /// speaker or date. Open one with get_meeting (its summary; the transcript
+    /// at a given time for quotes).
     #[tool(name = "search_meetings")]
     pub async fn search_meetings(&self, Parameters(a): Parameters<MeetingArgs>) -> Result<String, String> {
         let teams = self.teams()?;
@@ -253,8 +258,10 @@ impl ContextServer {
         Ok(crate::teams::format_meetings(&r))
     }
 
-    /// A whole Teams meeting: participants, AI summary, what was posted in the meeting's chat
-    /// during it (links, ticket ids), then the transcript, every line speaker-labelled (redacted).
+    /// A Teams meeting. By default: participants, the AI summary (cites [mm:ss] into the
+    /// transcript) and what was posted in the meeting's chat (links, ticket ids). The raw
+    /// transcript is for exact wording: at="mm:ss" gives that moment, transcript=true the whole
+    /// transcript paged. Quote or cite only from the transcript, never from the summary.
     #[tool(name = "get_meeting")]
     pub async fn get_meeting(&self, Parameters(a): Parameters<MeetingGetArgs>) -> Result<String, String> {
         let teams = self.teams()?.clone();
@@ -262,7 +269,12 @@ impl ContextServer {
         if id.is_empty() {
             return Err("meeting_id must not be empty".into());
         }
-        tokio::task::spawn_blocking(move || teams.meeting(&id, MAX_MEETING_CHARS)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+        let view = match (a.at.as_deref(), a.transcript.unwrap_or(false)) {
+            (Some(at), _) => crate::teams::MeetingView::Around { offset_s: crate::teams::parse_offset(at).map_err(|e| e.to_string())? },
+            (None, true) => crate::teams::MeetingView::Transcript { from_line: a.from_line.unwrap_or(0) as usize },
+            (None, false) => crate::teams::MeetingView::Summary,
+        };
+        tokio::task::spawn_blocking(move || teams.meeting(&id, view)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
     }
 
     fn scope(&self, scope: Option<&str>, project: Option<&str>) -> Result<Scope, String> {
@@ -423,7 +435,8 @@ impl ServerHandler for ContextServer {
              prefer recent sessions when results conflict. search_teams / get_teams_thread cover the \
              organisation's Teams channels and the user's private Teams chats, shared by all projects; \
              author roles in brackets come from the team directory. search_meetings / get_meeting cover \
-             Teams meeting transcripts (standups etc.), filterable by speaker and date.",
+             Teams meetings (standups etc.), filterable by speaker and date; get_meeting answers with the \
+             AI summary, and quotes must come from the transcript (get_meeting at=\"mm:ss\").",
             self.current_project
         ))
     }

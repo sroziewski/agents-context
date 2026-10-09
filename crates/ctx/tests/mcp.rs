@@ -99,7 +99,7 @@ async fn lists_the_tools_with_schemas_and_instructions() {
     names.sort();
     assert_eq!(names, [
         "deep_search_sessions", "get_jira_issue", "get_meeting", "get_session", "get_teams_thread", "jira_add_comment",
-        "jira_transition_issue", "list_projects", "list_sessions", "search_jira", "search_meetings", "search_sessions", "search_teams"
+        "jira_transition_issue", "list_projects", "list_sessions", "search_confluence", "search_jira", "search_meetings", "search_sessions", "search_teams"
     ]);
     let search = tools.iter().find(|t| t.name == "search_sessions").unwrap();
     let props = search.input_schema.get("properties").unwrap();

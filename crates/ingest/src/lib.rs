@@ -2,6 +2,7 @@
 
 pub mod batch;
 pub mod chunk;
+pub mod confluence;
 pub mod indexer;
 pub mod jira;
 pub mod rescan;

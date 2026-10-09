@@ -304,6 +304,24 @@ impl State {
         Ok(removed)
     }
 
+    /// Ids recorded for `source` that start with `prefix`, e.g. the pages of one Confluence space
+    /// (`SPACE/`), so a sync can drop the ones its source no longer lists.
+    pub fn ids_with_prefix(&self, source: &str, prefix: &str) -> rusqlite::Result<Vec<String>> {
+        // Not LIKE: it ignores ASCII case, so `SEDN/` would also return `sedn/…`, and a sync would
+        // then delete the pages it had just written under the corrected key.
+        let mut stmt = self.conn.prepare(
+            "select session_id from indexed where source = ?1 and substr(session_id, 1, length(?2)) = ?2 order by session_id",
+        )?;
+        let rows = stmt.query_map(params![source, prefix], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// Forgets one indexed item of `source`, leaving same-named ids of other sources alone.
+    pub fn forget(&self, source: &str, id: &str) -> rusqlite::Result<()> {
+        self.conn.execute("delete from indexed where source = ?1 and session_id = ?2", params![source, id])?;
+        Ok(())
+    }
+
     pub fn summary_count(&self) -> rusqlite::Result<usize> {
         self.conn.query_row("select count(*) from summaries", [], |r| r.get::<_, i64>(0)).map(|n| n as usize)
     }
@@ -329,6 +347,22 @@ mod tests {
 
     fn rec<'a>(source: &'a str, id: &'a str, fp: &'a str, project: &'a str, chunks: usize) -> Record<'a> {
         Record { source, session_id: id, fingerprint: fp, project, chunks, ..Default::default() }
+    }
+
+    #[test]
+    fn ids_by_prefix_stay_within_their_source_and_treat_like_wildcards_literally() {
+        let s = State::in_memory().unwrap();
+        for (source, id) in [("confluence", "SEDN/1"), ("confluence", "SEDN/2"), ("confluence", "SEDNX/3"), ("confluence", "S_DN/4"), ("jira", "SEDN/9")] {
+            s.record(&rec(source, id, "1", "", 1), 0).unwrap();
+        }
+        assert_eq!(s.ids_with_prefix("confluence", "SEDN/").unwrap(), ["SEDN/1", "SEDN/2"]);
+        assert_eq!(s.ids_with_prefix("confluence", "S_DN/").unwrap(), ["S_DN/4"], "`_` is not a LIKE wildcard here");
+        s.record(&rec("confluence", "sedn/5", "1", "", 1), 0).unwrap();
+        assert_eq!(s.ids_with_prefix("confluence", "SEDN/").unwrap(), ["SEDN/1", "SEDN/2"], "case-sensitive");
+
+        s.forget("confluence", "SEDN/1").unwrap();
+        assert_eq!(s.ids_with_prefix("confluence", "SEDN/").unwrap(), ["SEDN/2"]);
+        assert!(s.get("jira", "SEDN/9").unwrap().is_some(), "another source's same-named id is left alone");
     }
 
     #[test]

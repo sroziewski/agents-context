@@ -283,6 +283,19 @@ impl Store {
         self.delete_matching_except(filter, &[]).await
     }
 
+    /// Sets `fields` on every point matching `filter`, keeping their vectors and other fields.
+    /// Refuses an empty filter, like the deletes.
+    pub async fn set_payload(&self, filter: &SearchFilter, fields: Map<String, Value>) -> Result<()> {
+        let Some(f) = filter.to_qdrant().filter(|f| !f.must.is_empty()) else {
+            return Err(StoreError::Payload("refusing to update with an empty filter".into()));
+        };
+        let payload = qdrant_client::Payload::try_from(Value::Object(fields)).map_err(|e| StoreError::Payload(e.to_string()))?;
+        self.client
+            .set_payload(qdrant_client::qdrant::SetPayloadPointsBuilder::new(&self.collection, payload).points_selector(f).wait(true))
+            .await?;
+        Ok(())
+    }
+
     /// Distinct string values of `field` across points matching `filter` (e.g. the `session_id`s
     /// about to be pruned, so their state rows can be removed too).
     pub async fn distinct_payload(&self, filter: &SearchFilter, field: &str, limit: u32) -> Result<Vec<String>> {

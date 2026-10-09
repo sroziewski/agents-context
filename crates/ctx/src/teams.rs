@@ -164,7 +164,8 @@ pub fn load_project_groups(path: &Path) -> anyhow::Result<HashMap<String, Vec<St
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let raw: HashMap<String, Vec<String>> = serde_json::from_str(text.trim_start_matches('\u{feff}'))?;
-            Ok(raw.into_iter().map(|(dir, groups)| (sources::project::key(&dir), groups)).collect())
+            // normalise, not key: see `jira::load_project_keys`.
+            Ok(raw.into_iter().map(|(dir, groups)| (sources::project::normalise(&dir), groups)).collect())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
         Err(e) => Err(e.into()),

@@ -94,6 +94,7 @@ pub async fn indexed(fixtures: &[Fixture]) -> Env {
         None,
         None,
         None,
+        None,
     );
     let queue = IndexQueue::start(runner, Duration::from_millis(10));
     queue.request(Target::All);

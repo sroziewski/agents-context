@@ -1,6 +1,7 @@
 //! `ctx`: local memory over agent sessions — embedding daemon, indexer CLI and MCP server.
 
 pub mod config;
+pub mod confluence;
 pub mod embed_server;
 pub mod eval;
 pub mod factcheck;
@@ -155,6 +156,31 @@ pub async fn run_jira_index(
     Ok(ingest::jira::sync_jira(store, embedder, counter, state, &jira, &keys, &config, opts.as_ref(), now).await?)
 }
 
+/// Index of the Confluence spaces mapped in `confluence-projects.json`: pages with a new version
+/// only, and pages gone from a space removed.
+pub async fn run_confluence_index(
+    cfg: &config::Config,
+    store: &Store,
+    embedder: &mut dyn Embedder,
+    model: &str,
+    counter: &dyn TokenCounter,
+    state: &State,
+    redactor: &ingest::Redactor,
+) -> anyhow::Result<ingest::confluence::ConfluenceReport> {
+    if state.ensure_version(&index_version(model))? {
+        eprintln!("model or chunker changed: re-indexing everything");
+    }
+    let client = cfg.confluence().ok_or_else(|| anyhow::anyhow!("Confluence is not configured (CONFLUENCE_URL / CONFLUENCE_TOKEN)"))?;
+    let units = confluence::all_units(&cfg.confluence_projects)?;
+    anyhow::ensure!(!units.is_empty(), "no Confluence spaces or pages mapped in {}", cfg.confluence_projects.display());
+    store.ensure_collection(ingest::confluence::CONFLUENCE_FIELDS).await?;
+    let mut config = IndexConfig::default();
+    config.chunk.redactor = redactor.clone();
+    let now = jiff::Timestamp::now().as_millisecond();
+    // The client is blocking (ureq); the caller already runs this on a blocking thread.
+    Ok(ingest::confluence::sync_confluence(store, embedder, counter, state, &client, &units, &config, now).await?)
+}
+
 pub fn format_report(r: &Report, elapsed: std::time::Duration) -> String {
     format!(
         "scanned {} · indexed {} · unchanged {} · empty {} · failed {} · {} chunks · {} secrets redacted · {:.1?}",
@@ -184,6 +210,7 @@ pub fn daemon_runner(
     teams_store: Option<std::sync::Arc<Store>>,
     meetings_store: Option<std::sync::Arc<Store>>,
     jira_store: Option<std::sync::Arc<Store>>,
+    confluence_store: Option<std::sync::Arc<Store>>,
 ) -> queue::Runner {
     std::sync::Arc::new(move |target: queue::Target| {
         let (cfg, store, counter, mut embedder, model) = (cfg.clone(), store.clone(), counter.clone(), embedder.clone(), model.clone());
@@ -191,6 +218,7 @@ pub fn daemon_runner(
         let teams_store = teams_store.clone();
         let meetings_store = meetings_store.clone();
         let jira_store = jira_store.clone();
+        let confluence_store = confluence_store.clone();
         Box::pin(async move {
             let handle = tokio::runtime::Handle::current();
             // The indexer embeds synchronously; run it on a blocking thread so HTTP handlers
@@ -256,6 +284,29 @@ pub fn daemon_runner(
                             Err(e) => {
                                 eprintln!("[jira] FAILED: {e:#}");
                                 parts.push(format!("jira: FAILED ({e})"));
+                            }
+                        }
+                    }
+                    if let (true, Some(confluence)) = (target.includes_confluence(), &confluence_store) {
+                        match run_confluence_index(&cfg, confluence, &mut embedder, &model, counter.as_ref(), &state, &redactor).await {
+                            Ok(c) => {
+                                for (id, error) in &c.report.failed {
+                                    eprintln!("[confluence]   FAILED {id}: {error}");
+                                }
+                                let r = &c.report;
+                                parts.push(format!(
+                                    "confluence: scanned {} · indexed {} · unchanged {} · removed {} · failed {} · {} chunks",
+                                    r.scanned,
+                                    r.indexed,
+                                    r.unchanged,
+                                    c.removed,
+                                    r.failed.len(),
+                                    r.chunks
+                                ));
+                            }
+                            Err(e) => {
+                                eprintln!("[confluence] FAILED: {e:#}");
+                                parts.push(format!("confluence: FAILED ({e})"));
                             }
                         }
                     }

@@ -84,6 +84,15 @@ pub struct Config {
     /// CLI; `vision_model` is the model id and `vision_api_key` the optional bearer token.
     pub vision_url: Option<String>,
     pub vision_api_key: Option<String>,
+    /// Confluence Data Center base URL and Personal Access Token (`CONFLUENCE_URL` /
+    /// `CONFLUENCE_TOKEN`, in the config .env). The integration is off when either is unset.
+    pub confluence_url: Option<String>,
+    pub confluence_token: Option<String>,
+    /// `confluence-projects.json`: project directory → the space keys indexed and searched for it.
+    pub confluence_projects: PathBuf,
+    pub confluence_collection: String,
+    /// Local times to index Confluence at (`CTX_CONFLUENCE_INDEX_TIMES`).
+    pub confluence_index_times: Vec<(u32, u32)>,
 }
 
 /// Off: on the real query set (2026-09-27, 33 queries) every weight tried lowered MRR and none
@@ -105,6 +114,14 @@ impl Config {
     pub fn jira(&self) -> Option<crate::jira::Jira> {
         match (&self.jira_url, &self.jira_token) {
             (Some(url), Some(token)) => Some(crate::jira::Jira::new(url, token)),
+            _ => None,
+        }
+    }
+
+    /// A Confluence client, or `None` when the URL or token is unset (integration off).
+    pub fn confluence(&self) -> Option<crate::confluence::Confluence> {
+        match (&self.confluence_url, &self.confluence_token) {
+            (Some(url), Some(token)) => Some(crate::confluence::Confluence::new(url, token)),
             _ => None,
         }
     }
@@ -194,6 +211,12 @@ impl Config {
             jira_image_max_bytes: get("CTX_JIRA_IMAGE_MAX_BYTES").and_then(|v| v.trim().parse().ok()).unwrap_or(5 * 1024 * 1024),
             vision_url: get("CTX_VISION_URL").map(|u| u.trim().trim_end_matches('/').to_owned()).filter(|u| !u.is_empty()),
             vision_api_key: get("CTX_VISION_API_KEY").filter(|k| !k.is_empty()),
+            confluence_url: get("CONFLUENCE_URL").map(|u| u.trim().trim_end_matches('/').to_owned()).filter(|u| !u.is_empty()),
+            confluence_token: get("CONFLUENCE_TOKEN").filter(|t| !t.is_empty()),
+            confluence_projects: path("CONFLUENCE_PROJECTS", Self::config_dir().join("confluence-projects.json")),
+            confluence_collection: get("CTX_CONFLUENCE_COLLECTION").unwrap_or_else(|| "confluence".into()),
+            // Half an hour after Jira's slots, so the two runs do not queue behind each other.
+            confluence_index_times: parse_times(get("CTX_CONFLUENCE_INDEX_TIMES").as_deref().unwrap_or("10:30,17:30")),
         }
     }
 }
@@ -360,6 +383,22 @@ mod tests {
         let c = Config::from_env(|k| (k == "CTX_JIRA_INDEX_TIMES").then(|| "08:15".to_owned()));
         assert_eq!(c.jira_index_times, [(8, 15)]);
         assert_eq!(Config::from_env(|_| None).jira_index_times, [(10, 0), (17, 0)]);
+    }
+
+    #[test]
+    fn confluence_is_off_until_both_url_and_token_are_set() {
+        assert!(Config::from_env(|_| None).confluence().is_none());
+        let url_only = Config::from_env(|k| (k == "CONFLUENCE_URL").then(|| "https://confluence.example.org/".to_owned()));
+        assert_eq!(url_only.confluence_url.as_deref(), Some("https://confluence.example.org"));
+        assert!(url_only.confluence().is_none());
+        let both = Config::from_env(|k| match k {
+            "CONFLUENCE_URL" => Some("https://confluence.example.org".into()),
+            "CONFLUENCE_TOKEN" => Some("tok".into()),
+            _ => None,
+        });
+        assert!(both.confluence().is_some());
+        assert_eq!(both.confluence_collection, "confluence");
+        assert_eq!(both.confluence_index_times, [(10, 30), (17, 30)]);
     }
 
     #[test]

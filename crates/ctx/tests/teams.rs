@@ -133,7 +133,7 @@ async fn env() -> Env {
     let meetings_store = Arc::new(Store::connect(&q.url, None, "meetings", DIM).unwrap());
     let shared = SharedEmbedder::new(Box::new(HashEmbedder::new(DIM)));
     let runner =
-        ctx::daemon_runner(cfg.clone(), sessions.clone(), Arc::new(WordCounter), shared, "hash".into(), None, Some(teams_store.clone()), Some(meetings_store.clone()), None);
+        ctx::daemon_runner(cfg.clone(), sessions.clone(), Arc::new(WordCounter), shared, "hash".into(), None, Some(teams_store.clone()), Some(meetings_store.clone()), None, None);
     let queue = IndexQueue::start(runner, Duration::from_millis(10));
     queue.request(Target::Teams);
     // Wait generously (gRPC is slow when many container-backed tests run at once) and fail loudly

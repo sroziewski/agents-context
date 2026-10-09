@@ -24,6 +24,8 @@ pub enum Target {
     /// Jira only. Deliberately not part of `All`: Jira is indexed on its own twice-daily
     /// schedule, not on the frequent session/Teams runs.
     Jira,
+    /// Confluence only; like Jira, on its own schedule and never part of `All`.
+    Confluence,
     All,
 }
 
@@ -37,7 +39,7 @@ impl Target {
         match self {
             Target::Claude => Some(Sources::Claude),
             Target::Opencode => Some(Sources::OpenCode),
-            Target::Teams | Target::Jira => None,
+            Target::Teams | Target::Jira | Target::Confluence => None,
             Target::All => Some(Sources::All),
         }
     }
@@ -50,6 +52,15 @@ impl Target {
     /// --source jira`), never as part of `All`.
     pub fn includes_jira(self) -> bool {
         matches!(self, Target::Jira)
+    }
+
+    pub fn includes_confluence(self) -> bool {
+        matches!(self, Target::Confluence)
+    }
+
+    /// Targets that always run on their own instead of merging with others into `All`.
+    fn standalone(self) -> bool {
+        matches!(self, Target::Jira | Target::Confluence)
     }
 }
 
@@ -151,10 +162,12 @@ async fn worker(mut rx: mpsc::UnboundedReceiver<Target>, runner: Runner, debounc
         // it into `All` would drop it (All excludes Jira), so a Jira request coalesced with an
         // All request would silently never run. Instead each side is its own run.
         let mut sessions_teams: Option<Target> = None;
-        let mut jira = false;
+        let mut standalone: Vec<Target> = Vec::new();
         let mut consider = |t: Target| {
-            if t.includes_jira() {
-                jira = true;
+            if t.standalone() {
+                if !standalone.contains(&t) {
+                    standalone.push(t);
+                }
             } else {
                 sessions_teams = Some(sessions_teams.map_or(t, |acc: Target| acc.merge(t)));
             }
@@ -163,7 +176,7 @@ async fn worker(mut rx: mpsc::UnboundedReceiver<Target>, runner: Runner, debounc
         while let Ok(more) = rx.try_recv() {
             consider(more);
         }
-        for target in sessions_teams.into_iter().chain(jira.then_some(Target::Jira)) {
+        for target in sessions_teams.into_iter().chain(standalone) {
             run_and_record(&runner, target, &status).await;
         }
     }
@@ -230,6 +243,21 @@ mod tests {
         settle(&q, 2).await;
         let got = runs.lock().unwrap().clone();
         assert!(got.contains(&Target::All) && got.contains(&Target::Jira), "both ran: {got:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn confluence_and_jira_each_run_once_beside_all() {
+        let (runner, runs) = recording(None);
+        let q = IndexQueue::start(runner, Duration::from_millis(30));
+        q.request(Target::Confluence);
+        q.request(Target::All);
+        q.request(Target::Jira);
+        q.request(Target::Confluence);
+        settle(&q, 3).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(*runs.lock().unwrap(), [Target::All, Target::Confluence, Target::Jira]);
+        assert!(Target::Confluence.includes_confluence() && Target::Confluence.sessions().is_none());
+        assert!(!Target::All.includes_confluence() && !Target::Confluence.includes_jira() && !Target::Confluence.includes_teams());
     }
 
     /// Records every run's target; each run blocks until `release` is notified when gated.

@@ -90,6 +90,18 @@ pub struct JiraSearchArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ConfluenceSearchArgs {
+    /// What to look for, in plain words (Polish or English).
+    pub query: String,
+    /// Scope to this project directory's spaces instead of the current project's.
+    pub project: Option<String>,
+    /// Search every indexed space.
+    pub all: Option<bool>,
+    /// Number of pages, 1-30 (default 6).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct JiraIssueArgs {
     /// Issue key, e.g. HD-1410, or just the number (1410) for the current project's Jira key.
     pub key: String,
@@ -164,13 +176,37 @@ pub struct ContextServer {
     rerank: Option<(String, u64)>,
     /// Read-only Jira; `None` when JIRA_URL/JIRA_TOKEN are unset.
     jira: Option<crate::jira::JiraSearch>,
+    /// Search over indexed Confluence pages; `None` without a space mapping.
+    confluence: Option<crate::confluence::ConfluenceSearch>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl ContextServer {
     pub fn new(ctx: Context, current_project: String, state_path: PathBuf) -> Self {
-        Self { ctx, current_project, state_path, teams: None, mode: store::SearchMode::Hybrid, recency: crate::rank::Recency::OFF, rerank: None, jira: None, tool_router: Self::tool_router() }
+        Self {
+            ctx,
+            current_project,
+            state_path,
+            teams: None,
+            mode: store::SearchMode::Hybrid,
+            recency: crate::rank::Recency::OFF,
+            rerank: None,
+            jira: None,
+            confluence: None,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Enable `search_confluence`.
+    pub fn with_confluence(mut self, confluence: crate::confluence::ConfluenceSearch) -> Self {
+        self.confluence = Some(confluence);
+        self
+    }
+
+    /// The query embedder, to share with searches attached later.
+    pub fn embedder(&self) -> std::sync::Arc<std::sync::Mutex<Box<dyn embed::Embedder>>> {
+        self.ctx.embedder.clone()
     }
 
     /// Enable the read-only Jira tools.
@@ -358,6 +394,20 @@ impl ContextServer {
             .map_err(|e| e.to_string())
     }
 
+    /// Search the organisation's Confluence pages (documentation, runbooks, specs) by meaning.
+    /// Scoped to the current project's spaces by default (set project, or all=true for every
+    /// indexed space). Each result names the space, title, link, last edit and an excerpt; open
+    /// the link for the full page.
+    #[tool(name = "search_confluence")]
+    pub async fn search_confluence(&self, Parameters(a): Parameters<ConfluenceSearchArgs>) -> Result<String, String> {
+        let confluence = self.confluence.clone().ok_or("Confluence is not set up (no confluence-projects.json)")?;
+        if a.query.trim().is_empty() {
+            return Err("query must not be empty".into());
+        }
+        let scope = (!a.all.unwrap_or(false)).then(|| a.project.map_or_else(|| self.current_project.clone(), |p| sources::project::key(&p)));
+        confluence.search(&a.query, scope.as_deref(), a.limit.unwrap_or(6).clamp(1, 30) as usize).await.map_err(|e| e.to_string())
+    }
+
     /// One Jira issue in full — description and comments (redacted), with a link. Read-only.
     #[tool(name = "get_jira_issue")]
     pub async fn get_jira_issue(&self, Parameters(a): Parameters<JiraIssueArgs>) -> Result<String, String> {
@@ -430,10 +480,16 @@ impl ContextServer {
 impl ServerHandler for ContextServer {
     fn get_info(&self) -> ServerConfig {
         let jira_keys = self.jira.as_ref().and_then(|j| j.keys_for(&self.current_project).ok()).unwrap_or_default();
+        let spaces = self
+            .confluence
+            .as_ref()
+            .and_then(|c| crate::confluence::units_for_project(&self.current_project, &c.projects).ok())
+            .unwrap_or_default();
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(format!(
-            "{}{}",
+            "{}{}{}",
             self.base_instructions(),
-            jira_instructions(&jira_keys)
+            jira_instructions(&jira_keys),
+            confluence_instructions(&spaces)
         ))
     }
 }
@@ -453,6 +509,27 @@ impl ContextServer {
             self.current_project
         )
     }
+}
+
+/// The Confluence part of the server instructions; empty when the project has no mapped space.
+pub fn confluence_instructions(units: &[String]) -> String {
+    if units.is_empty() {
+        return String::new();
+    }
+    let (trees, spaces): (Vec<&String>, Vec<&String>) =
+        units.iter().partition(|u| u.strip_prefix('p').is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())));
+    let mut parts = Vec::new();
+    if !spaces.is_empty() {
+        parts.push(format!("space(s) {}", spaces.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    if !trees.is_empty() {
+        parts.push(format!("{} selected page tree(s)", trees.len()));
+    }
+    format!(
+        " This project's documentation is in Confluence ({}): search_confluence finds pages there \
+         (runbooks, specs, decisions) — use it before asking the user how something is set up.",
+        parts.join(" and ")
+    )
 }
 
 /// The Jira part of the server instructions, so a bare "1910" from the user is known to mean

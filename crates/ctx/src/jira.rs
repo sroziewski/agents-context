@@ -13,7 +13,9 @@ pub fn load_project_keys(path: &Path) -> anyhow::Result<HashMap<String, Vec<Stri
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let raw: HashMap<String, Vec<String>> = serde_json::from_str(text.trim_start_matches('\u{feff}'))?;
-            Ok(raw.into_iter().map(|(dir, keys)| (sources::project::key(&dir), keys)).collect())
+            // normalise, not key: a mapping name is not a working directory, and key() resolves a
+            // relative name like "sedn26" against the git repo the process happens to run in.
+            Ok(raw.into_iter().map(|(dir, keys)| (sources::project::normalise(&dir), keys)).collect())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
         Err(e) => Err(e.into()),
@@ -231,6 +233,19 @@ mod tests {
         assert_eq!(detect_issue_key("how did we fix HD-1410"), None);
         assert_eq!(detect_issue_key("lowercase-12"), None);
         assert_eq!(detect_issue_key("HD-"), None);
+    }
+
+    #[test]
+    fn relative_mapping_names_stay_apart_inside_a_git_repo() {
+        // Tests run with the crate dir as cwd, inside this repo: exactly where key() collapsed
+        // every relative name to "" and only one mapping entry survived.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.json");
+        std::fs::write(&path, r#"{"sedn26": ["SEDN26"], "helpdesk": ["HD"], "ai4sd": ["AI"]}"#).unwrap();
+        let map = load_project_keys(&path).unwrap();
+        assert_eq!(all_keys(&map), ["AI", "HD", "SEDN26"]);
+        assert_eq!(keys_for_project("d:/dev/sedn/sedn26", &map), ["SEDN26"]);
+        assert_eq!(keys_for_project("d:/dev/atlassian-gatewa-ai4sd", &map), ["AI"]);
     }
 
     #[test]

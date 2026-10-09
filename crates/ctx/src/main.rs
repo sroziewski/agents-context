@@ -173,6 +173,11 @@ enum Command {
         #[command(subcommand)]
         action: JiraAction,
     },
+    /// Confluence: find spaces to map to projects, search indexed pages.
+    Confluence {
+        #[command(subcommand)]
+        action: ConfluenceAction,
+    },
     /// Remove indexed data (optional, manual; dry-run unless --yes).
     Prune {
         #[command(subcommand)]
@@ -244,6 +249,27 @@ enum JiraAction {
 }
 
 #[derive(Subcommand)]
+enum ConfluenceAction {
+    /// List spaces (from the server), filtered by words in the key or name, to fill in
+    /// confluence-projects.json.
+    Spaces { filter: Option<String> },
+    /// Show which spaces are mapped to this project directory and to every project.
+    Mapped,
+    /// Search the indexed pages of this project's spaces.
+    Search {
+        query: String,
+        /// Search every indexed space instead of this project's.
+        #[arg(long)]
+        all: bool,
+        /// Scope to this project directory's spaces instead of the current one.
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = 6)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
 enum PruneAction {
     /// Drop all indexed points for a project (sessions collection), by its directory.
     Project {
@@ -267,6 +293,7 @@ enum PruneSource {
     Sessions,
     Teams,
     Jira,
+    Confluence,
     All,
 }
 
@@ -324,6 +351,7 @@ enum SourceArg {
     Opencode,
     Teams,
     Jira,
+    Confluence,
     All,
 }
 
@@ -371,6 +399,8 @@ async fn main() -> anyhow::Result<()> {
             let meetings_store = Arc::new(Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.meetings_collection, embed::BGEM3_DIM)?);
             // Jira store only when Jira is configured; the twice-daily schedule drives it.
             let jira_store = cfg.jira().map(|_| Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.jira_collection, embed::BGEM3_DIM)).transpose()?.map(Arc::new);
+            let confluence_store =
+                cfg.confluence().map(|_| Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.confluence_collection, embed::BGEM3_DIM)).transpose()?.map(Arc::new);
             let sessions_store = Arc::new(connect_store(&cfg)?);
             let counter: Arc<dyn ingest::TokenCounter + Send + Sync> = Arc::new(counter);
             // Always attached: whether to inject is decided by the hook on every prompt, so
@@ -394,6 +424,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(teams_store),
                 Some(meetings_store),
                 jira_store.clone(),
+                confluence_store.clone(),
             );
             let queue = IndexQueue::start(runner, Duration::from_secs(20));
             if !addr.ip().is_loopback() {
@@ -408,6 +439,10 @@ async fn main() -> anyhow::Result<()> {
             if jira_store.is_some() {
                 eprintln!("jira indexing scheduled at {:?} local", cfg.jira_index_times);
                 queue.schedule_daily(Target::Jira, cfg.jira_index_times.clone());
+            }
+            if confluence_store.is_some() {
+                eprintln!("confluence indexing scheduled at {:?} local", cfg.confluence_index_times);
+                queue.schedule_daily(Target::Confluence, cfg.confluence_index_times.clone());
             }
             // Lazily-built CPU reranker for opt-in deep search; loaded only on the first
             // /rerank call, never for a normal search.
@@ -559,6 +594,7 @@ async fn main() -> anyhow::Result<()> {
                 SourceArg::Opencode => Sources::OpenCode,
                 SourceArg::Teams => anyhow::bail!("indexing Teams needs the daemon (`ctx embed-server`); run without --local"),
                 SourceArg::Jira => anyhow::bail!("indexing Jira needs the daemon (`ctx embed-server`); run without --local"),
+                SourceArg::Confluence => anyhow::bail!("indexing Confluence needs the daemon (`ctx embed-server`); run without --local"),
                 SourceArg::All => Sources::All,
             };
             let refs = ctx::discover(&cfg, which)?;
@@ -650,6 +686,30 @@ async fn main() -> anyhow::Result<()> {
             let store = Arc::new(connect_store(&cfg)?);
             let ctx = Context { store, embedder: Arc::new(Mutex::new(Box::new(embed::HashEmbedder::new(1)))) };
             println!("{}", teams_search(&cfg, &ctx).meeting(&meeting_id, view)?);
+            Ok(())
+        }
+        Command::Confluence { action } => {
+            match action {
+                ConfluenceAction::Spaces { filter } => {
+                    let client = cfg.confluence().ok_or_else(|| {
+                        anyhow::anyhow!("Confluence is not configured; set CONFLUENCE_URL and CONFLUENCE_TOKEN in {}", Config::env_file().display())
+                    })?;
+                    let spaces = tokio::task::spawn_blocking(move || client.spaces()).await?.map_err(|e| anyhow::anyhow!("{e}"))?;
+                    println!("{}", ctx::confluence::format_spaces(&ctx::confluence::matching_spaces(&spaces, filter.as_deref())));
+                }
+                ConfluenceAction::Mapped => {
+                    let here = mcp::current_project();
+                    println!("mapping: {}", cfg.confluence_projects.display());
+                    println!("this project ({here}): {:?}", ctx::confluence::units_for_project(&here, &cfg.confluence_projects)?);
+                    println!("indexed (spaces, p<id> = page with its sub-pages): {:?}", ctx::confluence::all_units(&cfg.confluence_projects)?);
+                }
+                ConfluenceAction::Search { query, all, project, limit } => {
+                    let embedder: Box<dyn Embedder> = Box::new(embed_server::LazyRemote::new(&cfg.embed_url, embed::BGEM3_DIM));
+                    let search = confluence_search(&cfg, Arc::new(Mutex::new(embedder)));
+                    let scope = (!all).then(|| project.map_or_else(mcp::current_project, |p| sources::project::key(&p)));
+                    println!("{}", search.search(&query, scope.as_deref(), limit.clamp(1, 30)).await?);
+                }
+            }
             Ok(())
         }
         Command::Jira { action } => {
@@ -844,6 +904,12 @@ async fn main() -> anyhow::Result<()> {
             if let Ok(js) = jira_search(&cfg) {
                 server = server.with_jira(js);
             }
+            // Searches what the daemon indexed, so it needs no Confluence token in this process;
+            // only a mapping file, without which there is nothing indexed to search.
+            if cfg.confluence_projects.is_file() {
+                let search = confluence_search(&cfg, server.embedder());
+                server = server.with_confluence(search);
+            }
             mcp::serve_stdio(server).await
         }
     }
@@ -867,6 +933,13 @@ fn teams_search(cfg: &Config, ctx: &Context) -> ctx::teams::TeamsSearch {
     }
 }
 
+/// Search over the confluence collection, sharing `embedder` with the caller's other searches.
+fn confluence_search(cfg: &Config, embedder: Arc<Mutex<Box<dyn Embedder>>>) -> ctx::confluence::ConfluenceSearch {
+    let store = Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.confluence_collection, embed::BGEM3_DIM)
+        .expect("Qdrant client construction does not connect");
+    ctx::confluence::ConfluenceSearch { store: Arc::new(store), embedder, projects: cfg.confluence_projects.clone(), redact: cfg.redact_file.clone() }
+}
+
 /// A read-only Jira search, or a clear error when Jira is not configured.
 fn jira_search(cfg: &Config) -> anyhow::Result<ctx::jira::JiraSearch> {
     let jira = cfg
@@ -886,11 +959,13 @@ fn prune_targets(source: PruneSource, cfg: &Config) -> Vec<(&'static str, String
     let sessions = ("sessions", cfg.collection.clone(), "session_id");
     let teams = ("teams", cfg.teams_collection.clone(), "thread_id");
     let jira = ("jira", cfg.jira_collection.clone(), "issue_key");
+    let confluence = ("confluence", cfg.confluence_collection.clone(), "page_key");
     match source {
         PruneSource::Sessions => vec![sessions],
         PruneSource::Teams => vec![teams],
         PruneSource::Jira => vec![jira],
-        PruneSource::All => vec![sessions, teams, jira],
+        PruneSource::Confluence => vec![confluence],
+        PruneSource::All => vec![sessions, teams, jira, confluence],
     }
 }
 
@@ -900,6 +975,7 @@ fn to_target(source: SourceArg) -> Target {
         SourceArg::Opencode => Target::Opencode,
         SourceArg::Teams => Target::Teams,
         SourceArg::Jira => Target::Jira,
+        SourceArg::Confluence => Target::Confluence,
         SourceArg::All => Target::All,
     }
 }

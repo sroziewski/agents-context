@@ -5,15 +5,17 @@
 //! so every write is an idempotent upsert keyed by [`point_id`] and a collection can be dropped
 //! and rebuilt at any time.
 
+pub mod lexical;
+
 use std::collections::HashMap;
 
 use embed::Embedding;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     Condition, CountPointsBuilder, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
-    DeletePointsBuilder, Distance, FieldType, Filter, Fusion, KeywordIndexParamsBuilder, NamedVectors,
+    DeletePointsBuilder, Distance, FieldType, Filter, Fusion, KeywordIndexParamsBuilder, Modifier, NamedVectors,
     PointId, PointStruct, PrefetchQueryBuilder, Query, QueryPointsBuilder, Range, RetrievedPoint,
-    ScoredPoint, ScrollPointsBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
+    GetPointsBuilder, ScoredPoint, ScrollPointsBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
     UpsertPointsBuilder, Vector, VectorInput, VectorParamsBuilder, VectorsConfigBuilder,
     point_id::PointIdOptions,
 };
@@ -22,6 +24,8 @@ use uuid::Uuid;
 
 pub const DENSE: &str = "dense";
 pub const SPARSE: &str = "sparse";
+/// BM25 term weights (see [`lexical`]); only on stores opened [`Store::with_lexical`].
+pub const BM25: &str = "bm25";
 
 /// Fixed namespace so the same `(source, key)` maps to the same point id on every machine and run.
 const ID_NAMESPACE: Uuid = Uuid::from_u128(0x6a1c_2f0e_8d3b_4c57_9e21_7b44_d0a5_c3f9);
@@ -36,6 +40,8 @@ pub enum StoreError {
     Dimension { expected: usize, got: usize },
     #[error("point returned without a UUID id")]
     MissingId,
+    #[error("BM25 migration: {0}")]
+    Migration(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -166,12 +172,28 @@ pub struct Store {
     client: Qdrant,
     collection: String,
     dim: usize,
+    lexical: bool,
+    migration_lock: Option<std::path::PathBuf>,
 }
 
 impl Store {
     pub fn connect(url: &str, api_key: Option<String>, collection: &str, dim: usize) -> Result<Self> {
         let client = Qdrant::from_url(url).api_key(api_key).skip_compatibility_check().build()?;
-        Ok(Self { client, collection: collection.to_owned(), dim })
+        Ok(Self { client, collection: collection.to_owned(), dim, lexical: false, migration_lock: None })
+    }
+
+    /// Points also carry a [`BM25`] vector computed from their payload `text`, and
+    /// [`Self::ensure_collection`] migrates a collection created without it.
+    pub fn with_lexical(mut self) -> Self {
+        self.lexical = true;
+        self
+    }
+
+    /// File locked for the whole migration, so two processes (the daemon and `ctx index
+    /// --local`) can never interleave its drops. An OS lock, released if the process dies.
+    pub fn with_migration_lock(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.migration_lock = Some(path.into());
+        self
     }
 
     pub fn collection(&self) -> &str {
@@ -180,26 +202,139 @@ impl Store {
 
     /// Creates the collection and payload indexes if missing; safe to call on every start.
     /// `ts` always gets an integer index because [`SearchFilter`] ranges over it.
+    ///
+    /// On a lexical store this also migrates a collection created without the [`BM25`] vector:
+    /// Qdrant cannot add a named vector to an existing collection, so the points are copied
+    /// aside, the collection is recreated and they are copied back with BM25 added. Stored
+    /// vectors are copied, not recomputed, so nothing is re-embedded or re-summarised. Two
+    /// processes must not migrate at once: only the indexing path calls it, and
+    /// [`Self::with_migration_lock`] makes a second one fail instead of interleaving.
     pub async fn ensure_collection(&self, fields: &[Field]) -> Result<()> {
+        if self.lexical {
+            self.migrate_to_lexical().await?;
+        }
         if !self.client.collection_exists(&self.collection).await? {
-            let mut dense = VectorsConfigBuilder::default();
-            dense.add_named_vector_params(DENSE, VectorParamsBuilder::new(self.dim as u64, Distance::Cosine));
-            // No IDF modifier: bge-m3 sparse weights are already learned term importances, and
-            // re-weighting them by corpus IDF would double-count rarity.
-            let mut sparse = SparseVectorsConfigBuilder::default();
-            sparse.add_named_vector_params(SPARSE, SparseVectorParamsBuilder::default());
-            self.client
-                .create_collection(
-                    CreateCollectionBuilder::new(&self.collection)
-                        .vectors_config(dense)
-                        .sparse_vectors_config(sparse),
-                )
-                .await?;
+            self.create(&self.collection, self.lexical).await?;
         }
         for field in fields.iter().chain([&Field::Integer("ts")]) {
             self.index_field(*field).await?;
         }
         Ok(())
+    }
+
+    async fn create(&self, name: &str, bm25: bool) -> Result<()> {
+        let mut dense = VectorsConfigBuilder::default();
+        dense.add_named_vector_params(DENSE, VectorParamsBuilder::new(self.dim as u64, Distance::Cosine));
+        // No IDF modifier: bge-m3 sparse weights are already learned term importances, and
+        // re-weighting them by corpus IDF would double-count rarity.
+        let mut sparse = SparseVectorsConfigBuilder::default();
+        sparse.add_named_vector_params(SPARSE, SparseVectorParamsBuilder::default());
+        if bm25 {
+            // The stored BM25 weights are the term-frequency half only; IDF comes from Qdrant.
+            sparse.add_named_vector_params(BM25, SparseVectorParamsBuilder::default().modifier(Modifier::Idf));
+        }
+        self.client
+            .create_collection(CreateCollectionBuilder::new(name).vectors_config(dense).sparse_vectors_config(sparse))
+            .await?;
+        Ok(())
+    }
+
+    fn migration_collection(&self) -> String {
+        format!("{}__migrate", self.collection)
+    }
+
+    async fn has_bm25(&self, name: &str) -> Result<bool> {
+        let info = self.client.collection_info(name).await?;
+        Ok(info
+            .result
+            .and_then(|i| i.config)
+            .and_then(|c| c.params)
+            .and_then(|p| p.sparse_vectors_config)
+            .is_some_and(|s| s.map.contains_key(BM25)))
+    }
+
+    /// The migration as a resumable state machine. The original collection is dropped only
+    /// once the copy aside holds every point, and the copy aside is dropped only once the
+    /// recreated collection holds them all again, so a crash at any step loses nothing:
+    /// - original without BM25 and no larger copy aside: (re)start from scratch; a leftover
+    ///   copy is from an interrupted first copy and is discarded;
+    /// - original without BM25 but a larger copy aside: the original was dropped and something
+    ///   older (a previous ctx build) recreated it with a few points; the copy is the truth;
+    /// - copy aside present and the original missing or already with BM25: finish copying back.
+    ///   Only points the original lacks are copied, so anything written to it since (a
+    ///   re-index, a redaction rewrite) is never overwritten by the older copy.
+    async fn migrate_to_lexical(&self) -> Result<()> {
+        let _lock = match &self.migration_lock {
+            Some(path) => Some(lock_file(path)?),
+            None => None,
+        };
+        let aside = self.migration_collection();
+        let original_exists = self.client.collection_exists(&self.collection).await?;
+        let aside_exists = self.client.collection_exists(&aside).await?;
+        let mut original_ready = original_exists && self.has_bm25(&self.collection).await?;
+        if original_exists && !original_ready && aside_exists && self.count_in(&aside).await? > self.count_in(&self.collection).await? {
+            // What the older build wrote is newer than the copy: fold it in before dropping.
+            self.copy(&self.collection, &aside, false, false).await?;
+            self.client.delete_collection(&self.collection).await?;
+            self.create(&self.collection, true).await?;
+            original_ready = true;
+        }
+        if original_exists && !original_ready {
+            if aside_exists {
+                self.client.delete_collection(&aside).await?;
+            }
+            self.create(&aside, false).await?;
+            self.copy(&self.collection, &aside, false, false).await?;
+            if self.count_in(&aside).await? != self.count_in(&self.collection).await? {
+                return Err(StoreError::Migration(format!("the copy in {aside} does not match {}", self.collection)));
+            }
+            self.client.delete_collection(&self.collection).await?;
+        } else if !aside_exists {
+            return Ok(());
+        }
+        if !self.client.collection_exists(&self.collection).await? {
+            self.create(&self.collection, true).await?;
+        }
+        self.copy(&aside, &self.collection, true, true).await?;
+        // At least as many: the original may also hold points written after the copy aside.
+        if self.count_in(&self.collection).await? < self.count_in(&aside).await? {
+            return Err(StoreError::Migration(format!("{} is missing points of {aside}", self.collection)));
+        }
+        self.client.delete_collection(&aside).await?;
+        Ok(())
+    }
+
+    async fn count_in(&self, name: &str) -> Result<u64> {
+        Ok(self.client.count(CountPointsBuilder::new(name).exact(true)).await?.result.map_or(0, |r| r.count))
+    }
+
+    /// Copies every point with its stored vectors and payload, adding BM25 when `bm25`; with
+    /// `keep_existing`, points `to` already has are left as they are.
+    async fn copy(&self, from: &str, to: &str, bm25: bool, keep_existing: bool) -> Result<()> {
+        const PAGE: u32 = 256;
+        let mut offset: Option<PointId> = None;
+        loop {
+            let mut req = ScrollPointsBuilder::new(from).limit(PAGE).with_payload(true).with_vectors(true);
+            if let Some(o) = offset.take() {
+                req = req.offset(o);
+            }
+            let resp = self.client.scroll(req).await?;
+            let mut page = resp.result;
+            if keep_existing && !page.is_empty() {
+                let ids: Vec<PointId> = page.iter().filter_map(|p| p.id.clone()).collect();
+                let existing = self.client.get_points(GetPointsBuilder::new(to, ids).with_payload(false).with_vectors(false)).await?;
+                let existing: std::collections::HashSet<PointId> = existing.result.into_iter().filter_map(|p| p.id).collect();
+                page.retain(|p| p.id.as_ref().is_none_or(|id| !existing.contains(id)));
+            }
+            let points = page.into_iter().map(|p| copied_point(p, bm25)).collect::<Result<Vec<_>>>()?;
+            if !points.is_empty() {
+                self.client.upsert_points(UpsertPointsBuilder::new(to, points).wait(true)).await?;
+            }
+            match resp.next_page_offset {
+                Some(next) => offset = Some(next),
+                None => return Ok(()),
+            }
+        }
     }
 
     async fn index_field(&self, field: Field) -> Result<()> {
@@ -232,9 +367,12 @@ impl Store {
     fn to_point(&self, doc: Doc) -> Result<PointStruct> {
         self.check_dim(&doc.embedding)?;
         let (indices, values) = doc.embedding.sparse.into_parts();
-        let vectors = NamedVectors::default()
+        let mut vectors = NamedVectors::default()
             .add_vector(DENSE, doc.embedding.dense)
             .add_vector(SPARSE, Vector::new_sparse(indices, values));
+        if self.lexical {
+            vectors = with_bm25(vectors, &doc.payload);
+        }
         let payload = qdrant_client::Payload::try_from(Value::Object(doc.payload))
             .map_err(|e| StoreError::Payload(e.to_string()))?;
         Ok(PointStruct::new(doc.id.to_string(), vectors, payload))
@@ -369,6 +507,24 @@ impl Store {
         Ok(self.client.count(req).await?.result.map_or(0, |r| r.count))
     }
 
+    /// The BM25 leg alone (needs a lexical collection): best `limit` points matching `filter`.
+    /// A query without any token matches nothing.
+    pub async fn search_bm25(&self, text: &str, filter: &SearchFilter, limit: u64) -> Result<Vec<Hit>> {
+        let (indices, values) = lexical::query(text);
+        if indices.is_empty() || filter.matches_nothing() {
+            return Ok(Vec::new());
+        }
+        let mut req = QueryPointsBuilder::new(&self.collection)
+            .using(BM25)
+            .query(Query::new_nearest(VectorInput::new_sparse(indices, values)))
+            .limit(limit)
+            .with_payload(true);
+        if let Some(f) = filter.to_qdrant() {
+            req = req.filter(f);
+        }
+        self.client.query(req).await?.result.into_iter().map(to_hit).collect()
+    }
+
     pub async fn search(
         &self,
         query: &Embedding,
@@ -428,6 +584,56 @@ fn to_hit(p: ScoredPoint) -> Result<Hit> {
         _ => return Err(StoreError::MissingId),
     };
     Ok(Hit { id, score: p.score, payload: payload_to_json(p.payload) })
+}
+
+fn lock_file(path: &std::path::Path) -> Result<std::fs::File> {
+    let busy = || StoreError::Migration(format!("another process holds {}; try again when it is done", path.display()));
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).map_err(|_| busy())?;
+    file.try_lock().map_err(|_| busy())?;
+    Ok(file)
+}
+
+/// BM25 from the payload's `text`; a point without text gets no BM25 vector.
+fn with_bm25(vectors: NamedVectors, payload: &Map<String, Value>) -> NamedVectors {
+    match payload.get("text").and_then(Value::as_str).map(lexical::document) {
+        Some((indices, values)) if !indices.is_empty() => vectors.add_vector(BM25, Vector::new_sparse(indices, values)),
+        _ => vectors,
+    }
+}
+
+/// A scrolled point as an upsert, its stored vectors unchanged; any old BM25 is recomputed.
+fn copied_point(p: RetrievedPoint, bm25: bool) -> Result<PointStruct> {
+    use qdrant_client::qdrant::vector_output::Vector as Out;
+    use qdrant_client::qdrant::vectors_output::VectorsOptions;
+    let id = p.id.ok_or(StoreError::MissingId)?;
+    let mut vectors = NamedVectors::default();
+    let Some(VectorsOptions::Vectors(named)) = p.vectors.and_then(|v| v.vectors_options) else {
+        return Err(StoreError::Migration(format!("point {id:?} has no named vectors")));
+    };
+    if !named.vectors.contains_key(DENSE) {
+        return Err(StoreError::Migration(format!("point {id:?} has no {DENSE} vector")));
+    }
+    {
+        for (name, v) in named.vectors {
+            if name == BM25 {
+                continue;
+            }
+            vectors = match v.into_vector() {
+                Out::Dense(d) => vectors.add_vector(name, d.data),
+                Out::Sparse(s) => vectors.add_vector(name, Vector::new_sparse(s.indices, s.values)),
+                Out::MultiDense(_) => return Err(StoreError::Migration(format!("unexpected multi-vector {name}"))),
+            };
+        }
+    }
+    let payload = payload_to_json(p.payload);
+    if bm25 {
+        vectors = with_bm25(vectors, &payload);
+    }
+    let payload = qdrant_client::Payload::try_from(Value::Object(payload)).map_err(|e| StoreError::Payload(e.to_string()))?;
+    Ok(PointStruct::new(id, vectors, payload))
 }
 
 fn retrieved_to_hit(p: RetrievedPoint) -> Result<Hit> {

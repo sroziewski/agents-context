@@ -4,12 +4,14 @@ pub mod config;
 pub mod confluence;
 pub mod embed_server;
 pub mod eval;
+pub mod eval_identifiers;
 pub mod factcheck;
 pub mod handoff;
 pub mod hook;
 pub mod image;
 pub mod inject;
 pub mod jira;
+pub mod lexical;
 pub mod mcp;
 pub mod prune;
 pub mod memories;
@@ -230,13 +232,24 @@ pub fn daemon_runner(
                     // Re-read every run, so `ctx redact add` applies without a daemon restart.
                     let redactor = ingest::Redactor::from_file(&cfg.redact_file)?;
                     let mut parts = Vec::new();
+                    // Isolated like the sources below (a stuck collection migration would
+                    // otherwise stop every source), but still the run's error at the end.
+                    let mut sessions_error = None;
                     if let Some(which) = target.sessions() {
                         let refs = discover(&cfg, which)?;
-                        let report = run_index(&store, &mut embedder, &model, counter.as_ref(), &state, &refs, &redactor, |_| {}).await?;
-                        for (id, error) in &report.failed {
-                            eprintln!("[index {target:?}]   FAILED {id}: {error}");
+                        match run_index(&store, &mut embedder, &model, counter.as_ref(), &state, &refs, &redactor, |_| {}).await {
+                            Ok(report) => {
+                                for (id, error) in &report.failed {
+                                    eprintln!("[index {target:?}]   FAILED {id}: {error}");
+                                }
+                                parts.push(format_report(&report, t.elapsed()));
+                            }
+                            Err(e) => {
+                                eprintln!("[index {target:?}] sessions FAILED: {e:#}");
+                                parts.push(format!("sessions: FAILED ({e})"));
+                                sessions_error = Some(e);
+                            }
                         }
-                        parts.push(format_report(&report, t.elapsed()));
                     }
                     if let (true, Some(teams)) = (target.includes_teams(), &teams_store) {
                         // Before indexing, notice if the upstream scraper has stopped and, if
@@ -311,6 +324,10 @@ pub fn daemon_runner(
                         }
                     }
                     let mut line = parts.join(" · ");
+                    if let Some(e) = sessions_error {
+                        eprintln!("[index {target:?}] {line}");
+                        return Err(e.context(line));
+                    }
                     if let (Some(s), Some(_)) = (summarizer, target.sessions()) {
                         let now = jiff::Timestamp::now().as_millisecond();
                         let cfg = ingest::SummaryConfig { redactor, ..Default::default() };

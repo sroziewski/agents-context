@@ -370,3 +370,218 @@ async fn any_of_matches_listed_values_and_an_empty_list_matches_nothing() {
     assert_eq!(e.store.count(&none).await.unwrap(), 0);
     assert!(e.store.scroll(&none, 10).await.unwrap().is_empty());
 }
+
+/// Each probe's own point as found by `mode`: its score and payload. The test embedder maps
+/// some texts to identical vectors, so the probe's own point is looked up among the ties.
+async fn own_hits(s: &Store, probes: &[(String, Embedding)], mode: SearchMode) -> Vec<(f32, Map<String, Value>)> {
+    let mut out = Vec::new();
+    for (key, p) in probes {
+        let hits = s.search(p, &SearchFilter::default(), 20, mode).await.unwrap();
+        let h = hits.into_iter().find(|h| h.payload["key"] == key.as_str()).expect("own point among the top hits");
+        out.push((h.score, h.payload));
+    }
+    out
+}
+
+fn keys(hits: Vec<store::Hit>) -> Vec<String> {
+    hits.into_iter().map(|h| h.payload["key"].as_str().unwrap().to_owned()).collect()
+}
+
+#[tokio::test]
+async fn bm25_finds_the_exact_token_and_respects_filters() {
+    let qdrant = testkit::qdrant().await;
+    let store = Store::connect(&qdrant.url, None, "lex", DIM).unwrap().with_lexical();
+    store.ensure_collection(FIELDS).await.unwrap();
+    let mut emb = HashEmbedder::new(DIM);
+    let mut doc = |key: &str, text: &str, project: &str| Doc {
+        id: point_id("t", key),
+        embedding: emb.embed_one(text).unwrap(),
+        payload: payload(json!({"text": text, "key": key, "project": project})),
+    };
+    store
+        .upsert(vec![
+            doc("a", "we fixed the build and the build passed", "p"),
+            doc("b", "the build broke in SEDN26-1910 token_stream", "p"),
+            doc("c", "SEDN26-1910 in another project", "q"),
+        ])
+        .await
+        .unwrap();
+    let in_p = SearchFilter::default().eq("project", "p");
+    assert_eq!(keys(store.search_bm25("co z SEDN26-1910?", &in_p, 10).await.unwrap()), ["b"]);
+    assert_eq!(keys(store.search_bm25("token_stream", &SearchFilter::default(), 10).await.unwrap()), ["b"]);
+    assert_eq!(keys(store.search_bm25("sedn26 1910", &SearchFilter::default(), 10).await.unwrap()).len(), 2);
+    assert!(store.search_bm25("?!", &in_p, 10).await.unwrap().is_empty(), "no tokens, no hits");
+    // Dense and sparse legs are untouched by the extra vector.
+    let q = HashEmbedder::new(DIM).embed_one("build passed").unwrap();
+    assert_eq!(keys(store.search(&q, &in_p, 1, SearchMode::Dense).await.unwrap()), ["a"]);
+}
+
+#[tokio::test]
+async fn bm25_search_on_a_collection_without_it_is_an_error_not_a_panic() {
+    let mut e = env().await;
+    let d = e.doc("a", "token_stream", json!({}));
+    e.store.upsert(vec![d]).await.unwrap();
+    assert!(e.store.search_bm25("token_stream", &SearchFilter::default(), 10).await.is_err());
+}
+
+/// An old collection (no BM25) is migrated in place: same points, same stored vectors and
+/// payloads, plus BM25; the copy aside is gone afterwards; a second call is a no-op.
+#[tokio::test]
+async fn migration_adds_bm25_and_keeps_every_point_and_vector() {
+    let qdrant = testkit::qdrant().await;
+    let old = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap();
+    old.ensure_collection(FIELDS).await.unwrap();
+    let mut emb = HashEmbedder::new(DIM);
+    // More than one scroll page (256), so paging is exercised.
+    let docs: Vec<Doc> = (0..300)
+        .map(|i| {
+            let text = format!("turn {i} mentions ident_{i}");
+            Doc { id: point_id("t", &i.to_string()), embedding: emb.embed_one(&text).unwrap(), payload: payload(json!({"text": text, "key": i.to_string(), "project": "p"})) }
+        })
+        .collect();
+    old.upsert(docs).await.unwrap();
+    // Each probe is a stored point's own embedding; the same score for its own point before and
+    // after, per leg, shows the vectors were copied unchanged.
+    let probes: Vec<_> = [0, 7, 150, 299].iter().map(|i| (i.to_string(), emb.embed_one(&format!("turn {i} mentions ident_{i}")).unwrap())).collect();
+    let before = (own_hits(&old, &probes, SearchMode::Dense).await, own_hits(&old, &probes, SearchMode::Sparse).await);
+
+    let new = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap().with_lexical();
+    new.ensure_collection(FIELDS).await.unwrap();
+    assert_eq!(new.count(&SearchFilter::default()).await.unwrap(), 300);
+    let after = (own_hits(&new, &probes, SearchMode::Dense).await, own_hits(&new, &probes, SearchMode::Sparse).await);
+    assert_eq!(after, before, "stored dense and sparse vectors and payloads are copied unchanged");
+    assert_eq!(keys(new.search_bm25("ident_7", &SearchFilter::default(), 5).await.unwrap())[0], "7");
+    let aside = Store::connect(&qdrant.url, None, "sessions__migrate", DIM).unwrap();
+    assert!(aside.search_bm25("x", &SearchFilter::default(), 1).await.is_err(), "the copy aside was dropped");
+
+    new.ensure_collection(FIELDS).await.unwrap();
+    assert_eq!(new.count(&SearchFilter::default()).await.unwrap(), 300, "idempotent");
+    new.ensure_collection(FIELDS).await.unwrap();
+    let filtered = SearchFilter::default().eq("project", "p");
+    assert_eq!(new.count(&filtered).await.unwrap(), 300, "payload indexes still work");
+}
+
+/// A crash after the original was dropped leaves only the copy aside; the next start finishes.
+#[tokio::test]
+async fn migration_resumes_from_the_copy_aside() {
+    let qdrant = testkit::qdrant().await;
+    let aside = Store::connect(&qdrant.url, None, "sessions__migrate", DIM).unwrap();
+    aside.ensure_collection(&[]).await.unwrap();
+    let mut emb = HashEmbedder::new(DIM);
+    let text = "the only turn about RDE_2772";
+    aside
+        .upsert(vec![Doc { id: point_id("t", "only"), embedding: emb.embed_one(text).unwrap(), payload: payload(json!({"text": text, "key": "only"})) }])
+        .await
+        .unwrap();
+
+    let store = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap().with_lexical();
+    store.ensure_collection(FIELDS).await.unwrap();
+    assert_eq!(keys(store.search_bm25("RDE_2772", &SearchFilter::default(), 5).await.unwrap()), ["only"]);
+    assert!(aside.count(&SearchFilter::default()).await.is_err(), "copy aside dropped once copied back");
+}
+
+/// The original was dropped mid-migration and an older build recreated it (no BM25) with one
+/// re-indexed point. The larger copy aside is the truth; the newer point is folded in.
+#[tokio::test]
+async fn migration_prefers_the_complete_copy_over_an_original_recreated_by_an_older_build() {
+    let qdrant = testkit::qdrant().await;
+    let mut emb = HashEmbedder::new(DIM);
+    let mut doc = |key: &str, text: &str| Doc { id: point_id("t", key), embedding: emb.embed_one(text).unwrap(), payload: payload(json!({"text": text, "key": key})) };
+    let aside = Store::connect(&qdrant.url, None, "sessions__migrate", DIM).unwrap();
+    aside.ensure_collection(&[]).await.unwrap();
+    aside.upsert(vec![doc("a", "old text of a"), doc("b", "only b mentions RDE_2772"), doc("c", "c")]).await.unwrap();
+    let older_build = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap();
+    older_build.ensure_collection(&[]).await.unwrap();
+    older_build.upsert(vec![doc("a", "new text of a mentions token_stream")]).await.unwrap();
+
+    let store = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap().with_lexical();
+    store.ensure_collection(FIELDS).await.unwrap();
+    assert_eq!(store.count(&SearchFilter::default()).await.unwrap(), 3, "nothing from the copy aside is lost");
+    assert_eq!(keys(store.search_bm25("RDE_2772", &SearchFilter::default(), 5).await.unwrap()), ["b"]);
+    assert_eq!(keys(store.search_bm25("token_stream", &SearchFilter::default(), 5).await.unwrap()), ["a"], "the newer write wins");
+    assert!(aside.count(&SearchFilter::default()).await.is_err(), "copy aside dropped");
+}
+
+
+fn plain_doc(key: &str, text: Option<&str>, ts: i64) -> Doc {
+    let mut p = payload(json!({"key": key, "ts": ts}));
+    if let Some(t) = text {
+        p.insert("text".into(), json!(t));
+    }
+    Doc { id: point_id("t", key), embedding: HashEmbedder::new(DIM).embed_one(text.unwrap_or(key)).unwrap(), payload: p }
+}
+
+/// A crash after the full copy aside but before the original was dropped: equal counts, the
+/// original still without BM25. The next start restarts cleanly from the original.
+#[tokio::test]
+async fn migration_restarts_when_the_copy_aside_is_complete_but_the_original_untouched() {
+    let qdrant = testkit::qdrant().await;
+    for name in ["sessions", "sessions__migrate"] {
+        let s = Store::connect(&qdrant.url, None, name, DIM).unwrap();
+        s.ensure_collection(&[]).await.unwrap();
+        s.upsert(vec![plain_doc("a", Some("alpha RDE_2772"), 1), plain_doc("b", Some("beta"), 2)]).await.unwrap();
+    }
+    let store = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap().with_lexical();
+    store.ensure_collection(FIELDS).await.unwrap();
+    assert_eq!(store.count(&SearchFilter::default()).await.unwrap(), 2);
+    assert_eq!(keys(store.search_bm25("RDE_2772", &SearchFilter::default(), 5).await.unwrap()), ["a"]);
+}
+
+/// A crash part-way through copying back: the original already has BM25 and one point, since
+/// rewritten (redacted). Resuming adds what is missing and keeps the rewrite.
+#[tokio::test]
+async fn resumed_copy_back_never_overwrites_newer_points() {
+    let qdrant = testkit::qdrant().await;
+    let store = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap().with_lexical();
+    store.ensure_collection(&[]).await.unwrap();
+    store.upsert(vec![plain_doc("a", Some("a was [REDACTED]"), 1)]).await.unwrap();
+    let aside = Store::connect(&qdrant.url, None, "sessions__migrate", DIM).unwrap();
+    aside.ensure_collection(&[]).await.unwrap();
+    aside.upsert(vec![plain_doc("a", Some("a was hunter2"), 1), plain_doc("b", Some("b mentions RDE_2772"), 2)]).await.unwrap();
+
+    store.ensure_collection(FIELDS).await.unwrap();
+    assert_eq!(store.count(&SearchFilter::default()).await.unwrap(), 2);
+    assert!(store.search_bm25("hunter2", &SearchFilter::default(), 5).await.unwrap().is_empty(), "the redaction stays");
+    assert_eq!(keys(store.search_bm25("RDE_2772", &SearchFilter::default(), 5).await.unwrap()), ["b"]);
+    assert!(aside.count(&SearchFilter::default()).await.is_err(), "copy aside dropped");
+}
+
+/// Points without text survive the migration (they just get no BM25), and integer payloads
+/// keep working with range filters afterwards.
+#[tokio::test]
+async fn migration_keeps_textless_points_and_integer_payloads() {
+    let qdrant = testkit::qdrant().await;
+    let old = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap();
+    old.ensure_collection(FIELDS).await.unwrap();
+    old.upsert(vec![plain_doc("no-text", None, 10), plain_doc("t", Some("RDE_2772 here"), 20)]).await.unwrap();
+
+    let store = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap().with_lexical();
+    store.ensure_collection(FIELDS).await.unwrap();
+    assert_eq!(store.count(&SearchFilter::default()).await.unwrap(), 2);
+    assert_eq!(store.count(&SearchFilter::default().between(Some(5), Some(15))).await.unwrap(), 1, "ts is still an integer");
+    assert_eq!(keys(store.search_bm25("RDE_2772", &SearchFilter::default().between(Some(15), None), 5).await.unwrap()), ["t"]);
+}
+
+/// While one process holds the migration lock, another fails instead of interleaving drops.
+#[tokio::test]
+async fn a_second_migrator_fails_while_the_lock_is_held() {
+    let qdrant = testkit::qdrant().await;
+    let old = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap();
+    old.ensure_collection(FIELDS).await.unwrap();
+    old.upsert(vec![plain_doc("a", Some("RDE_2772"), 1)]).await.unwrap();
+    let dir = std::env::temp_dir().join(format!("ctx-lock-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lock = dir.join("migrate.lock");
+    let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock).unwrap();
+    held.lock().unwrap();
+
+    let store = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap().with_lexical().with_migration_lock(&lock);
+    let err = store.ensure_collection(FIELDS).await.unwrap_err();
+    assert!(matches!(err, StoreError::Migration(_)), "{err}");
+    assert_eq!(old.count(&SearchFilter::default()).await.unwrap(), 1, "untouched");
+
+    drop(held);
+    store.ensure_collection(FIELDS).await.unwrap();
+    assert_eq!(keys(store.search_bm25("RDE_2772", &SearchFilter::default(), 5).await.unwrap()), ["a"]);
+    let _ = std::fs::remove_dir_all(dir);
+}

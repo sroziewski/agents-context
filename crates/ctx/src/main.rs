@@ -85,9 +85,13 @@ enum Command {
         /// Cap ONNX Runtime CPU threads for the reranker (default: all cores).
         #[arg(long)]
         rerank_threads: Option<usize>,
-        /// What to evaluate: "sessions" (default) or "teams".
+        /// What to evaluate: "sessions" (default), "teams", or "identifiers" (exact tokens
+        /// unique to one session, generated from the index; see `ctx::eval_identifiers`).
         #[arg(long, default_value = "sessions")]
         target: String,
+        /// Identifiers to sample for `--target identifiers`.
+        #[arg(long, default_value_t = 120)]
+        samples: usize,
     },
     /// Index new or changed sessions (incremental; safe to run any time).
     Index {
@@ -451,7 +455,7 @@ async fn main() -> anyhow::Result<()> {
                 let which: embed::RerankModel = rerank_model.parse().map_err(embed::EmbedError::Model)?;
                 Ok(Box::new(embed::FastembedReranker::hub(which, 512, rerank_threads, 32, Some(rerank_cache.clone()))?) as Box<dyn embed::Reranker>)
             });
-            embed_server::serve(embed_server::daemon_router(shared, &model, Some(queue), Some(injector), Some(reranker)), addr).await
+            embed_server::serve(embed_server::daemon_router(shared, &model, Some(queue), Some(injector), cfg.rerank.then_some(reranker)), addr).await
         }
         Command::Hook { inject: true, .. } => {
             let payload = hook::read_stdin();
@@ -530,8 +534,11 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Eval { file, save_baseline, check, sweep, compare, rerank_model, rerank_pool, rerank_threads, target } => {
-            run_eval(cfg, file, save_baseline, check, sweep, compare, rerank_model, rerank_pool, rerank_threads, target).await
+        Command::Eval { file, save_baseline, check, sweep, compare, rerank_model, rerank_pool, rerank_threads, target, samples } => {
+            if target == "identifiers" {
+                return Box::pin(run_identifier_eval(cfg, samples, rerank_model, rerank_pool, rerank_threads)).await;
+            }
+            Box::pin(run_eval(cfg, file, save_baseline, check, sweep, compare, rerank_model, rerank_pool, rerank_threads, target)).await
         }
         Command::Hook { source, .. } => {
             let payload = hook::read_stdin();
@@ -627,7 +634,11 @@ async fn main() -> anyhow::Result<()> {
             q.include_subagents = subagents;
             q.recency = cfg.recency;
             q.mode = cfg.search_mode;
-            let results = if rerank {
+            q.lexical = cfg.lexical;
+            if rerank && !cfg.rerank {
+                eprintln!("deep search is off (set CTX_RERANK=on); showing the normal order");
+            }
+            let results = if rerank && cfg.rerank {
                 let rr: Arc<Mutex<Box<dyn embed::Reranker>>> = Arc::new(Mutex::new(Box::new(embed_server::RemoteReranker::new(&cfg.embed_url))));
                 match ctx.search_reranked(&q, rr, cfg.rerank_pool).await {
                     Ok(r) => r,
@@ -900,7 +911,10 @@ async fn main() -> anyhow::Result<()> {
             let mut server = mcp::ContextServer::new(ctx, mcp::current_project(), cfg.state_path.clone())
                 .with_teams(teams)
                 .with_ranking(cfg.search_mode, cfg.recency)
-                .with_rerank(cfg.embed_url.clone(), cfg.rerank_pool);
+                .with_lexical(cfg.lexical);
+            if cfg.rerank {
+                server = server.with_rerank(cfg.embed_url.clone(), cfg.rerank_pool);
+            }
             if let Ok(js) = jira_search(&cfg) {
                 server = server.with_jira(js);
             }
@@ -995,8 +1009,10 @@ fn model_name(dir: &std::path::Path) -> String {
 }
 
 fn connect_store(cfg: &Config) -> anyhow::Result<Store> {
-    Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.collection, embed::BGEM3_DIM)
-        .with_context(|| format!("connecting to Qdrant at {}", cfg.qdrant_url))
+    Ok(Store::connect(&cfg.qdrant_url, cfg.qdrant_api_key.clone(), &cfg.collection, embed::BGEM3_DIM)
+        .with_context(|| format!("connecting to Qdrant at {}", cfg.qdrant_url))?
+        .with_lexical()
+        .with_migration_lock(cfg.data_dir.join("sessions-migrate.lock")))
 }
 
 async fn connect_embedder(cfg: &Config) -> anyhow::Result<RemoteEmbedder> {
@@ -1025,6 +1041,78 @@ async fn context(cfg: &Config) -> anyhow::Result<Context> {
     Ok(Context { store: Arc::new(connect_store(cfg)?), embedder: Arc::new(Mutex::new(embedder)) })
 }
 
+
+/// `ctx eval --target identifiers`: generates the cases from the index, writes them next to the
+/// session eval file for inspection, and prints one table for bare identifiers and one for
+/// identifiers inside a sentence.
+async fn run_identifier_eval(cfg: Config, samples: usize, rerank_model: Option<String>, rerank_pool: u64, rerank_threads: Option<usize>) -> anyhow::Result<()> {
+    use ctx::{eval, eval_identifiers as ids};
+    let ctx = context(&cfg).await?;
+    let turns = ids::load_turns(&ctx.store).await?;
+    let (picked, candidates) = ids::pick(&turns, samples);
+    anyhow::ensure!(!picked.is_empty(), "no identifier occurs in exactly one session; nothing to evaluate");
+    let (bare, sentence) = ids::cases(&picked);
+    let path = cfg.eval_file.parent().unwrap_or(std::path::Path::new(".")).join("identifiers.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))?;
+    let lines: Vec<String> = bare.iter().chain(&sentence).map(serde_json::to_string).collect::<Result<_, _>>()?;
+    std::fs::write(&path, lines.join("\n") + "\n")?;
+    println!(
+        "{} turns, {candidates} identifiers unique to one session by token, {} sampled (cases in {})\n",
+        turns.len(),
+        picked.len(),
+        path.display()
+    );
+    let all: Vec<eval::Case> = bare.iter().chain(&sentence).cloned().collect();
+    let vectors = eval::embed_queries(&ctx, &all).await?;
+    let bm25 = ids::Bm25::new(&turns);
+    if let Some(model) = rerank_model {
+        // DEV-63: the deep-search pool (routed) reranked, against production without reranking.
+        let which: embed::RerankModel = model.parse().map_err(anyhow::Error::msg)?;
+        eprintln!("loading reranker {model} on CPU (first run downloads it)…");
+        let cache = cfg.rerank_cache_dir.clone();
+        let mut reranker = tokio::task::spawn_blocking(move || embed::FastembedReranker::hub(which, 512, rerank_threads, 32, Some(cache)))
+            .await?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let production = eval::variants(cfg.search_mode, cfg.recency, cfg.lexical).into_iter().filter(|v| v.name == eval::PRODUCTION).collect::<Vec<_>>();
+        for (title, set) in [("bare identifier", &bare), ("identifier in a sentence", &sentence)] {
+            let base = ids::run(&ctx, &turns, &bm25, set, &vectors, &production, &[]).await?.remove(0);
+            let (reranked, latency) = eval::run_reranked(&ctx, set, &vectors, &mut reranker, rerank_pool, cfg.lexical, &ids::scope, "routed+rerank").await?;
+            println!("{title} (n = {}), reranker {model}, pool N={rerank_pool}:\n{}\n", set.len(), eval::format_retrieval(&[base, reranked]));
+            println!("{}\n", eval::format_latency("rerank added latency", latency));
+        }
+        return Ok(());
+    }
+    let variants = eval::variants(cfg.search_mode, cfg.recency, cfg.lexical);
+    let fused = ids::fused_variants();
+    for (title, set) in [("bare identifier", &bare), ("identifier in a sentence", &sentence)] {
+        let reports = ids::run(&ctx, &turns, &bm25, set, &vectors, &variants, &fused).await?;
+        println!("{title} (n = {}):\n{}\n", set.len(), eval::format_retrieval(&reports));
+    }
+    Ok(())
+}
+
+/// Candidate lexical legs (see `ctx eval --target identifiers`) on the hand-written set, next to
+/// the dense turns-only baseline, so a third leg is only shipped if natural questions do not
+/// lose. Boxed by the caller: inlined, it overflows `run_eval`'s stack in debug builds.
+async fn print_lexical_legs(
+    ctx: &ctx::search::Context,
+    cases: &[ctx::eval::Case],
+    vectors: &std::collections::HashMap<String, embed::Embedding>,
+    reports: &[ctx::eval::VariantReport],
+) -> anyhow::Result<()> {
+    use ctx::{eval, eval_identifiers as ids};
+    let turns = ids::load_turns(&ctx.store).await?;
+    let bm25 = ids::Bm25::new(&turns);
+    let positives: Vec<eval::Case> = cases.iter().filter(|c| !c.expect.is_empty()).cloned().collect();
+    let fused = ids::run_fused(ctx, &turns, &bm25, &positives, vectors, &ids::fused_variants(), &eval::Case::scope).await?;
+    let dense = reports.iter().filter(|r| r.name == "dense").cloned();
+    println!(
+        "lexical legs, turns only, BM25 simulated in memory (RRF k={}; `production` above is the shipped search):\n{}\n",
+        ctx::lexical::RRF_K,
+        eval::format_retrieval(&dense.chain(fused).collect::<Vec<_>>())
+    );
+    Ok(())
+}
 
 /// The `ctx eval` handler, split out of `main` so the async main state machine stays small
 /// enough not to overflow the stack in debug builds.
@@ -1079,16 +1167,17 @@ async fn run_eval(
                     .await?
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 // Baseline: dense turns, no summaries — the same pool the reranker reorders.
-                let base = eval::Variant { name: "dense-turns", mode: store::SearchMode::Dense, summaries: false, recency: ctx::rank::Recency::OFF };
+                let base = eval::Variant { name: "routed-turns", mode: store::SearchMode::Dense, summaries: false, recency: ctx::rank::Recency::OFF, lexical: cfg.lexical };
                 let baseline = eval::run_retrieval(&ctx, &cases, &[base], &vectors).await?.remove(0);
-                let (reranked, latency) = eval::run_reranked(&ctx, &cases, &vectors, &mut reranker, rerank_pool, "dense+rerank").await?;
+                let (reranked, latency) =
+                    eval::run_reranked(&ctx, &cases, &vectors, &mut reranker, rerank_pool, cfg.lexical, &eval::Case::scope, "routed+rerank").await?;
                 println!("reranker: {model}, pool N={rerank_pool}, threads={}\n", rerank_threads.map_or("all".to_owned(), |t| t.to_string()));
                 println!("{}\n", eval::format_retrieval(&[baseline.clone(), reranked.clone()]));
                 println!("{}\n", eval::format_compare(&baseline, &reranked, &cases));
                 println!("{}", eval::format_latency("rerank added latency", latency));
                 return Ok(());
             }
-            let all_variants = eval::variants(cfg.search_mode, cfg.recency);
+            let all_variants = eval::variants(cfg.search_mode, cfg.recency, cfg.lexical);
             if let [a, b] = compare.as_slice() {
                 let pick = |name: &str| {
                     all_variants
@@ -1103,10 +1192,16 @@ async fn run_eval(
                 return Ok(());
             }
             let reports = eval::run_retrieval(&ctx, &cases, &all_variants, &vectors).await?;
-            println!("production = {:?} + summaries, recency weight {:.2}", cfg.search_mode, cfg.recency.weight);
+            println!("production = {:?} + summaries, lexical {:?}, recency weight {:.2}", cfg.search_mode, cfg.lexical, cfg.recency.weight);
             println!("{}\n", eval::format_retrieval(&reports));
             let production = reports.iter().find(|r| r.name == eval::PRODUCTION).expect("production variant is always run");
             println!("{}\n", eval::format_misses(production, &cases));
+            if !check {
+                // A diagnostic: it must not decide whether `--check` passes.
+                if let Err(e) = Box::pin(print_lexical_legs(&ctx, &cases, &vectors, &reports)).await {
+                    eprintln!("lexical legs not measured: {e:#}");
+                }
+            }
             if sweep {
                 let mut tries = Vec::new();
                 for weight in [0.1, 0.2, 0.3, 0.5] {
@@ -1116,7 +1211,7 @@ async fn run_eval(
                 }
                 let mut rows = Vec::new();
                 for r in tries {
-                    let v = eval::Variant { name: "sweep", mode: cfg.search_mode, summaries: true, recency: r };
+                    let v = eval::Variant { name: "sweep", mode: cfg.search_mode, summaries: true, recency: r, lexical: cfg.lexical };
                     let rep = eval::run_retrieval(&ctx, &cases, &[v], &vectors).await?.remove(0);
                     rows.push(format!(
                         "weight {:.1} half-life {:>3} d: R@5 {:.2} MRR {:.3} latest {}/{}",

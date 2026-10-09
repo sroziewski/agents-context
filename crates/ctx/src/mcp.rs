@@ -172,6 +172,7 @@ pub struct ContextServer {
     teams: Option<crate::teams::TeamsSearch>,
     mode: store::SearchMode,
     recency: crate::rank::Recency,
+    lexical: crate::lexical::Lexical,
     /// Daemon URL + candidate pool for the opt-in `deep_search_sessions`; `None` disables it.
     rerank: Option<(String, u64)>,
     /// Read-only Jira; `None` when JIRA_URL/JIRA_TOKEN are unset.
@@ -191,10 +192,11 @@ impl ContextServer {
             teams: None,
             mode: store::SearchMode::Hybrid,
             recency: crate::rank::Recency::OFF,
+            lexical: crate::lexical::Lexical::Off,
             rerank: None,
             jira: None,
             confluence: None,
-            tool_router: Self::tool_router(),
+            tool_router: Self::tool_router().with_disabled("deep_search_sessions"),
         }
     }
 
@@ -218,12 +220,19 @@ impl ContextServer {
     /// Enable `deep_search_sessions`, which reranks through the daemon at `embed_url`.
     pub fn with_rerank(mut self, embed_url: String, pool: u64) -> Self {
         self.rerank = Some((embed_url, pool));
+        self.tool_router.enable_route("deep_search_sessions");
         self
     }
 
     pub fn with_ranking(mut self, mode: store::SearchMode, recency: crate::rank::Recency) -> Self {
         self.mode = mode;
         self.recency = recency;
+        self
+    }
+
+    /// Lexical legs for identifier queries, in both `search_sessions` and deep search.
+    pub fn with_lexical(mut self, lexical: crate::lexical::Lexical) -> Self {
+        self.lexical = lexical;
         self
     }
 
@@ -343,6 +352,7 @@ impl ContextServer {
         q.include_subagents = a.include_subagents.unwrap_or(false);
         q.recency = self.recency;
         q.mode = self.mode;
+        q.lexical = self.lexical;
         let results = self.ctx.search(&q).await.map_err(|e| e.to_string())?;
         Ok(format_results(&results))
     }
@@ -368,6 +378,7 @@ impl ContextServer {
         q.since = a.since.as_deref().map(|d| parse_date(d, false)).transpose().map_err(|e| e.to_string())?;
         q.until = a.until.as_deref().map(|d| parse_date(d, true)).transpose().map_err(|e| e.to_string())?;
         q.include_subagents = a.include_subagents.unwrap_or(false);
+        q.lexical = self.lexical;
         let reranker: std::sync::Arc<std::sync::Mutex<Box<dyn embed::Reranker>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Box::new(crate::embed_server::RemoteReranker::new(&url))));
         let results = self.ctx.search_reranked(&q, reranker, pool).await.map_err(|e| e.to_string())?;

@@ -40,6 +40,10 @@ fn session(cwd: &str, turns: &[(&str, &str)]) -> String {
 }
 
 async fn env() -> Env {
+    env_with(|s| s).await
+}
+
+async fn env_with(configure: impl FnOnce(ContextServer) -> ContextServer) -> Env {
     let qdrant = testkit::qdrant().await;
     let store = Store::connect(&qdrant.url, None, "sessions", DIM).unwrap();
 
@@ -64,7 +68,7 @@ async fn env() -> Env {
         store: Arc::new(store),
         embedder: Arc::new(Mutex::new(Box::new(HashEmbedder::new(DIM)) as Box<dyn Embedder>)),
     };
-    let server = ContextServer::new(context, sources::project::key(ALPHA), state_path);
+    let server = configure(ContextServer::new(context, sources::project::key(ALPHA), state_path));
     let (server_io, client_io) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move {
         let running = server.serve(server_io).await.unwrap();
@@ -98,7 +102,7 @@ async fn lists_the_tools_with_schemas_and_instructions() {
     let mut names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
     assert_eq!(names, [
-        "deep_search_sessions", "get_jira_issue", "get_meeting", "get_session", "get_teams_thread", "jira_add_comment",
+        "get_jira_issue", "get_meeting", "get_session", "get_teams_thread", "jira_add_comment",
         "jira_transition_issue", "list_projects", "list_sessions", "search_confluence", "search_jira", "search_meetings", "search_sessions", "search_teams"
     ]);
     let search = tools.iter().find(|t| t.name == "search_sessions").unwrap();
@@ -106,6 +110,17 @@ async fn lists_the_tools_with_schemas_and_instructions() {
     assert!(props.get("query").is_some() && props.get("scope").is_some());
     let info = e.client.peer_info().unwrap();
     assert!(info.instructions.as_deref().unwrap().contains("z:/work/alpha"));
+}
+
+#[tokio::test]
+async fn deep_search_is_offered_only_when_switched_on() {
+    let off = env().await;
+    let r = off.client.call_tool(CallToolRequestParams::new("deep_search_sessions").with_arguments(json!({"query": "migration"}).as_object().cloned().unwrap())).await;
+    assert!(r.is_err() || r.unwrap().is_error == Some(true), "a hidden tool must not run");
+
+    let on = env_with(|s| s.with_rerank("http://127.0.0.1:9".into(), 30)).await;
+    let tools = on.client.list_all_tools().await.unwrap();
+    assert!(tools.iter().any(|t| t.name == "deep_search_sessions"));
 }
 
 #[tokio::test]

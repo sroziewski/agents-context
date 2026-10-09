@@ -6,6 +6,7 @@ use embed::Embedder;
 use serde_json::Value;
 use store::{Hit, SearchFilter, SearchMode, Store};
 
+use crate::lexical::{self, Lexical};
 use crate::rank::Recency;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,8 @@ pub struct Query {
     pub include_subagents: bool,
     pub mode: SearchMode,
     pub recency: Recency,
+    /// Legs fused with dense when the query contains an identifier (see [`crate::lexical`]).
+    pub lexical: Lexical,
 }
 
 impl Query {
@@ -42,6 +45,7 @@ impl Query {
             include_subagents: false,
             mode: SearchMode::Hybrid,
             recency: Recency::OFF,
+            lexical: Lexical::Off,
         }
     }
 }
@@ -70,6 +74,8 @@ pub struct Results {
 
 /// Summaries shown above the turns; a few are enough to orient, the turns carry the detail.
 const MAX_SUMMARIES: u64 = 3;
+/// Turns each leg of a routed search contributes to the fusion, at least; the evals used 50.
+const LEG_POOL: u64 = 50;
 
 impl Context {
     pub async fn search(&self, q: &Query) -> anyhow::Result<Results> {
@@ -96,15 +102,61 @@ impl Context {
             f
         };
         let (summary_filter, turn_filter) = (filter_for("summary"), filter_for("turn"));
+        let now = jiff::Timestamp::now().as_millisecond();
+        if q.lexical != Lexical::Off && lexical::has_identifier(&q.text) {
+            // Summaries rarely contain identifiers, so for these queries they push the session
+            // that does further down (DEV-62): turns only.
+            let turns = match self.routed_turns(query, q, &turn_filter, q.lexical).await {
+                Ok(turns) => Some(turns),
+                // A collection not yet migrated has no BM25 vector; the configured mode still
+                // answers.
+                Err(e) => {
+                    eprintln!("[search] lexical leg unavailable ({e}); searching without it");
+                    None
+                }
+            };
+            let turns = match turns {
+                Some(t) => t,
+                None => self.store.search(query, &turn_filter, q.recency.pool(q.limit), q.mode).await?,
+            };
+            return Ok(Results { summaries: Vec::new(), turns: q.recency.rerank(turns, now, q.limit as usize) });
+        }
         let n_summaries = MAX_SUMMARIES.min(q.limit);
         let summaries = self.store.search(query, &summary_filter, q.recency.pool(n_summaries), q.mode);
         let turns = self.store.search(query, &turn_filter, q.recency.pool(q.limit), q.mode);
         let (summaries, turns) = tokio::try_join!(summaries, turns)?;
-        let now = jiff::Timestamp::now().as_millisecond();
         Ok(Results {
             summaries: q.recency.rerank(summaries, now, n_summaries as usize),
             turns: q.recency.rerank(turns, now, q.limit as usize),
         })
+    }
+
+    /// Dense fused with the lexical legs by RRF (DEV-61), each hit scored with its fused score
+    /// so recency can still weigh in. Errors if a leg fails, so the caller can fall back.
+    async fn routed_turns(&self, query: &embed::Embedding, q: &Query, filter: &SearchFilter, legs: Lexical) -> anyhow::Result<Vec<Hit>> {
+        let pool = q.recency.pool(q.limit).max(LEG_POOL);
+        let dense = self.store.search(query, filter, pool, SearchMode::Dense);
+        let bm25 = self.store.search_bm25(&q.text, filter, pool);
+        let sparse = async {
+            match legs {
+                Lexical::SparseBm25 => self.store.search(query, filter, pool, SearchMode::Sparse).await,
+                _ => Ok(Vec::new()),
+            }
+        };
+        let (dense, bm25, sparse) = tokio::try_join!(dense, bm25, sparse)?;
+        let ids = |hits: &[Hit]| hits.iter().map(|h| h.id).collect::<Vec<_>>();
+        let fused = lexical::rrf(&[ids(&dense), ids(&bm25), ids(&sparse)], lexical::RRF_K);
+        let mut by_id: std::collections::HashMap<uuid::Uuid, Hit> = dense.into_iter().chain(bm25).chain(sparse).map(|h| (h.id, h)).collect();
+        Ok(fused
+            .into_iter()
+            .take(pool as usize)
+            .filter_map(|(id, score)| {
+                by_id.remove(&id).map(|mut h| {
+                    h.score = score as f32;
+                    h
+                })
+            })
+            .collect())
     }
 
     /// Deep search (opt-in): dense retrieval of a larger turn pool, reordered by `reranker`.
@@ -116,6 +168,8 @@ impl Context {
         deep.limit = pool.max(q.limit);
         deep.mode = SearchMode::Dense;
         deep.recency = Recency::OFF;
+        // `deep.lexical` stays as the caller set it: for an identifier query the reranker then
+        // sees the routed pool, so the turn naming it can reach the reranker at all (DEV-63).
         let mut results = self.search(&deep).await?;
         if results.turns.len() > 1 {
             let query = q.text.clone();

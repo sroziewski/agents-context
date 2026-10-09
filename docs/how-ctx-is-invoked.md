@@ -85,7 +85,12 @@ The `ctx` MCP server exposes tools the model calls **agentically**:
 - `search_sessions` — semantic search over past sessions
 - `get_session` — pull one full session
 - `list_sessions`, `list_projects` — browse what is indexed
-- `deep_search_sessions` — reranked, higher-quality search (opt-in, ~seconds)
+- `deep_search_sessions` — reranked search; offered only with `CTX_RERANK=on`, see below
+
+A query that names something by its exact spelling (a file name like `eval.rs`, a
+Jira key like `SEDN26-1910`, a function like `boundObjectId`) is also matched
+word for word (BM25) and returns turns only, without session summaries in front.
+Other queries are searched by meaning, as before (`CTX_LEXICAL`, DEV-61/62).
 
 These do **not** run every turn. The model calls one only when it judges that
 past sessions would help, or when **you explicitly ask**. Each call is a visible
@@ -98,7 +103,37 @@ tool use.
 > reads the hits, and cites the session id + date.
 
 > **You (CLI):** `ctx search --rerank "reranker latency decision"`
-> → runs the deep, reranked search from the terminal.
+> → runs the deep, reranked search from the terminal (with `CTX_RERANK=on`).
+
+### Deep search (reranker) — off by default
+
+Deep search takes the candidates the normal search found and re-sorts them with a
+cross-encoder (`jina-v2`, on CPU). It is **off** unless `CTX_RERANK=on` is set for
+both the daemon and the MCP server (the shared `.env`). When off:
+
+- the daemon never loads the reranker model (~1.1 GB on disk, several GB of RAM
+  while it runs);
+- the MCP server does not list `deep_search_sessions`, so agents cannot call it;
+- `ctx search --rerank` says deep search is off and prints the normal results.
+
+Why off: measured on the live index (DEV-63, 2026-10-09, 8 CPU threads):
+
+| Test set | Candidates | R@1 normal → reranked | Added time, p95 |
+|---|---|---|---|
+| Natural questions (60) | 10 | 0.83 → 0.88 | 7.2 s |
+| Natural questions (60) | 20 | 0.83 → 0.88 | 14.4 s |
+| Bare identifier (30) | 10 | 0.90 → 0.97 | 6.9 s |
+| Identifier in a sentence (30) | 10 | 0.87 → 0.90 | 7.1 s |
+
+The bar was p95 ≤ 800 ms at 30 candidates plus a quality gain outside noise. It
+costs about 0.6 s per candidate, and the gain on natural questions is within noise.
+Turn it on if you are happy to wait several seconds for an occasional harder search.
+
+Settings (`.env`): `CTX_RERANK=on`, `CTX_RERANK_MODEL` (default `jina-v2`),
+`CTX_RERANK_POOL` (candidates, default 30; 10 halves the wait), `CTX_RERANK_THREADS`.
+Restart the daemon and the agent after changing them. To re-measure:
+`ctx eval --rerank-model jina-v2 --rerank-pool 10 --rerank-threads 8`, and the same
+with `--target identifiers --samples 30`.
 
 ---
 

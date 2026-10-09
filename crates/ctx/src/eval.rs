@@ -15,11 +15,12 @@ use serde::{Deserialize, Serialize};
 use store::SearchMode;
 
 use crate::inject::Injector;
+use crate::lexical::Lexical;
 use crate::rank::Recency;
 use crate::search::{Context, Query, Results, Scope};
 
 /// Results fetched per search; MRR is measured to this depth.
-const DEPTH: u64 = 10;
+pub const DEPTH: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -112,21 +113,24 @@ pub struct Variant {
     /// Session summaries are listed before the turns, as `search_sessions` shows them.
     pub summaries: bool,
     pub recency: Recency,
+    /// Lexical legs for identifier queries, as `search_sessions` routes them.
+    pub lexical: Lexical,
 }
 
 /// What `search_sessions` serves with the current configuration; baselines are kept for it.
 pub const PRODUCTION: &str = "production";
 
-/// The alternatives worth comparing, then the configured one.
-pub fn variants(mode: SearchMode, recency: Recency) -> Vec<Variant> {
-    let v = |name, mode, summaries, recency| Variant { name, mode, summaries, recency };
+/// The alternatives worth comparing, then the configured one. Only production routes
+/// identifier queries; the others show each ranking as it is.
+pub fn variants(mode: SearchMode, recency: Recency, lexical: Lexical) -> Vec<Variant> {
+    let v = |name, mode, summaries, recency, lexical| Variant { name, mode, summaries, recency, lexical };
     vec![
-        v("dense", SearchMode::Dense, false, Recency::OFF),
-        v("sparse", SearchMode::Sparse, false, Recency::OFF),
-        v("hybrid", SearchMode::Hybrid, false, Recency::OFF),
-        v("hybrid+summaries", SearchMode::Hybrid, true, Recency::OFF),
-        v("dense+summaries", SearchMode::Dense, true, Recency::OFF),
-        v(PRODUCTION, mode, true, recency),
+        v("dense", SearchMode::Dense, false, Recency::OFF, Lexical::Off),
+        v("sparse", SearchMode::Sparse, false, Recency::OFF, Lexical::Off),
+        v("hybrid", SearchMode::Hybrid, false, Recency::OFF, Lexical::Off),
+        v("hybrid+summaries", SearchMode::Hybrid, true, Recency::OFF, Lexical::Off),
+        v("dense+summaries", SearchMode::Dense, true, Recency::OFF, Lexical::Off),
+        v(PRODUCTION, mode, true, recency, lexical),
     ]
 }
 
@@ -242,6 +246,7 @@ pub async fn run_retrieval(ctx: &Context, cases: &[Case], variants: &[Variant], 
             let mut q = Query::new(c.query.clone(), c.scope(), DEPTH);
             q.mode = v.mode;
             q.recency = v.recency;
+            q.lexical = v.lexical;
             let r = ctx.search_embedded(&vectors[&c.id], &q).await?;
             results.push(judge_turns(c, &session_order(&r, v.summaries), &turn_order(&r)));
         }
@@ -250,24 +255,29 @@ pub async fn run_retrieval(ctx: &Context, cases: &[Case], variants: &[Variant], 
     Ok(reports)
 }
 
-/// DEV-28 spike: a dense pool of `pool` turns per query, reordered by the cross-encoder, then
-/// judged like any variant. Returns the report and the per-query rerank latency in ms (the
-/// added cost on top of retrieval). Retrieval stays dense (production); summaries are left out
-/// so the metric is purely the turn ranking the reranker produces.
+/// DEV-28 spike: a pool of `pool` turns per query, reordered by the cross-encoder, then judged
+/// like any variant. Returns the report and the per-query rerank latency in ms (the added cost
+/// on top of retrieval). The pool is what deep search reranks: dense, routed through `lexical`
+/// for identifier queries (DEV-63). Summaries are left out so the metric is purely the turn
+/// ranking the reranker produces. `scope_of` says where each case searches.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_reranked(
     ctx: &Context,
     cases: &[Case],
     vectors: &HashMap<String, Embedding>,
     reranker: &mut dyn Reranker,
     pool: u64,
+    lexical: Lexical,
+    scope_of: &dyn Fn(&Case) -> Scope,
     name: &'static str,
 ) -> anyhow::Result<(VariantReport, Vec<f64>)> {
     let positives: Vec<&Case> = cases.iter().filter(|c| !c.expect.is_empty()).collect();
     let mut results = Vec::new();
     let mut latency_ms = Vec::new();
     for c in &positives {
-        let mut q = Query::new(c.query.clone(), c.scope(), pool);
+        let mut q = Query::new(c.query.clone(), scope_of(c), pool);
         q.mode = SearchMode::Dense;
+        q.lexical = lexical;
         let r = ctx.search_embedded(&vectors[&c.id], &q).await?;
         let texts: Vec<&str> = r.turns.iter().map(|h| h.payload.get("text").and_then(|v| v.as_str()).unwrap_or_default()).collect();
         // The cross-encoder is blocking CPU work; keep it off the async workers.

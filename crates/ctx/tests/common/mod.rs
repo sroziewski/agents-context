@@ -40,7 +40,7 @@ pub struct Fixture {
     pub prompts: &'static [&'static str],
 }
 
-fn session(f: &Fixture) -> String {
+pub fn session(f: &Fixture) -> String {
     f.prompts
         .iter()
         .enumerate()
@@ -83,7 +83,7 @@ pub async fn indexed(fixtures: &[Fixture]) -> Env {
         teams_db: tmp.path().join("no-teams.db"),
         ..Config::from_env(|_| None)
     };
-    let store = Arc::new(Store::connect(&qdrant.url, None, "sessions", DIM).unwrap());
+    let store = Arc::new(Store::connect(&qdrant.url, None, "sessions", DIM).unwrap().with_lexical());
     let runner = ctx::daemon_runner(
         cfg.clone(),
         store.clone(),

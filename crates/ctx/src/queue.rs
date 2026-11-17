@@ -7,6 +7,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -75,27 +76,106 @@ pub struct Status {
     pub last_finished_ms: Option<i64>,
 }
 
+/// How the run that served one request ended.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Outcome {
+    pub report: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Where one request stands. `Unknown` is a ticket this queue never issued (another daemon
+/// instance did) or one old enough that its outcome is no longer kept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum Ticket {
+    Pending,
+    Done(Outcome),
+    Unknown,
+}
+
+/// Finished runs whose outcome is kept for lookup; a waiting caller polls within milliseconds
+/// of its run ending. Counted in runs, so every request one run served stays answerable however
+/// many were coalesced into it.
+const KEPT_RUNS: usize = 256;
+
+#[derive(Default)]
+struct Tickets {
+    issued: u64,
+    /// Issued and not yet served by a finished run.
+    waiting: BTreeSet<u64>,
+    /// The newest finished runs, oldest first: the tickets each served and how it ended.
+    finished: VecDeque<(Vec<u64>, Outcome)>,
+}
+
+impl Tickets {
+    fn issue(&mut self) -> u64 {
+        self.issued += 1;
+        self.waiting.insert(self.issued);
+        self.issued
+    }
+
+    fn finish(&mut self, tickets: &[u64], outcome: Outcome) {
+        for t in tickets {
+            self.waiting.remove(t);
+        }
+        self.finished.push_back((tickets.to_vec(), outcome));
+        while self.finished.len() > KEPT_RUNS {
+            self.finished.pop_front();
+        }
+    }
+
+    fn state(&self, ticket: u64) -> Ticket {
+        if self.waiting.contains(&ticket) {
+            return Ticket::Pending;
+        }
+        self.finished.iter().rev().find(|(served, _)| served.contains(&ticket)).map_or(Ticket::Unknown, |(_, outcome)| Ticket::Done(outcome.clone()))
+    }
+}
+
 pub type RunFuture = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
 /// Performs one index run and returns its one-line report.
 pub type Runner = Arc<dyn Fn(Target) -> RunFuture + Send + Sync>;
 
 #[derive(Clone)]
 pub struct IndexQueue {
-    tx: mpsc::UnboundedSender<Target>,
+    tx: mpsc::UnboundedSender<(Target, u64)>,
     status: Arc<Mutex<Status>>,
+    tickets: Arc<Mutex<Tickets>>,
+    epoch: u64,
 }
 
 impl IndexQueue {
     pub fn start(runner: Runner, debounce: Duration) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let status = Arc::new(Mutex::new(Status::default()));
-        tokio::spawn(worker(rx, runner, debounce, status.clone()));
-        Self { tx, status }
+        let tickets = Arc::new(Mutex::new(Tickets::default()));
+        tokio::spawn(worker(rx, runner, debounce, status.clone(), tickets.clone()));
+        Self { tx, status, tickets, epoch: jiff::Timestamp::now().as_millisecond() as u64 }
     }
 
-    pub fn request(&self, target: Target) {
+    /// Queues a run for `target` and returns the ticket to ask [`Self::ticket`] about.
+    pub fn request(&self, target: Target) -> u64 {
+        let ticket = self.tickets.lock().unwrap_or_else(|p| p.into_inner()).issue();
         // Only fails once the worker is gone, i.e. during shutdown.
-        let _ = self.tx.send(target);
+        if self.tx.send((target, ticket)).is_err() {
+            self.tickets.lock().unwrap_or_else(|p| p.into_inner()).waiting.remove(&ticket);
+        }
+        ticket
+    }
+
+    /// Identifies this queue instance: tickets restart from 1 with every daemon start, so a
+    /// ticket only means something together with the epoch it was issued under.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The state of a ticket issued under `epoch`. It is `Done` only once a run that started
+    /// after the request has finished, with that run's outcome.
+    pub fn ticket(&self, epoch: u64, ticket: u64) -> Ticket {
+        if epoch != self.epoch {
+            return Ticket::Unknown;
+        }
+        self.tickets.lock().unwrap_or_else(|p| p.into_inner()).state(ticket)
     }
 
     pub fn status(&self) -> Status {
@@ -155,34 +235,43 @@ fn duration_until_next(times: &[(u32, u32)], now: jiff::Zoned) -> Duration {
     }
 }
 
-async fn worker(mut rx: mpsc::UnboundedReceiver<Target>, runner: Runner, debounce: Duration, status: Arc<Mutex<Status>>) {
+async fn worker(
+    mut rx: mpsc::UnboundedReceiver<(Target, u64)>,
+    runner: Runner,
+    debounce: Duration,
+    status: Arc<Mutex<Status>>,
+    tickets: Arc<Mutex<Tickets>>,
+) {
     while let Some(first) = rx.recv().await {
         tokio::time::sleep(debounce).await;
         // Drain the debounce window. Jira is kept separate from the session/Teams merge: merging
         // it into `All` would drop it (All excludes Jira), so a Jira request coalesced with an
         // All request would silently never run. Instead each side is its own run.
-        let mut sessions_teams: Option<Target> = None;
-        let mut standalone: Vec<Target> = Vec::new();
-        let mut consider = |t: Target| {
+        let mut sessions_teams: Option<(Target, Vec<u64>)> = None;
+        let mut standalone: Vec<(Target, Vec<u64>)> = Vec::new();
+        let mut consider = |(t, ticket): (Target, u64)| {
             if t.standalone() {
-                if !standalone.contains(&t) {
-                    standalone.push(t);
+                match standalone.iter_mut().find(|(s, _)| *s == t) {
+                    Some((_, served)) => served.push(ticket),
+                    None => standalone.push((t, vec![ticket])),
                 }
             } else {
-                sessions_teams = Some(sessions_teams.map_or(t, |acc: Target| acc.merge(t)));
+                let (acc, mut served) = sessions_teams.take().map_or((t, Vec::new()), |(acc, served)| (acc.merge(t), served));
+                served.push(ticket);
+                sessions_teams = Some((acc, served));
             }
         };
         consider(first);
         while let Ok(more) = rx.try_recv() {
             consider(more);
         }
-        for target in sessions_teams.into_iter().chain(standalone) {
-            run_and_record(&runner, target, &status).await;
+        for (target, served) in sessions_teams.into_iter().chain(standalone) {
+            run_and_record(&runner, target, &status, &tickets, &served).await;
         }
     }
 }
 
-async fn run_and_record(runner: &Runner, target: Target, status: &Arc<Mutex<Status>>) {
+async fn run_and_record(runner: &Runner, target: Target, status: &Arc<Mutex<Status>>, tickets: &Mutex<Tickets>, served: &[u64]) {
     set(status, |s| s.running = true);
     // Its own task, so a panicking run (sync or async part) becomes an error on this run
     // instead of killing the worker and leaving every later request silently dropped.
@@ -192,6 +281,10 @@ async fn run_and_record(runner: &Runner, target: Target, status: &Arc<Mutex<Stat
         Err(e) => Err(anyhow::anyhow!("index run panicked: {e}")),
     };
     let now = jiff::Timestamp::now().as_millisecond();
+    let outcome = match &result {
+        Ok(report) => Outcome { report: Some(report.clone()), error: None },
+        Err(e) => Outcome { report: None, error: Some(format!("{e:#}")) },
+    };
     set(status, |s| {
         s.running = false;
         s.runs += 1;
@@ -205,6 +298,7 @@ async fn run_and_record(runner: &Runner, target: Target, status: &Arc<Mutex<Stat
             Err(e) => s.last_error = Some(format!("{e:#}")),
         }
     });
+    tickets.lock().unwrap_or_else(|p| p.into_inner()).finish(served, outcome);
 }
 
 fn set(status: &Mutex<Status>, f: impl FnOnce(&mut Status)) {
@@ -426,5 +520,256 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(*runs.lock().unwrap(), [Target::All]);
+    }
+
+    /// Run `n` reports `run {n} {target:?}`, so an outcome names the run it came from. Returns
+    /// the number of runs started; with a gate every run blocks until it is notified.
+    fn numbered(gate: Option<Arc<Notify>>) -> (Runner, Arc<Mutex<u64>>) {
+        let started = Arc::new(Mutex::new(0u64));
+        let s = started.clone();
+        let runner: Runner = Arc::new(move |t| {
+            let s = s.clone();
+            let gate = gate.clone();
+            Box::pin(async move {
+                let n = {
+                    let mut n = s.lock().unwrap();
+                    *n += 1;
+                    *n
+                };
+                if let Some(g) = gate {
+                    g.notified().await;
+                }
+                Ok(format!("run {n} {t:?}"))
+            })
+        });
+        (runner, started)
+    }
+
+    async fn until(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..1000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("never happened: {what}");
+    }
+
+    fn done(report: &str) -> Ticket {
+        Ticket::Done(Outcome { report: Some(report.to_owned()), error: None })
+    }
+
+    #[tokio::test]
+    async fn a_request_made_during_a_run_is_pending_until_its_own_run_finishes() {
+        let gate = Arc::new(Notify::new());
+        let (runner, started) = numbered(Some(gate.clone()));
+        let q = IndexQueue::start(runner, Duration::from_millis(20));
+        let e = q.epoch();
+        let first = q.request(Target::Claude);
+        until("run 1 starts", || q.status().running).await;
+        let second = q.request(Target::Opencode);
+        assert_eq!((first, second), (1, 2), "tickets count up from 1");
+        assert_eq!(q.ticket(e, first), Ticket::Pending);
+        assert_eq!(q.ticket(e, second), Ticket::Pending);
+
+        gate.notify_one();
+        until("run 1 finishes", || q.status().runs == 1).await;
+        assert_eq!(q.ticket(e, first), done("run 1 Claude"));
+        assert_eq!(q.ticket(e, second), Ticket::Pending, "run 1 started before this request, so it does not answer it");
+
+        until("run 2 starts", || *started.lock().unwrap() == 2).await;
+        assert_eq!(q.ticket(e, second), Ticket::Pending, "its own run is still in progress");
+        gate.notify_one();
+        settle(&q, 2).await;
+        assert_eq!(q.ticket(e, second), done("run 2 Opencode"));
+        assert_eq!(q.ticket(e, first), done("run 1 Claude"), "a later run does not rewrite an earlier outcome");
+    }
+
+    #[tokio::test]
+    async fn requests_in_one_window_get_the_outcome_of_the_run_that_served_them() {
+        let started = Arc::new(Mutex::new(0u64));
+        let s = started.clone();
+        let runner: Runner = Arc::new(move |t| {
+            let s = s.clone();
+            Box::pin(async move {
+                let n = {
+                    let mut n = s.lock().unwrap();
+                    *n += 1;
+                    *n
+                };
+                if t == Target::Jira { Err(anyhow::anyhow!("jira unreachable in run {n}")) } else { Ok(format!("run {n} {t:?}")) }
+            })
+        });
+        let q = IndexQueue::start(runner, Duration::from_millis(30));
+        let e = q.epoch();
+        // Jira and Confluence each asked for twice: the second request joins the first one's run.
+        let jira_first = q.request(Target::Jira);
+        let sessions = q.request(Target::Claude);
+        let confluence_first = q.request(Target::Confluence);
+        let (jira, confluence) = ([jira_first, q.request(Target::Jira)], [confluence_first, q.request(Target::Confluence)]);
+        assert_eq!((jira, sessions, confluence), ([1, 4], 2, [3, 5]));
+        settle(&q, 3).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(*started.lock().unwrap(), 3, "one run for the sessions, one for Jira, one for Confluence");
+        assert_eq!(q.ticket(e, sessions), done("run 1 Claude"));
+        for t in jira {
+            assert_eq!(q.ticket(e, t), Ticket::Done(Outcome { report: None, error: Some("jira unreachable in run 2".into()) }), "Jira ticket {t}");
+        }
+        for t in confluence {
+            assert_eq!(q.ticket(e, t), done("run 3 Confluence"), "Confluence ticket {t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_coalesced_into_one_run_all_get_that_runs_outcome() {
+        let (runner, started) = numbered(None);
+        let q = IndexQueue::start(runner, Duration::from_millis(30));
+        let e = q.epoch();
+        let tickets = [q.request(Target::Claude), q.request(Target::Opencode), q.request(Target::Claude)];
+        settle(&q, 1).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(*started.lock().unwrap(), 1, "one run for the whole window");
+        assert_eq!(tickets, [1, 2, 3]);
+        for t in tickets {
+            assert_eq!(q.ticket(e, t), done("run 1 All"), "ticket {t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_is_done_with_an_error_and_no_report() {
+        let calls = Arc::new(Mutex::new(0));
+        let c = calls.clone();
+        let runner: Runner = Arc::new(move |_| {
+            let c = c.clone();
+            Box::pin(async move {
+                let mut n = c.lock().unwrap();
+                *n += 1;
+                if *n == 2 { Err(anyhow::anyhow!("qdrant down")) } else { Ok(format!("ok {n}")) }
+            })
+        });
+        let q = IndexQueue::start(runner, Duration::from_millis(10));
+        let e = q.epoch();
+        let ok = q.request(Target::All);
+        settle(&q, 1).await;
+        let failed = q.request(Target::All);
+        settle(&q, 2).await;
+        assert_eq!(q.status().last_report.as_deref(), Some("ok 1"), "the status still shows the last successful run");
+        assert_eq!(q.ticket(e, failed), Ticket::Done(Outcome { report: None, error: Some("qdrant down".into()) }));
+        assert_eq!(q.ticket(e, ok), done("ok 1"));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_run_is_done_with_an_error_and_no_report() {
+        let runner: Runner = Arc::new(|_| Box::pin(async { panic!("boom after await") }));
+        let q = IndexQueue::start(runner, Duration::from_millis(10));
+        let t = q.request(Target::Claude);
+        settle(&q, 1).await;
+        let Ticket::Done(outcome) = q.ticket(q.epoch(), t) else { panic!("not done: {:?}", q.ticket(q.epoch(), t)) };
+        assert_eq!(outcome.report, None);
+        // The text after the prefix is tokio's JoinError (it carries a task id), so only the prefix is fixed.
+        let error = outcome.error.expect("a panic is an error");
+        assert!(error.starts_with("index run panicked: "), "{error}");
+    }
+
+    #[tokio::test]
+    async fn tickets_this_queue_did_not_issue_are_unknown() {
+        let (runner, _) = numbered(None);
+        let q = IndexQueue::start(runner, Duration::from_millis(10));
+        let e = q.epoch();
+        assert_eq!(q.ticket(e, 1), Ticket::Unknown, "nothing issued yet");
+        let issued = q.request(Target::Claude);
+        settle(&q, 1).await;
+        assert_eq!(q.ticket(e, issued), done("run 1 Claude"));
+        for (epoch, ticket, why) in [
+            (e, 0, "ticket 0 is never issued"),
+            (e, issued + 1, "the next ticket has not been issued"),
+            (e, u64::MAX, "far beyond the last ticket"),
+            (e + 1, issued, "a later daemon's epoch"),
+            (e - 1, issued, "an earlier daemon's epoch"),
+            (0, issued, "epoch 0"),
+        ] {
+            assert_eq!(q.ticket(epoch, ticket), Ticket::Unknown, "{why}");
+        }
+    }
+
+    #[tokio::test]
+    async fn outcomes_are_kept_for_the_newest_256_finished_runs() {
+        let (runner, _) = numbered(None);
+        let q = IndexQueue::start(runner, Duration::from_millis(1));
+        let e = q.epoch();
+        for run in 1..=256 {
+            assert_eq!(q.request(Target::Claude), run);
+            settle(&q, run).await;
+        }
+        assert_eq!(q.ticket(e, 1), done("run 1 Claude"), "256 finished runs are all kept");
+
+        assert_eq!(q.request(Target::Claude), 257);
+        settle(&q, 257).await;
+        assert_eq!(q.ticket(e, 1), Ticket::Unknown, "the 257th run pushes the oldest out");
+        for run in 2..=257 {
+            assert_eq!(q.ticket(e, run), done(&format!("run {run} Claude")), "run {run} is among the newest 256");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_ticket_of_a_kept_run_stays_done_however_many_it_served() {
+        let (runner, started) = numbered(None);
+        let q = IndexQueue::start(runner, Duration::from_millis(30));
+        let e = q.epoch();
+        let tickets: Vec<u64> = (0..300).map(|_| q.request(Target::Claude)).collect();
+        settle(&q, 1).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(*started.lock().unwrap(), 1, "300 requests in one window are one run");
+        assert_eq!((tickets[0], tickets[299]), (1, 300));
+        for &t in &tickets {
+            assert_eq!(q.ticket(e, t), done("run 1 Claude"), "ticket {t}");
+        }
+
+        let later = q.request(Target::Opencode);
+        settle(&q, 2).await;
+        assert_eq!(q.ticket(e, later), done("run 2 Opencode"));
+        assert_eq!(q.ticket(e, tickets[0]), done("run 1 Claude"), "a later run does not push out tickets of a kept run");
+    }
+
+    #[tokio::test]
+    async fn a_ticket_stays_pending_behind_another_run_of_its_window_however_many_tickets_that_run_served() {
+        let gate = Arc::new(Notify::new());
+        let (runner, started) = numbered(Some(gate.clone()));
+        let q = IndexQueue::start(runner, Duration::from_millis(30));
+        let e = q.epoch();
+        // One window: the oldest ticket is the Jira request, then 257 session requests. The
+        // session run goes first; its finishing with more tickets than runs are kept must not
+        // make the lower-numbered Jira ticket look forgotten while the Jira run is still to end.
+        let jira = q.request(Target::Jira);
+        let sessions: Vec<u64> = (0..257).map(|_| q.request(Target::Claude)).collect();
+        until("the session run starts", || *started.lock().unwrap() == 1).await;
+        assert_eq!(q.ticket(e, jira), Ticket::Pending, "the session run of its window is in progress");
+        gate.notify_one();
+        until("the Jira run starts", || *started.lock().unwrap() == 2).await;
+        assert_eq!((q.ticket(e, sessions[0]), q.ticket(e, sessions[256])), (done("run 1 Claude"), done("run 1 Claude")));
+        let while_running = q.ticket(e, jira);
+        gate.notify_one();
+        settle(&q, 2).await;
+        assert_eq!(while_running, Ticket::Pending, "the Jira run was still in progress");
+        assert_eq!(q.ticket(e, jira), done("run 2 Jira"));
+    }
+
+    #[test]
+    fn a_request_made_after_the_worker_is_gone_is_unknown_not_pending_forever() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let q = rt.block_on(async {
+            let (runner, _) = numbered(None);
+            let q = IndexQueue::start(runner, Duration::from_millis(10));
+            let served = q.request(Target::Claude);
+            settle(&q, 1).await;
+            assert_eq!(q.ticket(q.epoch(), served), done("run 1 Claude"));
+            q
+        });
+        // Dropping the runtime drops the worker task, as a daemon shutting down does.
+        drop(rt);
+        let late = q.request(Target::Claude);
+        assert_eq!(late, 2);
+        assert_eq!(q.ticket(q.epoch(), late), Ticket::Unknown, "no run will ever serve it");
+        assert_eq!(q.ticket(q.epoch(), 1), done("run 1 Claude"), "what finished before stays answered");
     }
 }

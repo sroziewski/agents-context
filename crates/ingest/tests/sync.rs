@@ -313,6 +313,126 @@ async fn grown_session_embeds_only_new_chunks() {
     assert_eq!(e.count(SearchFilter::default().eq("session_id", "s1")).await, 3);
 }
 
+/// HashEmbedder that fails on any batch holding a text with "POISON" while `poisoned` is set.
+struct Poisonable {
+    inner: HashEmbedder,
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Embedder for Poisonable {
+    fn dim(&self) -> usize {
+        DIM
+    }
+    fn embed(&mut self, texts: &[&str]) -> embed::Result<Vec<Embedding>> {
+        if self.poisoned.load(Ordering::SeqCst) && texts.iter().any(|t| t.contains("POISON")) {
+            return Err(embed::EmbedError::Model("cuda out of memory".into()));
+        }
+        self.inner.embed(texts)
+    }
+}
+
+#[tokio::test]
+async fn a_session_whose_indexing_fails_is_reported_and_retried_and_later_ones_still_index() {
+    let mut e = env().await;
+    e.write_session("a", "s1-fine", &[prompt("u1", ALPHA, "first fine session"), reply("ok")]);
+    e.write_session("a", "s2-bad", &[prompt("u1", ALPHA, "POISON pill prompt"), reply("ok")]);
+    e.write_session("a", "s3-fine", &[prompt("u1", ALPHA, "third fine session"), reply("ok")]);
+    let mut refs = e.refs();
+    refs.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(refs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["s1-fine", "s2-bad", "s3-fine"], "the failing session is in the middle");
+    let poisoned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut embedder = Poisonable { inner: HashEmbedder::new(DIM), poisoned: poisoned.clone() };
+
+    let mut events = Vec::new();
+    let r = {
+        let mut indexer = Indexer { store: &e.store, embedder: &mut embedder, counter: &WordCounter, state: &e.state, config: IndexConfig::default() };
+        indexer.sync(&refs, claude::load, |p| events.push(format!("{p:?}")), 0).await.unwrap()
+    };
+
+    assert_eq!((r.scanned, r.indexed, r.chunks), (3, 2, 2));
+    assert_eq!(r.failed, [("s2-bad".to_owned(), "model error: cuda out of memory".to_owned())]);
+    assert_eq!(
+        events,
+        [
+            "Indexed { id: \"s1-fine\", chunks: 1 }",
+            "Failed { id: \"s2-bad\", error: \"model error: cuda out of memory\" }",
+            "Indexed { id: \"s3-fine\", chunks: 1 }",
+        ]
+    );
+    assert!(e.state.get("claude", "s2-bad").unwrap().is_none(), "not recorded, so the next sync retries it");
+    assert_eq!(e.count(SearchFilter::default().eq("session_id", "s3-fine")).await, 1, "the session after the failure is indexed");
+    assert_eq!(e.count(SearchFilter::default().eq("session_id", "s2-bad")).await, 0);
+
+    poisoned.store(false, Ordering::SeqCst);
+    let again = {
+        let mut indexer = Indexer { store: &e.store, embedder: &mut embedder, counter: &WordCounter, state: &e.state, config: IndexConfig::default() };
+        indexer.sync(&refs, claude::load, |_| {}, 0).await.unwrap()
+    };
+    assert_eq!((again.indexed, again.unchanged, again.failed.len()), (1, 2, 0), "only the failed session is indexed again");
+    assert_eq!(e.count(SearchFilter::default().eq("session_id", "s2-bad")).await, 1);
+}
+
+fn prompt_at(uuid: &str, at: &str, text: &str) -> String {
+    json!({"type": "user", "uuid": uuid, "timestamp": at, "cwd": ALPHA, "origin": {"kind": "human"}, "message": {"content": text}}).to_string()
+}
+
+fn ms(at: &str) -> i64 {
+    at.parse::<jiff::Timestamp>().unwrap().as_millisecond()
+}
+
+/// `(turn_index, ts)` of every stored turn of `session`, sorted.
+async fn stored_turns(e: &Env, session: &str) -> Vec<(i64, i64)> {
+    let mut v: Vec<(i64, i64)> = e
+        .store
+        .scroll(&SearchFilter::default().eq("session_id", session), 50)
+        .await
+        .unwrap()
+        .iter()
+        .map(|h| (h.payload["turn_index"].as_i64().unwrap(), h.payload["ts"].as_i64().unwrap()))
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test]
+async fn chunks_at_or_before_the_prune_cutoff_are_not_written_and_leave_the_scope() {
+    let mut e = env().await;
+    let (t0, t1, t2) = ("2025-03-01T10:00:00Z", "2026-02-01T10:00:00Z", "2026-09-01T10:00:00Z");
+    let lines = [prompt_at("u0", t0, "an old question"), reply("old"), prompt_at("u1", t1, "the cutoff question"), reply("mid"), prompt_at("u2", t2, "a new question"), reply("new")];
+    e.write_session("a", "s1", &lines);
+    e.sync().await;
+    assert_eq!(stored_turns(&e, "s1").await, [(0, ms(t0)), (1, ms(t1)), (2, ms(t2))], "precondition: all three turns stored");
+
+    // The cutoff equals turn 1's time: turn 0 is before it, turn 1 at it, both go.
+    e.state.forget("claude", "s1").unwrap();
+    let refs = e.refs();
+    let config = IndexConfig { prune_before_ms: Some(ms(t1)), ..IndexConfig::default() };
+    let before = e.embedded();
+    let r = {
+        let mut indexer = Indexer { store: &e.store, embedder: &mut e.embedder, counter: &WordCounter, state: &e.state, config };
+        indexer.sync(&refs, claude::load, |_| {}, 0).await.unwrap()
+    };
+
+    assert_eq!((r.indexed, r.chunks), (1, 1));
+    assert_eq!(stored_turns(&e, "s1").await, [(2, ms(t2))], "the old turns left the session's points");
+    assert_eq!(e.embedded(), before, "the kept turn was unchanged, so nothing was embedded");
+}
+
+#[tokio::test]
+async fn a_session_entirely_before_the_cutoff_is_written_as_nothing() {
+    let mut e = env().await;
+    e.write_session("a", "old", &[prompt_at("u0", "2025-03-01T10:00:00Z", "an old question"), reply("old")]);
+    let refs = e.refs();
+    let config = IndexConfig { prune_before_ms: Some(ms("2026-01-01T00:00:00Z")), ..IndexConfig::default() };
+    let r = {
+        let mut indexer = Indexer { store: &e.store, embedder: &mut e.embedder, counter: &WordCounter, state: &e.state, config };
+        indexer.sync(&refs, claude::load, |_| {}, 0).await.unwrap()
+    };
+    assert_eq!((r.indexed, r.chunks, r.failed.len()), (1, 0, 0));
+    assert_eq!(e.count(SearchFilter::default()).await, 0);
+    assert_eq!(e.embedded(), 0);
+}
+
 #[tokio::test]
 async fn edited_turn_is_re_embedded_and_unchanged_turns_are_not() {
     let mut e = env().await;

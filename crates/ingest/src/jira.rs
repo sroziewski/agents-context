@@ -15,8 +15,10 @@ use crate::state::{Record, State};
 use crate::tokens::TokenCounter;
 
 pub const SOURCE: &str = "jira";
-/// Meta key for the delta watermark (max `updated` epoch ms indexed so far).
-const WATERMARK: &str = "jira/watermark_ms";
+use crate::state::JIRA_WATERMARK as WATERMARK;
+/// Meta key for when indexed issues were last checked against Jira for deletions and moves.
+const RECONCILED: &str = "jira/reconciled_ms";
+const RECONCILE_EVERY_MS: i64 = 24 * 3_600_000;
 /// JQL `updated` is minute-granular; widen the delta window so a same-minute edit is not missed.
 const MARGIN_MS: i64 = 120_000;
 const PAGE: u32 = 50;
@@ -86,6 +88,8 @@ fn resolve_description(
             if desc.is_empty() {
                 return None;
             }
+            // The cache sits outside the index; keep secrets read off a screenshot out of it too.
+            let desc = crate::scrub::scrub(&desc).0;
             let _ = state.put_image_desc(id, &fnv1a_hex(&bytes), &desc, now_ms);
             Some(desc)
         }
@@ -226,19 +230,32 @@ pub async fn sync_jira(
         return Ok(Report::default());
     }
     let since = state.get_meta(WATERMARK).ok().flatten().and_then(|s| s.parse::<i64>().ok());
-    let jql = sync_jql(keys, since);
     let mut report = Report::default();
     let mut max_updated = since.unwrap_or(0);
+    // Pages restart from the newest `updated` seen rather than continuing by offset: an issue
+    // edited during the run moves to the end of the `updated` order, and an offset would then
+    // step over the issue that slid into its place, for good once the watermark passed it.
+    let mut cursor = since;
     let mut start = 0u32;
+    // Key → `updated` already handled this run. Restarted pages overlap the previous one, and a
+    // repeat must be neither counted again nor retried; an issue edited mid-run comes back with
+    // a new `updated` and is handled again.
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     loop {
+        let jql = sync_jql(keys, cursor);
         let page = client.search_full(&jql, start, PAGE).map_err(|e| IndexError::Source(e.to_string()))?;
         if page.issues.is_empty() {
             break;
         }
         let fetched = page.issues.len() as u32;
+        let page_max = page.issues.iter().filter_map(|i| updated_ms(&i.updated)).max();
         for issue in &page.issues {
-            report.scanned += 1;
             max_updated = max_updated.max(updated_ms(&issue.updated).unwrap_or(0));
+            match seen.insert(issue.key.clone(), issue.updated.clone()) {
+                Some(prev) if prev == issue.updated => continue,
+                Some(_) => {}
+                None => report.scanned += 1,
+            }
             let fingerprint = issue.updated.clone();
             if state.get(SOURCE, &issue.key)?.is_some_and(|i| i.fingerprint == fingerprint) {
                 report.unchanged += 1;
@@ -262,16 +279,63 @@ pub async fn sync_jira(
             report.chunks += n;
             report.redactions += redactions;
         }
-        start += fetched;
-        if start >= page.total {
+        if start + fetched >= page.total {
             break;
+        }
+        match page_max {
+            // The re-query overlaps the page by the JQL margin; those issues are unchanged.
+            Some(m) if cursor.is_none_or(|c| m > c) => {
+                cursor = Some(m);
+                start = 0;
+            }
+            // A whole page within one cursor window: only an offset can move past it.
+            _ => start += fetched,
         }
     }
     // Persist the watermark only after a clean pass, so a mid-run failure re-scans the tail.
     if report.failed.is_empty() && max_updated > 0 {
         let _ = state.set_meta(WATERMARK, &max_updated.to_string());
     }
+    let last = state.get_meta(RECONCILED).ok().flatten().and_then(|s| s.parse::<i64>().ok());
+    if last.is_none_or(|l| now_ms - l >= RECONCILE_EVERY_MS) {
+        report.removed = reconcile(store, state, client, keys).await?;
+        state.set_meta(RECONCILED, &now_ms.to_string())?;
+    }
     Ok(report)
+}
+
+/// Removes indexed issues of the mapped projects that Jira no longer has under that key: deleted,
+/// or moved to another key or project. The delta sync only ever sees issues that still match,
+/// so without this they would stay searchable forever. A key missing from the listing is removed
+/// only once Jira confirms it, so a listing that shifted while it was paged deletes nothing.
+/// Returns how many issues were removed.
+async fn reconcile(store: &Store, state: &State, client: &Jira, keys: &[String]) -> Result<usize, IndexError> {
+    let listed: std::collections::HashSet<String> = client
+        .all_keys(&format!("project in ({}) ORDER BY key ASC", keys.join(", ")))
+        .map_err(|e| IndexError::Source(e.to_string()))?
+        .into_iter()
+        .collect();
+    let indexed = SearchFilter::default().eq("source", SOURCE).eq("kind", "issue").any_of("project", keys.to_vec());
+    let mut removed = 0;
+    for key in store.distinct_payload(&indexed, "issue_key", 10_000_000).await? {
+        if listed.contains(&key) {
+            continue;
+        }
+        let gone = match client.issue(&key) {
+            Err(sources::jira::JiraError::NotFound(_)) => true,
+            Ok(issue) => issue.key != key,
+            Err(e) => {
+                eprintln!("[jira] could not check {key}, kept: {e}");
+                false
+            }
+        };
+        if gone {
+            store.delete_matching(&SearchFilter::default().eq("source", SOURCE).eq("issue_key", key.clone())).await?;
+            state.forget(SOURCE, &key)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -396,5 +460,18 @@ mod tests {
         let ok = FakeDescriber { calls: std::sync::atomic::AtomicUsize::new(0), out: Ok("x".into()) };
         assert!(resolve_description(&state, &ok, "att-3", "s.png", "image/png", 0, || Err("404".into())).is_none());
         assert_eq!(ok.calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no describe when the fetch fails");
+    }
+
+    #[test]
+    fn a_secret_read_off_a_screenshot_never_reaches_the_cache() {
+        let state = State::in_memory().unwrap();
+        let d = FakeDescriber {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            out: Ok("  terminal shows ghp_abcdefghijklmnopqrstuvwxyz0123456789AB and a 401  ".into()),
+        };
+        let want = "terminal shows [REDACTED:github-token] and a 401";
+        let r = resolve_description(&state, &d, "att-9", "s.png", "image/png", 0, || Ok(vec![4u8, 5]));
+        assert_eq!(r.as_deref(), Some(want));
+        assert_eq!(state.get_image_desc("att-9").unwrap().as_deref(), Some(want));
     }
 }

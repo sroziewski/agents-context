@@ -37,11 +37,24 @@ pub async fn prune_older_than(store: &Store, state_path: &Path, id_field: &str, 
     let filter = SearchFilter::default().between(None, Some(cutoff_ms));
     let points = store.count(&filter).await?;
     let ids = store.distinct_payload(&filter, id_field, 500_000).await?;
-    if apply && points > 0 {
-        store.delete_matching(&filter).await?;
-        State::open(state_path)?.delete_ids(&ids)?;
+    if apply {
+        if points > 0 {
+            store.delete_matching(&filter).await?;
+        }
+        let state = State::open(state_path)?;
+        state.delete_ids(&ids)?;
+        // The state rows are gone, so the next sync re-reads these items; the cutoff keeps it
+        // from writing their old chunks back. A later, narrower prune does not lower it.
+        let key = cutoff_key(store.collection());
+        let kept = state.get_meta(&key)?.and_then(|v| v.parse::<i64>().ok());
+        state.set_meta(&key, &kept.map_or(cutoff_ms, |k| k.max(cutoff_ms)).to_string())?;
     }
     Ok(PruneReport { points, items: ids.len(), applied: apply })
+}
+
+/// State-meta key holding the `prune older-than` cutoff applied to `collection`.
+pub fn cutoff_key(collection: &str) -> String {
+    format!("prune/before_ms/{collection}")
 }
 
 pub fn format_report(label: &str, r: &PruneReport) -> String {

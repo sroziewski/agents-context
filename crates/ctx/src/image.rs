@@ -47,9 +47,12 @@ impl ClaudeImageDescriber {
             "--strict-mcp-config",
             "--settings",
             r#"{"autoMemoryEnabled":false}"#,
-            // Tools are left enabled (Read must see the image); skip the per-read permission prompt
-            // for the single image in the throwaway workdir.
-            "--dangerously-skip-permissions",
+            // Read is the only tool: the screenshot is untrusted, and text in it must not be
+            // able to make the run write files or run commands.
+            "--tools",
+            "Read",
+            "--allowedTools",
+            "Read",
             "--output-format",
             "json",
         ]
@@ -170,15 +173,28 @@ mod tests {
     }
 
     #[test]
-    fn args_allow_reading_but_disable_hooks_and_persistence() {
-        let d = ClaudeImageDescriber::new("claude".into(), "haiku", ".".into(), Duration::from_secs(1));
-        let a = d.args();
-        for flag in ["-p", "--dangerously-skip-permissions", "--setting-sources", "--strict-mcp-config", "--no-session-persistence"] {
-            assert!(a.iter().any(|x| x == flag), "missing {flag}");
-        }
-        assert!(!a.iter().any(|x| x == "--tools"), "tools stay enabled so Read can see the image");
-        let model = a.iter().position(|x| x == "--model").unwrap();
-        assert_eq!(a[model + 1], "haiku");
+    fn args_allow_only_read_and_disable_hooks_settings_mcp_and_persistence() {
+        let d = ClaudeImageDescriber::new("claude".into(), "sonnet-x", ".".into(), Duration::from_secs(1));
+        assert_eq!(
+            d.args(),
+            [
+                "-p",
+                "--model",
+                "sonnet-x",
+                "--no-session-persistence",
+                "--setting-sources",
+                "",
+                "--strict-mcp-config",
+                "--settings",
+                r#"{"autoMemoryEnabled":false}"#,
+                "--tools",
+                "Read",
+                "--allowedTools",
+                "Read",
+                "--output-format",
+                "json",
+            ]
+        );
     }
 
     #[test]

@@ -190,6 +190,49 @@ async fn an_empty_space_lists_no_pages_in_one_request() {
     assert_eq!(seen.starts.lock().unwrap().len(), 1);
 }
 
+/// `/rest/api/content` answers one full page with a `next` link, then a reply without `results`;
+/// `/rest/api/space` answers without `results` at once.
+async fn serve_without_results() -> (String, Seen) {
+    let seen = Seen::default();
+    let content = |State(s): State<Seen>, Query(q): Query<std::collections::HashMap<String, String>>| async move {
+        let start = q.get("start").cloned().unwrap_or_default();
+        s.starts.lock().unwrap().push(start.clone());
+        if start == "0" {
+            Json(json!({"results": [{"id": "7", "title": "P7", "version": {"number": 1}}], "size": 1, "_links": {"next": "/rest/api/content?start=1"}}))
+        } else {
+            Json(json!({"size": 0, "message": "temporarily unavailable"}))
+        }
+    };
+    let app: Router = Router::new()
+        .route("/rest/api/content", get(content))
+        .route("/rest/api/space", get(|| async { Json(json!({"size": 0})) }))
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, seen)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_without_results_is_a_parse_error_not_an_empty_listing() {
+    let (url, _) = serve_without_results().await;
+    let err = tokio::task::spawn_blocking(move || Confluence::new(&url, "t").spaces()).await.unwrap().unwrap_err();
+    assert!(matches!(err, ConfluenceError::Parse(_)), "{err:?}");
+    assert_eq!(err.to_string(), "Confluence response could not be parsed: /rest/api/space?type=global: reply without a results list");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_page_without_results_fails_the_whole_listing() {
+    let (url, seen) = serve_without_results().await;
+    let err = tokio::task::spawn_blocking(move || Confluence::new(&url, "t").page_refs("SEDN")).await.unwrap().unwrap_err();
+    assert!(matches!(err, ConfluenceError::Parse(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "Confluence response could not be parsed: /rest/api/content?spaceKey=SEDN&type=page&status=current&expand=version: reply without a results list"
+    );
+    assert_eq!(*seen.starts.lock().unwrap(), ["0", "1"], "the first page was read, then the reply without results");
+}
+
 /// Two pages of SEDN: one last edited in 2024, one in 2026.
 struct AgedPages;
 impl ingest::confluence::PageSource for AgedPages {
@@ -216,7 +259,64 @@ impl ingest::confluence::PageSource for AgedPages {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pruning_old_pages_by_age_lets_the_next_sync_restore_them() {
+async fn the_prune_cutoff_keeps_pages_edited_before_it_out_of_the_index() {
+    const DIM: usize = 64;
+    let q = testkit::qdrant().await;
+    let store = Store::connect(&q.url, None, "confluence", DIM).unwrap();
+    store.ensure_collection(ingest::confluence::CONFLUENCE_FIELDS).await.unwrap();
+    let state = ingest::State::in_memory().unwrap();
+    let cutoff = jiff::civil::date(2025, 1, 1).to_zoned(jiff::tz::TimeZone::UTC).unwrap().timestamp().as_millisecond();
+    let config = ingest::IndexConfig { prune_before_ms: Some(cutoff), ..ingest::IndexConfig::default() };
+    let mut emb = HashEmbedder::new(DIM);
+
+    let r = ingest::confluence::sync_confluence(&store, &mut emb, &ingest::WordCounter, &state, &AgedPages, &["SEDN".to_owned()], &config, 0).await.unwrap();
+
+    assert_eq!(r.report.failed, Vec::<(String, String)>::new());
+    let page = |id: &'static str| store::SearchFilter::default().eq("page_id", id);
+    assert_eq!(store.count(&page("old")).await.unwrap(), 0, "edited in 2024, before the cutoff");
+    assert_eq!(store.count(&page("new")).await.unwrap(), 1, "edited in 2026");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_confluence_index_re_embeds_a_point_of_the_previous_model_and_records_the_new_version() {
+    const DIM: usize = 64;
+    let (url, _) = serve().await;
+    let q = testkit::qdrant().await;
+    let store = Store::connect(&q.url, None, "confluence", DIM).unwrap();
+    store.ensure_collection(ingest::confluence::CONFLUENCE_FIELDS).await.unwrap();
+    let (old, new) = (ctx::index_version("m1"), ctx::index_version("m2"));
+    // A page of a unit that is not mapped: no listing covers it, only the re-embed pass.
+    let Value::Object(payload) =
+        json!({"kind": "page", "source": "confluence", "unit": "OTHER", "page_id": "seeded", "text": "an m1 page", "ts": 1, ingest::VERSION_FIELD: old})
+    else {
+        unreachable!()
+    };
+    store.upsert(vec![store::Doc { id: store::point_id("confluence", "OTHER/seeded/0"), embedding: HashEmbedder::new(DIM).embed_one("old vector").unwrap(), payload }]).await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mapping = tmp.path().join("confluence-projects.json");
+    std::fs::write(&mapping, r#"{"work/sedn": ["SEDN"]}"#).unwrap();
+    let cfg = ctx::config::Config {
+        confluence_url: Some(url),
+        confluence_token: Some("pat".into()),
+        confluence_projects: mapping,
+        ..ctx::config::Config::from_env(|_| None)
+    };
+    let state = ingest::State::open(&tmp.path().join("state.db")).unwrap();
+    state.ensure_version(&old).unwrap();
+    state.set_meta("index_version/confluence", &old).unwrap();
+
+    let mut emb = HashEmbedder::new(DIM);
+    let r = ctx::run_confluence_index(&cfg, &store, &mut emb, "m2", &ingest::WordCounter, &state, &ingest::Redactor::default()).await.unwrap();
+
+    assert_eq!((r.report.indexed, r.report.failed.len()), (5, 0), "{:?}", r.report);
+    let hits = store.scroll(&store::SearchFilter::default().eq("page_id", "seeded"), 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].payload[ingest::VERSION_FIELD], json!(new));
+    assert_eq!(state.get_meta("index_version/confluence").unwrap(), Some(new));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pruned_pages_stay_out_after_the_next_sync() {
     const DIM: usize = 64;
     let q = testkit::qdrant().await;
     let store = Store::connect(&q.url, None, "confluence", DIM).unwrap();
@@ -226,9 +326,8 @@ async fn pruning_old_pages_by_age_lets_the_next_sync_restore_them() {
     let sync = || async {
         let state = ingest::State::open(&state_path).unwrap();
         let mut emb = HashEmbedder::new(DIM);
-        ingest::confluence::sync_confluence(&store, &mut emb, &ingest::WordCounter, &state, &AgedPages, &["SEDN".to_owned()], &ingest::IndexConfig::default(), 0)
-            .await
-            .unwrap()
+        let config = ctx::index_config(&store, &state, &ingest::Redactor::default()).unwrap();
+        ingest::confluence::sync_confluence(&store, &mut emb, &ingest::WordCounter, &state, &AgedPages, &["SEDN".to_owned()], &config, 0).await.unwrap()
     };
     let page = |id: &'static str| store::SearchFilter::default().eq("page_id", id);
     sync().await;
@@ -244,6 +343,7 @@ async fn pruning_old_pages_by_age_lets_the_next_sync_restore_them() {
     drop(state);
 
     let again = sync().await;
-    assert_eq!((again.report.indexed, again.report.unchanged), (1, 1), "only the pruned page is fetched again");
-    assert!(store.count(&page("old")).await.unwrap() > 0, "restored");
+    assert_eq!(again.report.failed, Vec::<(String, String)>::new());
+    assert_eq!(store.count(&page("old")).await.unwrap(), 0, "the recorded cutoff keeps the pruned page out");
+    assert!(store.count(&page("new")).await.unwrap() > 0);
 }

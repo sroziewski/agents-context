@@ -75,6 +75,16 @@ pub fn resolve_issue_key(text: &str, keys: &[String]) -> Option<String> {
     }
 }
 
+/// A full issue key in any case (`hd-12` is `HD-12`); `None` for anything that is not one. Used
+/// where the caller names one issue, so nothing but a key ever reaches an issue URL.
+pub fn normalize_issue_key(text: &str) -> Option<String> {
+    detect_issue_key(&text.trim().to_ascii_uppercase())
+}
+
+fn checked_key(key: &str) -> anyhow::Result<String> {
+    normalize_issue_key(key).ok_or_else(|| anyhow::anyhow!("{key:?} is not a Jira issue key; pass a full key such as HD-123"))
+}
+
 /// Builds a JQL query from plain text. Scopes to `keys` (`project in (…)`) when any are given,
 /// matches with `~`, and orders by most recently updated. Quotes are escaped so text cannot
 /// break out of the JQL string literal.
@@ -111,8 +121,12 @@ impl JiraSearch {
                 (false, Some(p)) => self.keys_for(p)?,
                 _ => Vec::new(),
             };
-            if let Some(key) = resolve_issue_key(query, &keys) {
-                return self.issue(&key);
+            if let Some(key) = resolve_issue_key(query, &keys).and_then(|key| normalize_issue_key(&key)) {
+                match self.jira.issue(&key) {
+                    Ok(issue) => return Ok(format_issue(&issue, &ingest::Redactor::from_file(&self.redact)?)),
+                    Err(sources::jira::JiraError::NotFound(_)) => {}
+                    Err(e) => return Err(anyhow::Error::msg(e)),
+                }
             }
             build_jql(query, &keys)
         };
@@ -128,12 +142,33 @@ impl JiraSearch {
 
     /// One issue by key, where a bare number is completed with `project_key`'s Jira key.
     pub fn issue_in(&self, key: &str, project_key: &str) -> anyhow::Result<String> {
-        let full = resolve_issue_key(key, &self.keys_for(project_key)?).unwrap_or_else(|| key.trim().to_owned());
-        self.issue(&full)
+        self.issue(&self.key_in(key, project_key)?)
+    }
+
+    /// The full key `key` names inside `project_key`: a key as is, or a bare number completed
+    /// with the project's only Jira key. Anything else is an error, never a guess.
+    fn key_in(&self, key: &str, project_key: &str) -> anyhow::Result<String> {
+        if let Some(full) = normalize_issue_key(key) {
+            return Ok(full);
+        }
+        resolve_issue_key(key, &self.keys_for(project_key)?).ok_or_else(|| {
+            anyhow::anyhow!("{key:?} is not a Jira issue key; pass a full key such as HD-123 (a bare number works only where the current project maps to exactly one Jira project)")
+        })
+    }
+
+    /// [`Self::comment`] on the issue `key` names inside `project_key` (see [`Self::issue_in`]).
+    pub fn comment_in(&self, key: &str, project_key: &str, body: &str, confirm: bool) -> anyhow::Result<String> {
+        self.comment(&self.key_in(key, project_key)?, body, confirm)
+    }
+
+    /// [`Self::transition`] on the issue `key` names inside `project_key`.
+    pub fn transition_in(&self, key: &str, project_key: &str, to: &str, confirm: bool) -> anyhow::Result<String> {
+        self.transition(&self.key_in(key, project_key)?, to, confirm)
     }
 
     /// One issue with description and comments, redacted.
     pub fn issue(&self, key: &str) -> anyhow::Result<String> {
+        let key = &checked_key(key)?;
         let issue = self.jira.issue(key).map_err(anyhow::Error::msg)?;
         let redactor = ingest::Redactor::from_file(&self.redact)?;
         Ok(format_issue(&issue, &redactor))
@@ -148,6 +183,7 @@ impl JiraSearch {
     /// Without `confirm` it is a dry run.
     pub fn comment(&self, key: &str, body: &str, confirm: bool) -> anyhow::Result<String> {
         self.require_write_allowed()?;
+        let key = &checked_key(key)?;
         if !confirm {
             return Ok(format!("DRY RUN — would POST a comment to {key}:\n{body}\n\n(pass the confirm/--write flag to actually send it)"));
         }
@@ -159,6 +195,7 @@ impl JiraSearch {
     /// Transitions an issue to the named status (case-insensitive), under the same two locks.
     pub fn transition(&self, key: &str, to: &str, confirm: bool) -> anyhow::Result<String> {
         self.require_write_allowed()?;
+        let key = &checked_key(key)?;
         let available = self.jira.transitions(key).map_err(anyhow::Error::msg)?;
         let Some((id, name)) = available.iter().find(|(_, name)| name.eq_ignore_ascii_case(to.trim())) else {
             let names: Vec<&str> = available.iter().map(|(_, n)| n.as_str()).collect();
@@ -262,17 +299,64 @@ mod tests {
     }
 
     #[test]
+    fn normalize_accepts_full_keys_in_any_case_and_nothing_else() {
+        let rows: &[(&str, Option<&str>)] = &[
+            ("HD-1410", Some("HD-1410")),
+            ("hd-12", Some("HD-12")),
+            ("Sedn26-42", Some("SEDN26-42")),
+            ("  hd-7\t", Some("HD-7")),
+            ("AB-0", Some("AB-0")),
+            ("ABCDEFGHIJ-1", Some("ABCDEFGHIJ-1")),
+            ("ABCDEFGHIJK-1", None),
+            ("H-1", None),
+            ("2HD-1", None),
+            ("1910", None),
+            ("#1910", None),
+            ("-1910", None),
+            ("HD-", None),
+            ("HD", None),
+            ("HD-1/../../x", None),
+            ("HD-1?x=1", None),
+            ("HD-1#frag", None),
+            ("HD 1", None),
+            ("HD -1", None),
+            ("HD- 1", None),
+            ("HD-1 extra", None),
+            ("HD-1-2", None),
+            ("HD--1", None),
+            ("HD-1a", None),
+            ("HD_X-1", None),
+            ("HD-1\nHD-2", None),
+            ("ÄB-1", None),
+            ("HD-１", None),
+            ("", None),
+            ("   ", None),
+        ];
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter(|(text, want)| normalize_issue_key(text).as_deref() != *want)
+            .map(|(text, want)| format!("{text:?}: got {:?}, want {want:?}", normalize_issue_key(text)))
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
     fn maps_project_dirs_to_keys_and_lists_all() {
-        let map: HashMap<String, Vec<String>> = [
-            (sources::project::key("helpdesk"), vec!["HD".to_string()]),
-            (sources::project::key("zsun-help-backend"), vec!["HD".to_string()]),
-            (sources::project::key("sedn26"), vec!["SEDN26".to_string()]),
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("jira-projects.json");
+        std::fs::write(&file, r#"{"Helpdesk": ["HD"], "zsun-help-backend": ["HD"], "sedn26": ["SEDN26"]}"#).unwrap();
+        let map = load_project_keys(&file).unwrap();
+        let expected: HashMap<String, Vec<String>> = [
+            ("helpdesk".to_string(), vec!["HD".to_string()]),
+            ("zsun-help-backend".to_string(), vec!["HD".to_string()]),
+            ("sedn26".to_string(), vec!["SEDN26".to_string()]),
         ]
         .into_iter()
         .collect();
-        assert_eq!(keys_for_project(&sources::project::key("d:/dev/helpdesk"), &map), ["HD"]);
-        assert_eq!(keys_for_project(&sources::project::key("d:/dev/sedn/sedn26"), &map), ["SEDN26"]);
-        assert!(keys_for_project(&sources::project::key("d:/dev/unrelated"), &map).is_empty());
+        assert_eq!(map, expected, "mapping names are normalised, never resolved against the process cwd");
+        assert_eq!(keys_for_project("d:/dev/helpdesk", &map), ["HD"]);
+        assert_eq!(keys_for_project("d:/dev/sedn/sedn26", &map), ["SEDN26"]);
+        assert!(keys_for_project("d:/dev/unrelated", &map).is_empty());
         assert_eq!(all_keys(&map), ["HD", "SEDN26"]);
     }
 

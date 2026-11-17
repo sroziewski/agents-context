@@ -28,6 +28,14 @@ const CASES: &str = r#"
 {"id": "none", "query": "kubernetes ingress certificates rotation", "project": "Z:\\work\\alpha", "lang": "en"}
 "#;
 
+/// A few hours after the newest fixture (2026-09-22T10:00Z): recency is measured from here, so
+/// the expected order does not change as the fixtures age.
+const SHORTLY_AFTER_THE_FIXTURES: &str = "2026-09-23T00:00:00Z";
+
+fn ms(rfc3339: &str) -> i64 {
+    rfc3339.parse::<jiff::Timestamp>().unwrap().as_millisecond()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn eval_measures_variants_recency_and_inject_thresholds() {
     let e = indexed(FIXTURES).await;
@@ -36,7 +44,8 @@ async fn eval_measures_variants_recency_and_inject_thresholds() {
     let vectors = eval::embed_queries(&ctx, &cases).await.unwrap();
 
     let recency = Recency { weight: 0.5, half_life_days: 30.0 };
-    let reports = eval::run_retrieval(&ctx, &cases, &eval::variants(store::SearchMode::Hybrid, recency, ctx::lexical::Lexical::Off), &vectors).await.unwrap();
+    let variants = eval::variants(store::SearchMode::Hybrid, recency, ctx::lexical::Lexical::Off);
+    let reports = eval::run_retrieval_at(&ctx, &cases, &variants, &vectors, Some(ms(SHORTLY_AFTER_THE_FIXTURES))).await.unwrap();
     assert_eq!(reports.len(), 6);
     let production = reports.iter().find(|r| r.name == PRODUCTION).unwrap();
     assert_eq!(production.cases.len(), 3, "negatives are not retrieval cases");
@@ -45,6 +54,19 @@ async fn eval_measures_variants_recency_and_inject_thresholds() {
     assert_eq!(production.turn_hit_at_5, (1, 1), "the one turn-targeted case finds its turn");
     let table = eval::format_retrieval(&reports);
     assert!(table.contains(PRODUCTION) && table.contains("turn@5"), "{table}");
+
+    // The pin is what decides the order. Ten years on, both decisions have decayed to the same
+    // factor (0.5^(3650/30) vanishes next to 1 - weight), so recency no longer separates them and
+    // the order is the one relevance alone gives - which prefers the superseded decision.
+    let production_of = |reports: Vec<eval::VariantReport>| reports.into_iter().find(|r| r.name == PRODUCTION).unwrap();
+    let aged = production_of(eval::run_retrieval_at(&ctx, &cases, &variants, &vectors, Some(ms("2036-09-20T10:00:00Z"))).await.unwrap());
+    let no_recency = eval::variants(store::SearchMode::Hybrid, Recency::OFF, ctx::lexical::Lexical::Off);
+    let relevance_only = production_of(eval::run_retrieval_at(&ctx, &cases, &no_recency, &vectors, Some(ms(SHORTLY_AFTER_THE_FIXTURES))).await.unwrap());
+    assert_eq!(relevance_only.latest, (0, 1), "the fixture is a recency case only if relevance alone prefers the old decision");
+    assert_eq!(aged.cases, relevance_only.cases);
+    assert_eq!(aged.latest, (0, 1), "with `now` far in the future the newer decision no longer ranks first");
+    let again = production_of(eval::run_retrieval_at(&ctx, &cases, &variants, &vectors, Some(ms(SHORTLY_AFTER_THE_FIXTURES))).await.unwrap());
+    assert_eq!(&again, production, "the same pinned instant gives the same report");
 
     // --compare path: dense vs production, with a bootstrap CI and no panics on real data.
     let two = eval::variants(store::SearchMode::Hybrid, recency, ctx::lexical::Lexical::Off);
@@ -110,6 +132,37 @@ async fn eval_measures_variants_recency_and_inject_thresholds() {
     assert!(deep.turns.len() <= 3, "cut to the limit");
     let top = deep.turns[0].payload.get("session_id").and_then(|v| v.as_str()).unwrap();
     assert_eq!(top, "beta-deploy", "the overlap reranker puts the jenkins turn first");
+}
+
+async fn sessions_in_order(ctx: &Context, now_ms: Option<i64>) -> Vec<String> {
+    let mut q = ctx::search::Query::new("which embedding model did we choose", ctx::search::Scope::Project(sources::project::key(ALPHA)), 5);
+    q.recency = Recency { weight: 0.5, half_life_days: 30.0 };
+    q.now_ms = now_ms;
+    eval::session_order(&ctx.search(&q).await.unwrap(), true)
+}
+
+/// The corpus of the test above, except that the newer decision was made yesterday by the real
+/// clock - so the wall clock, and nothing pinned, is what puts it first.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_pinned_now_recency_is_measured_from_the_wall_clock() {
+    let now = jiff::Timestamp::now();
+    let yesterday: &'static str = Box::leak((now - jiff::SignedDuration::from_hours(24)).strftime("%Y-%m-%dT%H:%M:%SZ").to_string().into_boxed_str());
+    let fixtures = [
+        Fixture { id: "model-old", cwd: ALPHA, at: FIXTURES[0].at, prompts: FIXTURES[0].prompts },
+        Fixture { id: "model-new", cwd: ALPHA, at: yesterday, prompts: FIXTURES[1].prompts },
+        Fixture { id: "css", cwd: ALPHA, at: FIXTURES[2].at, prompts: FIXTURES[2].prompts },
+        Fixture { id: "beta-deploy", cwd: BETA, at: FIXTURES[3].at, prompts: FIXTURES[3].prompts },
+    ];
+    let e = indexed(&fixtures).await;
+    let ctx = Context { store: e.store.clone(), embedder: Arc::new(Mutex::new(Box::new(HashEmbedder::new(DIM)) as Box<dyn Embedder>)) };
+
+    let unpinned = sessions_in_order(&ctx, None).await;
+    assert_eq!(unpinned.first().map(String::as_str), Some("model-new"), "{unpinned:?}");
+    assert_eq!(sessions_in_order(&ctx, Some(now.as_millisecond())).await, unpinned, "pinning the real `now` changes nothing");
+
+    let ten_years_on = now.as_millisecond() + 3650 * 86_400_000;
+    let aged = sessions_in_order(&ctx, Some(ten_years_on)).await;
+    assert_eq!(aged.first().map(String::as_str), Some("model-old"), "a pinned `now` replaces the wall clock: {aged:?}");
 }
 
 const ID_FIXTURES: &[Fixture] = &[

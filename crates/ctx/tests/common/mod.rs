@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod jira_mock;
+
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;

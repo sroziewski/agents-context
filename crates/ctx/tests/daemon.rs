@@ -237,6 +237,203 @@ async fn cli_index_is_delegated_to_the_daemon() {
     assert_eq!(e.chunks().await, 1);
 }
 
+/// A daemon whose run `n` ends as `outcome(n)`; run 1 blocks until the returned gate is notified.
+/// No Qdrant behind it: the runs are scripted.
+async fn scripted_daemon(debounce: Duration, outcome: fn(u64) -> Result<String, String>) -> (String, IndexQueue, Arc<tokio::sync::Notify>) {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let g = gate.clone();
+    let started = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let runner: ctx::queue::Runner = Arc::new(move |_| {
+        let g = g.clone();
+        let n = started.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Box::pin(async move {
+            if n == 1 {
+                g.notified().await;
+            }
+            outcome(n).map_err(anyhow::Error::msg)
+        })
+    });
+    let queue = IndexQueue::start(runner, debounce);
+    let app = service_router(SharedEmbedder::new(Box::new(HashEmbedder::new(DIM))), "hash", Some(queue.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, queue, gate)
+}
+
+/// Calls `delegate_index` while run 1 is in progress and lets run 1 finish only once the
+/// CLI's request has been queued behind it. The long debounce leaves the daemon idle with
+/// `runs` already increased between run 1 and the CLI's own run 2.
+async fn delegate_to_a_busy_daemon(outcome: fn(u64) -> Result<String, String>) -> Status {
+    let (url, queue, gate) = scripted_daemon(Duration::from_millis(700), outcome).await;
+    assert_eq!(queue.request(Target::All), 1);
+    wait_until("run 1 starts", || queue.status().running).await;
+    let call = tokio::task::spawn_blocking(move || ctx::hook::delegate_index(&url, Target::Claude, Duration::from_secs(30)));
+    wait_until("the CLI's request is queued", || queue.ticket(queue.epoch(), 2) == ctx::queue::Ticket::Pending).await;
+    gate.notify_one();
+    call.await.unwrap().unwrap().expect("daemon is up")
+}
+
+async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    for _ in 0..1000 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("never happened: {what}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_index_against_a_busy_daemon_reports_its_own_run_not_the_one_in_progress() {
+    let status = delegate_to_a_busy_daemon(|n| Ok(format!("run {n}"))).await;
+    assert_eq!((status.last_report.as_deref(), status.last_error.as_deref()), (Some("run 2"), None));
+    assert_eq!((status.running, status.runs, status.last_target), (false, 2, Some(Target::Claude)), "the status is already that of the finished run");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_index_against_a_busy_daemon_reports_its_own_runs_failure() {
+    let status = delegate_to_a_busy_daemon(|n| if n == 2 { Err("run 2 failed: qdrant down".to_owned()) } else { Ok(format!("run {n}")) }).await;
+    assert_eq!((status.last_report.as_deref(), status.last_error.as_deref()), (None, Some("run 2 failed: qdrant down")), "run 1's report is not this request's");
+    assert_eq!((status.running, status.runs, status.last_target), (false, 2, Some(Target::Claude)));
+}
+
+/// A stand-in daemon answering from `reply`, which sees the request line (`METHOD path`) and how
+/// many requests came before it. Returns the URL and the log of request lines.
+async fn mock_daemon(reply: fn(&str, usize) -> axum::response::Response) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let l = log.clone();
+    // The body is read to its end: answering a POST without reading it lets the server close the
+    // connection under the client that is still sending.
+    let app = axum::Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri, _body: String| {
+        let l = l.clone();
+        async move {
+            let line = format!("{method} {}", uri.path());
+            let earlier = {
+                let mut log = l.lock().unwrap();
+                log.push(line.clone());
+                log.len() - 1
+            };
+            reply(&line, earlier)
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, log)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_index_fails_promptly_when_the_daemon_does_not_know_its_ticket() {
+    use axum::response::IntoResponse;
+    // A daemon that restarted after accepting: it still answers, but the ticket is not its own.
+    let (url, log) = mock_daemon(|line, _| match line {
+        "GET /index/status" => axum::Json(Status { runs: 4, ..Status::default() }).into_response(),
+        "POST /index" => (axum::http::StatusCode::ACCEPTED, axum::Json(ctx::embed_server::IndexAccepted { epoch: 7, ticket: 3 })).into_response(),
+        "GET /index/ticket/7/3" => axum::Json(ctx::queue::Ticket::Unknown).into_response(),
+        _ => axum::Json(ctx::queue::Ticket::Pending).into_response(),
+    })
+    .await;
+    let start = std::time::Instant::now();
+    let err = tokio::task::spawn_blocking(move || ctx::hook::delegate_index(&url, Target::All, Duration::from_secs(30))).await.unwrap().unwrap_err();
+    let took = start.elapsed();
+    assert_eq!(err.to_string(), "the daemon restarted before the requested index run finished; run the command again");
+    assert!(took < Duration::from_secs(5), "must not poll until the 30 s deadline: {took:?}");
+    assert_eq!(*log.lock().unwrap(), ["GET /index/status", "POST /index", "GET /index/ticket/7/3"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_index_still_works_against_a_daemon_that_answers_202_without_a_ticket() {
+    use axum::response::IntoResponse;
+    fn status(runs: u64, running: bool, report: &str) -> Status {
+        Status { running, runs, last_target: Some(Target::Opencode), last_report: Some(report.to_owned()), last_error: None, last_finished_ms: Some(1_790_000_000_000 + runs as i64) }
+    }
+    // The daemon before tickets: an empty 202, then the run shows up in /index/status only.
+    let (url, log) = mock_daemon(|line, earlier| match (line, earlier) {
+        ("GET /index/status", 0) => axum::Json(status(4, false, "run 4")).into_response(),
+        ("POST /index", _) => axum::http::StatusCode::ACCEPTED.into_response(),
+        ("GET /index/status", 2) => axum::Json(status(4, true, "run 4")).into_response(),
+        ("GET /index/status", _) => axum::Json(status(5, false, "run 5")).into_response(),
+        _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+    })
+    .await;
+    let got = tokio::task::spawn_blocking(move || ctx::hook::delegate_index(&url, Target::Opencode, Duration::from_secs(30))).await.unwrap().unwrap();
+    assert_eq!(got, Some(status(5, false, "run 5")));
+    assert_eq!(*log.lock().unwrap(), ["GET /index/status", "POST /index", "GET /index/status", "GET /index/status"], "the ticket route is never asked");
+}
+
+fn mock_status(runs: u64, report: &str) -> Status {
+    Status { running: false, runs, last_target: Some(Target::Opencode), last_report: Some(report.to_owned()), last_error: None, last_finished_ms: Some(1_790_000_000_000 + runs as i64) }
+}
+
+fn mock_done(report: &str) -> ctx::queue::Ticket {
+    ctx::queue::Ticket::Done(ctx::queue::Outcome { report: Some(report.to_owned()), error: None })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_index_keeps_polling_when_the_ticket_route_hiccups() {
+    use axum::response::IntoResponse;
+    // The ticket route fails once, then answers something that is not JSON, then the outcome.
+    let (url, log) = mock_daemon(|line, earlier| match (line, earlier) {
+        ("GET /index/status", 0) => axum::Json(mock_status(4, "run 4")).into_response(),
+        ("POST /index", _) => (axum::http::StatusCode::ACCEPTED, axum::Json(ctx::embed_server::IndexAccepted { epoch: 7, ticket: 3 })).into_response(),
+        ("GET /index/ticket/7/3", 2) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        ("GET /index/ticket/7/3", 3) => "<html>busy</html>".into_response(),
+        ("GET /index/ticket/7/3", _) => axum::Json(mock_done("the ticket's run")).into_response(),
+        ("GET /index/status", _) => axum::Json(mock_status(5, "the status's run")).into_response(),
+        _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+    })
+    .await;
+    let got = tokio::task::spawn_blocking(move || ctx::hook::delegate_index(&url, Target::Opencode, Duration::from_secs(30))).await.unwrap().unwrap();
+    assert_eq!(got, Some(Status { last_report: Some("the ticket's run".into()), ..mock_status(5, "") }), "the status of the daemon with the ticket's own outcome");
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["GET /index/status", "POST /index", "GET /index/ticket/7/3", "GET /index/ticket/7/3", "GET /index/ticket/7/3", "GET /index/status"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_index_gives_up_when_its_ticket_is_still_pending_at_the_deadline() {
+    use axum::response::IntoResponse;
+    let (url, log) = mock_daemon(|line, _| match line {
+        "GET /index/status" => axum::Json(mock_status(4, "run 4")).into_response(),
+        "POST /index" => (axum::http::StatusCode::ACCEPTED, axum::Json(ctx::embed_server::IndexAccepted { epoch: 7, ticket: 3 })).into_response(),
+        "GET /index/ticket/7/3" => axum::Json(ctx::queue::Ticket::Pending).into_response(),
+        _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+    })
+    .await;
+    let err = tokio::task::spawn_blocking(move || ctx::hook::delegate_index(&url, Target::All, Duration::from_millis(600))).await.unwrap().unwrap_err();
+    assert_eq!(err.to_string(), "daemon accepted the request but did not finish within 600ms; check `/index/status`");
+    let log = log.lock().unwrap();
+    assert_eq!(log[..3], ["GET /index/status", "POST /index", "GET /index/ticket/7/3"]);
+    assert!(log[3..].iter().all(|line| line == "GET /index/ticket/7/3"), "only the ticket is polled: {log:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_index_returns_its_tickets_outcome_even_when_the_status_can_no_longer_be_read() {
+    use axum::response::IntoResponse;
+    let (url, log) = mock_daemon(|line, earlier| match (line, earlier) {
+        ("GET /index/status", 0) => axum::Json(mock_status(4, "run 4")).into_response(),
+        ("POST /index", _) => (axum::http::StatusCode::ACCEPTED, axum::Json(ctx::embed_server::IndexAccepted { epoch: 7, ticket: 3 })).into_response(),
+        ("GET /index/ticket/7/3", _) => axum::Json(ctx::queue::Ticket::Done(ctx::queue::Outcome { report: None, error: Some("the ticket's run failed".into()) })).into_response(),
+        _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    })
+    .await;
+    let got = tokio::task::spawn_blocking(move || ctx::hook::delegate_index(&url, Target::Opencode, Duration::from_secs(30))).await.unwrap().unwrap().expect("the run finished");
+    assert_eq!((got.last_report.as_deref(), got.last_error.as_deref()), (None, Some("the ticket's run failed")), "not run 4's report from the earlier status");
+    assert_eq!(*log.lock().unwrap(), ["GET /index/status", "POST /index", "GET /index/ticket/7/3", "GET /index/status"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_index_falls_back_when_the_daemon_has_no_index_queue() {
+    let app = service_router(SharedEmbedder::new(Box::new(HashEmbedder::new(DIM))), "hash", None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let outcome = tokio::task::spawn_blocking(move || ctx::hook::delegate_index(&url, Target::All, Duration::from_secs(5))).await.unwrap().unwrap();
+    assert_eq!(outcome, None);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_index_falls_back_when_no_daemon_is_running() {
     let outcome = tokio::task::spawn_blocking(|| ctx::hook::delegate_index("http://127.0.0.1:9", Target::All, Duration::from_secs(5)))

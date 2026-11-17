@@ -119,7 +119,7 @@ pub fn paths(text: &str) -> Vec<String> {
     for raw in text.split(|c: char| c.is_whitespace() || "`'\"()[],;".contains(c)) {
         let t = raw.trim_end_matches(['.', ':', '!', '?']);
         // `src/x.rs:42` and `src/x.rs:42:7` name the file.
-        let t = t.trim_end_matches(|c: char| c.is_ascii_digit() || c == ':');
+        let t = strip_line_suffix(t);
         let t = if t.ends_with(|c: char| c.is_ascii_alphanumeric()) { t } else { raw.trim_end_matches(['.', ':', '!', '?']) };
         if t.contains("://") || t.contains(['<', '>', '*', '{', '}', '$', '|']) || !t.contains(['/', '\\']) {
             continue;
@@ -134,6 +134,18 @@ pub fn paths(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// `t` without trailing `:line` / `:line:col` suffixes. Digits that are not behind a colon belong
+/// to the name (`install.ps1`, `clip.mp4`).
+fn strip_line_suffix(mut t: &str) -> &str {
+    loop {
+        let digitless = t.trim_end_matches(|c: char| c.is_ascii_digit());
+        match digitless.strip_suffix(':') {
+            Some(rest) if digitless.len() < t.len() => t = rest,
+            _ => return t,
+        }
+    }
 }
 
 fn is_absolute(p: &str) -> bool {
@@ -569,6 +581,48 @@ mod tests {
     #[test]
     fn paths_with_line_numbers_and_prose_abbreviations() {
         assert_eq!(paths("see src/x.rs:42 and src/y.rs:1:7, e.g./i.e. prose"), ["src/x.rs", "src/y.rs"]);
+    }
+
+    #[test]
+    fn digits_stay_in_a_name_and_only_line_suffixes_are_cut() {
+        let rows: &[(&str, &[&str])] = &[
+            ("scripts/install.ps1", &["scripts/install.ps1"]),
+            ("media/clip.mp4", &["media/clip.mp4"]),
+            ("D:\\dev\\models\\bge-m3-fp32", &["D:\\dev\\models\\bge-m3-fp32"]),
+            ("src/x.rs:42", &["src/x.rs"]),
+            ("src/y.rs:1:7", &["src/y.rs"]),
+            ("scripts/install.ps1:12", &["scripts/install.ps1"]),
+            ("media/clip.mp4:3:14", &["media/clip.mp4"]),
+            ("D:\\dev\\models\\bge-m3-fp32:8", &["D:\\dev\\models\\bge-m3-fp32"]),
+            ("see src/x.rs.", &["src/x.rs"]),
+            ("see scripts/install.ps1.", &["scripts/install.ps1"]),
+            ("broken at src/x.rs:42.", &["src/x.rs"]),
+            ("is it scripts/install.ps1:12?", &["scripts/install.ps1"]),
+            ("look at src/x.rs:42:", &["src/x.rs"]),
+            ("crates/v2/src/lib.rs", &["crates/v2/src/lib.rs"]),
+            ("first scripts/install.ps1:12, then media/clip.mp4 and src/y.rs:1:7", &["scripts/install.ps1", "media/clip.mp4", "src/y.rs"]),
+            ("src/x.rs:42 again at src/x.rs:50 and src/x.rs", &["src/x.rs"]),
+            ("https://x.io/a.md:12", &[]),
+            ("https://x.io/v2/install.ps1", &[]),
+            ("<dir>/install.ps1:3", &[]),
+            ("scripts/*.ps1:7", &[]),
+            ("${HOME}/clip.mp4", &[]),
+            ("install.ps1:12", &[]),
+            ("logs/app.log:12:30:45", &["logs/app.log"]),
+            ("src/x.rs::42", &[]),
+            ("12:30", &[]),
+            ("C:12", &[]),
+            ("host:8080/path", &[]),
+            ("", &[]),
+        ];
+        let wrong: Vec<String> = rows.iter().filter(|(text, want)| paths(text) != *want).map(|(text, want)| format!("{text:?}: got {:?}, want {want:?}", paths(text))).collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn a_long_extension_ending_in_a_digit_is_still_a_path() {
+        assert_eq!(paths("the state lives in data/x.sqlite3"), ["data/x.sqlite3"]);
+        assert_eq!(paths("data/x.sqlite3:9"), ["data/x.sqlite3"]);
     }
 
     #[test]

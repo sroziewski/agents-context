@@ -124,7 +124,7 @@ pub(crate) fn run_claude(exe: &std::path::Path, args: &[String], cwd: &std::path
 /// Kills the child and everything it started. `Child::kill` ends only the direct child: with a
 /// `claude.cmd` shim that is cmd.exe, and the real CLI underneath would keep running (and
 /// billing) and keep the output pipes open.
-fn kill_tree(child: &mut std::process::Child) {
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
     let _ = Command::new("taskkill")
         .args(["/T", "/F", "/PID", &child.id().to_string()])
         .stdout(Stdio::null())

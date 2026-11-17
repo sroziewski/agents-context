@@ -476,7 +476,7 @@ async fn main() -> anyhow::Result<()> {
             let mut s = ctx::statusline::parse(&hook::read_stdin());
             s.daemon_up = Some(ctx::statusline::daemon_up(&cfg.embed_url, Duration::from_millis(150)));
             let synced = cfg.teams_db.is_file().then(|| sources::teams::TeamsDb::open(&cfg.teams_db).ok()?.last_synced_at().ok()?).flatten();
-            s.teams_stale = synced.is_some_and(|ms| ctx::handoff::now_ms() - ms > cfg.teams_watch.stale_after.as_millis() as i64);
+            s.teams_stale = synced.is_some() && ctx::teams_watch::is_stale(&cfg.teams_watch, synced, &jiff::Zoned::now());
             let t = ctx::statusline::Thresholds { warn: cfg.status_warn, crit: cfg.status_crit, handoff: cfg.handoff };
             println!("{}", ctx::statusline::render(&s, t));
             Ok(())
@@ -486,13 +486,7 @@ async fn main() -> anyhow::Result<()> {
             match action {
                 InjectAction::On { ref client } | InjectAction::Off { ref client } => {
                     let on = matches!(action, InjectAction::On { .. });
-                    let key = match client.as_deref() {
-                        None => "CTX_INJECT",
-                        Some("claude") => "CTX_INJECT_CLAUDE",
-                        Some("opencode") => "CTX_INJECT_OPENCODE",
-                        Some(other) => anyhow::bail!("unknown client {other:?}; use claude or opencode"),
-                    };
-                    ctx::config::set_env_value(&env_file, key, if on { "on" } else { "off" })?;
+                    ctx::config::switch_inject(&env_file, client.as_deref(), on)?;
                     println!("auto-inject {} for {} ({})", if on { "on" } else { "off" }, client.as_deref().unwrap_or("all clients"), env_file.display());
                     if on {
                         println!("Claude needs the UserPromptSubmit hook (`ctx.exe hook --inject`); OpenCode needs the ctx-inject plugin.");
@@ -515,6 +509,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 InjectAction::Preview { prompt } => {
                     // Show what would be injected even when inject is currently off.
+                    let enabled = cfg.inject.enabled_claude;
                     let mut cfg = cfg.clone();
                     cfg.inject.enabled_claude = true;
                     let injector = injector(&cfg).await?;
@@ -528,7 +523,7 @@ async fn main() -> anyhow::Result<()> {
                     if resp.context.is_empty() {
                         println!("nothing would be injected (no summary of this project scores {:.2} or more, or the prompt is too short)", cfg.inject.min_score);
                     } else {
-                        println!("{}\n\n({} tokens max; enabled: {})", resp.context, cfg.inject.max_tokens, cfg.inject.enabled);
+                        println!("{}\n\n({} tokens max; enabled: {})", resp.context, cfg.inject.max_tokens, enabled);
                     }
                 }
             }
@@ -736,8 +731,8 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", js.search(&query, project_key.as_deref(), jql, all, limit)?);
                 }
                 JiraAction::Issue { key } => println!("{}", js.issue_in(&key, &mcp::current_project())?),
-                JiraAction::Comment { key, body, write } => println!("{}", js.comment(&key, &body, write)?),
-                JiraAction::Transition { key, to, write } => println!("{}", js.transition(&key, &to, write)?),
+                JiraAction::Comment { key, body, write } => println!("{}", js.comment_in(&key, &mcp::current_project(), &body, write)?),
+                JiraAction::Transition { key, to, write } => println!("{}", js.transition_in(&key, &mcp::current_project(), &to, write)?),
             }
             Ok(())
         }

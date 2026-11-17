@@ -8,6 +8,11 @@ pub struct State {
     conn: Connection,
 }
 
+/// Meta key for the Jira delta watermark (max `updated` epoch ms indexed so far).
+pub const JIRA_WATERMARK: &str = "jira/watermark_ms";
+/// Meta key set once the index version first changes; never cleared.
+const VERSION_CHANGED: &str = "index_version_changed";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Indexed {
     pub fingerprint: String,
@@ -140,7 +145,22 @@ impl State {
              on conflict(key) do update set value = excluded.value",
             params![version],
         )?;
+        if current.is_some() {
+            // Issues older than the watermark would never be fetched again, so their chunks
+            // would keep the old chunking.
+            self.conn.execute("delete from meta where key = ?1", params![JIRA_WATERMARK])?;
+            self.conn.execute(
+                "insert into meta (key, value) values (?1, '1') on conflict(key) do nothing",
+                params![VERSION_CHANGED],
+            )?;
+        }
         Ok(current.is_some())
+    }
+
+    /// Whether the index version has ever changed since version stamps were introduced, i.e.
+    /// whether a collection without a recorded version may hold vectors of an older model.
+    pub fn version_ever_changed(&self) -> rusqlite::Result<bool> {
+        Ok(self.get_meta(VERSION_CHANGED)?.is_some())
     }
 
     /// Reads a free-form meta value (e.g. the Jira watermark). `None` if unset.
@@ -415,6 +435,64 @@ mod tests {
         assert!(s.ensure_version("v2").unwrap());
         assert!(s.get("claude", "s1").unwrap().is_none(), "version change forgets sessions");
         assert_eq!(s.summary_count().unwrap(), 0, "and their summaries");
+    }
+
+    #[test]
+    fn first_ever_version_keeps_the_jira_watermark_and_sets_no_change_flag() {
+        let s = State::in_memory().unwrap();
+        s.set_meta(JIRA_WATERMARK, "1759300000000").unwrap();
+        assert!(!s.ensure_version("chunker-3/m1").unwrap());
+        assert_eq!(s.get_meta(JIRA_WATERMARK).unwrap().as_deref(), Some("1759300000000"));
+        assert!(!s.version_ever_changed().unwrap());
+    }
+
+    #[test]
+    fn the_same_version_again_keeps_the_watermark_and_sets_no_change_flag() {
+        let s = State::in_memory().unwrap();
+        s.ensure_version("chunker-3/m1").unwrap();
+        s.set_meta(JIRA_WATERMARK, "1759300000001").unwrap();
+        assert!(!s.ensure_version("chunker-3/m1").unwrap());
+        assert_eq!(s.get_meta(JIRA_WATERMARK).unwrap().as_deref(), Some("1759300000001"));
+        assert!(!s.version_ever_changed().unwrap());
+    }
+
+    #[test]
+    fn a_real_change_drops_the_jira_watermark_and_sets_the_flag_only() {
+        let s = State::in_memory().unwrap();
+        s.ensure_version("chunker-3/m1").unwrap();
+        s.set_meta(JIRA_WATERMARK, "1759300000002").unwrap();
+        s.set_meta("jira/reconciled_ms", "1759300000003").unwrap();
+        s.set_meta("prune/before_ms/sessions", "1700000000000").unwrap();
+
+        assert!(s.ensure_version("chunker-4/m1").unwrap());
+
+        assert_eq!(s.get_meta(JIRA_WATERMARK).unwrap(), None);
+        assert!(s.version_ever_changed().unwrap());
+        assert_eq!(s.get_meta("jira/reconciled_ms").unwrap().as_deref(), Some("1759300000003"), "other meta is kept");
+        assert_eq!(s.get_meta("prune/before_ms/sessions").unwrap().as_deref(), Some("1700000000000"));
+    }
+
+    #[test]
+    fn the_change_flag_is_never_cleared() {
+        let s = State::in_memory().unwrap();
+        s.ensure_version("chunker-3/m1").unwrap();
+        s.ensure_version("chunker-3/m2").unwrap();
+        s.ensure_version("chunker-3/m2").unwrap();
+        assert!(s.version_ever_changed().unwrap(), "after the same version again");
+        s.ensure_version("chunker-3/m1").unwrap();
+        assert!(s.version_ever_changed().unwrap(), "after changing back");
+    }
+
+    #[test]
+    fn the_change_flag_survives_reopening_the_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let s = State::open(&path).unwrap();
+            s.ensure_version("chunker-3/m1").unwrap();
+            s.ensure_version("chunker-3/m2").unwrap();
+        }
+        assert!(State::open(&path).unwrap().version_ever_changed().unwrap());
     }
 
     #[test]

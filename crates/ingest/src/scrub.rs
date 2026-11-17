@@ -28,14 +28,25 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         rule("api-key", r"\b(sk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,})", 1),
         rule("google-key", r"\b(AIza[0-9A-Za-z_\-]{35})", 1),
         rule("jwt", r"\b(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})", 1),
+        rule("atlassian-token", r"\b(AT(?:ATT|CTT)[A-Za-z0-9_\-=]{20,})", 1),
         rule("bearer", r"(?i)\bbearer\s+([A-Za-z0-9._~+/=\-]{16,})", 1),
+        rule("basic-auth", r"(?i)\bauthorization[\x22']?\s*[:=]\s*[\x22']?basic\s+([A-Za-z0-9+/]{8,}={0,2})", 1),
         // scheme://user:password@host — keeps scheme, user and host so the context stays readable.
         rule("url-password", r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:([^\s@/]+)@", 1),
+        // scheme://:password@host, as Redis URLs carry a password without a user.
+        rule("url-password", r"(?i)\b[a-z][a-z0-9+.\-]*://:([^\s@/]+)@", 1),
+        // A quoted value may contain spaces (a passphrase); the plain assignment below stops at
+        // the first one and would leave the rest of the phrase behind.
+        rule(
+            "assignment",
+            r#"(?i)\b[A-Z0-9_.\-]*(?:password|passwd|passphrase|pwd|has[łl]o|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key|client[_\-]?secret)[A-Z0-9_.\-]*["'`]?\s*[:=]\s*["'`]([^"'`\n$\{<%][^"'`\n]*\s[^"'`\n]*)["'`]"#,
+            1,
+        ),
         // NAME=value / "name": "value" where the name says it is a secret. Values starting with
         // `$`, `{`, `<` or `%` are references (env vars, templates), not secrets.
         rule(
             "assignment",
-            r#"(?i)\b[A-Z0-9_.\-]*(?:password|passwd|pwd|has[łl]o|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key|client[_\-]?secret)[A-Z0-9_.\-]*["'`]?\s*[:=]\s*["'`]?([^\s"'`,;$\{<%][^\s"'`,;]{5,})"#,
+            r#"(?i)\b[A-Z0-9_.\-]*(?:password|passwd|passphrase|pwd|has[łl]o|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key|client[_\-]?secret)[A-Z0-9_.\-]*["'`]?\s*[:=]\s*["'`]?([^\s"'`,;$\{<%][^\s"'`,;]{5,})"#,
             1,
         ),
     ]
@@ -48,6 +59,7 @@ static SECRET_WORD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:pass(?:word|wd|phrase)s?|pwd|has[łl](?:o|a|em|ami|ach|om)|haśle|secrets?|credentials?)\b")
         .expect("secret word")
 });
+static MARKER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[REDACTED:[a-z\-]+\]").expect("marker"));
 /// `host:port` and colon-joined lowercase names (CI job ids like `build:docker`).
 static COLON_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9_.\-]+(?::[a-z0-9_.\-]+)+$").expect("colon name"));
@@ -144,7 +156,9 @@ fn scrub_near_secret_words(text: &str) -> (String, usize) {
         .split('\n')
         .map(|line| {
             let mut ranges: Vec<(usize, usize)> = Vec::new();
-            for m in SECRET_WORD.find_iter(line) {
+            // The kind inside `[REDACTED:url-password]` is not a secret word announcing what follows.
+            let markers: Vec<(usize, usize)> = MARKER.find_iter(line).map(|m| (m.start(), m.end())).collect();
+            for m in SECRET_WORD.find_iter(line).filter(|m| !markers.iter().any(|&(s, e)| s <= m.start() && m.end() <= e)) {
                 let rest = &line[m.end()..];
                 let mut offset = m.end();
                 // Punctuation-only tokens ("password: …") do not count as words.
@@ -420,5 +434,73 @@ mod tests {
     fn polish_text_survives() {
         let text = "Hasło do bazy jest w menedżerze haseł, nie w repozytorium.";
         assert_eq!(redacted(text), text);
+    }
+
+    #[test]
+    fn new_rules_redact_their_secret_and_keep_the_context() {
+        let cases = [
+            ("redis-url", "REDIS_URL redis://:Rd7pw-Q2x@cache.local:6380/2 ok", "REDIS_URL redis://:[REDACTED:url-password]@cache.local:6380/2 ok"),
+            ("rediss-url-upper-scheme", "Rediss://:x9Yq@redis.example:6379/1", "Rediss://:[REDACTED:url-password]@redis.example:6379/1"),
+            ("quoted-phrase", r#"password: "correct horse battery staple" end"#, r#"password: "[REDACTED:assignment]" end"#),
+            ("quoted-phrase-single", "db_secret = 'two words here' x", "db_secret = '[REDACTED:assignment]' x"),
+            ("quoted-phrase-json", r#"{"smtp_password": "open sesame 42"}"#, r#"{"smtp_password": "[REDACTED:assignment]"}"#),
+            ("passphrase-env", "GPG_PASSPHRASE=k3yPhr4seValue", "GPG_PASSPHRASE=[REDACTED:assignment]"),
+            ("passphrase-lower", "passphrase: wordwordword", "passphrase: [REDACTED:assignment]"),
+            ("basic-header", "Authorization: Basic dXNlcjpwYXNzd29yZA== sent", "Authorization: Basic [REDACTED:basic-auth] sent"),
+            ("basic-curl", "curl -H 'authorization=basic YWxhZGRpbjpvcGVu' url", "curl -H 'authorization=basic [REDACTED:basic-auth]' url"),
+            ("atlassian-api", "use ATATT3xFfGF0T4kZ-ab_cd=1A2B3C4D now", "use [REDACTED:atlassian-token] now"),
+            ("atlassian-cloud", "ATCTT3xFfGF0abcdefghijklmnop", "[REDACTED:atlassian-token]"),
+            ("atlassian-in-assignment", "JIRA_TOKEN=ATATT3xFfGF0T4kZabcdefghij", "JIRA_TOKEN=[REDACTED:atlassian-token]"),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(_, text, want)| redacted(text) != *want)
+            .map(|(name, text, want)| format!("{name}: got {:?}, want {want:?}", redacted(text)))
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn a_redis_url_without_a_path_keeps_its_host() {
+        assert_eq!(redacted("REDIS_URL=redis://:x9Yq@redis.example:6379"), "REDIS_URL=redis://:[REDACTED:url-password]@redis.example:6379");
+    }
+
+    #[test]
+    fn a_quoted_basic_auth_header_is_redacted() {
+        assert_eq!(
+            redacted(r#"headers: {"Authorization": "Basic dXNlcjpwYXNzd29yZA=="}"#),
+            r#"headers: {"Authorization": "Basic [REDACTED:basic-auth]"}"#
+        );
+    }
+
+    #[test]
+    fn each_new_rule_counts_one_redaction_and_is_idempotent() {
+        for text in [
+            "redis://:Rd7pw-Q2x@cache.local:6380/2",
+            r#"password: "correct horse battery staple""#,
+            "passphrase=k3yPhr4seValue",
+            "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+            "ATATT3xFfGF0T4kZ-ab_cd=1A2B3C4D",
+        ] {
+            let (once, n) = scrub(text);
+            assert_eq!(n, 1, "{text} -> {once}");
+            assert_eq!(scrub(&once), (once.clone(), 0), "{text}");
+        }
+    }
+
+    #[test]
+    fn near_misses_of_the_new_rules_pass_through() {
+        for text in [
+            "redis://cache.local:6379/0",
+            "redis://@cache.local:6379",
+            r#"title: "correct horse battery staple""#,
+            r#"password: "<your pass phrase>""#,
+            r#"password: "${DB PASS}""#,
+            "Authorization: Basic auth is off",
+            "ATATT is a prefix, ATATTshort too",
+            "the passphrase field is optional",
+        ] {
+            assert_eq!(scrub(text), (text.to_owned(), 0), "{text}");
+        }
     }
 }

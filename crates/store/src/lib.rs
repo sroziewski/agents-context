@@ -168,6 +168,9 @@ impl SearchFilter {
     }
 }
 
+/// Timeout for every Qdrant request.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct Store {
     client: Qdrant,
     collection: String,
@@ -178,7 +181,9 @@ pub struct Store {
 
 impl Store {
     pub fn connect(url: &str, api_key: Option<String>, collection: &str, dim: usize) -> Result<Self> {
-        let client = Qdrant::from_url(url).api_key(api_key).skip_compatibility_check().build()?;
+        // The client's 5 s default fails index writes and scrolls of large sessions on a busy
+        // Qdrant; latency-bound callers (the inject hook) keep their own shorter budget.
+        let client = Qdrant::from_url(url).api_key(api_key).timeout(REQUEST_TIMEOUT).skip_compatibility_check().build()?;
         Ok(Self { client, collection: collection.to_owned(), dim, lexical: false, migration_lock: None })
     }
 

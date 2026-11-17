@@ -238,6 +238,18 @@ pub async fn embed_queries(ctx: &Context, cases: &[Case]) -> anyhow::Result<Hash
 
 /// Retrieval metrics per variant over the positive cases.
 pub async fn run_retrieval(ctx: &Context, cases: &[Case], variants: &[Variant], vectors: &HashMap<String, Embedding>) -> anyhow::Result<Vec<VariantReport>> {
+    run_retrieval_at(ctx, cases, variants, vectors, None).await
+}
+
+/// [`run_retrieval`] with recency measured from `now_ms` instead of the wall clock, so a run over
+/// a fixed corpus gives the same ranking whenever it is repeated.
+pub async fn run_retrieval_at(
+    ctx: &Context,
+    cases: &[Case],
+    variants: &[Variant],
+    vectors: &HashMap<String, Embedding>,
+    now_ms: Option<i64>,
+) -> anyhow::Result<Vec<VariantReport>> {
     let positives: Vec<&Case> = cases.iter().filter(|c| !c.expect.is_empty()).collect();
     let mut reports = Vec::new();
     for v in variants {
@@ -247,6 +259,7 @@ pub async fn run_retrieval(ctx: &Context, cases: &[Case], variants: &[Variant], 
             q.mode = v.mode;
             q.recency = v.recency;
             q.lexical = v.lexical;
+            q.now_ms = now_ms;
             let r = ctx.search_embedded(&vectors[&c.id], &q).await?;
             results.push(judge_turns(c, &session_order(&r, v.summaries), &turn_order(&r)));
         }

@@ -30,6 +30,9 @@ pub struct Query {
     pub recency: Recency,
     /// Legs fused with dense when the query contains an identifier (see [`crate::lexical`]).
     pub lexical: Lexical,
+    /// The instant recency is measured from, in epoch ms; `None` is the wall clock. Pinned by
+    /// evals and tests, whose expected order would otherwise drift as the fixtures age.
+    pub now_ms: Option<i64>,
 }
 
 impl Query {
@@ -46,6 +49,7 @@ impl Query {
             mode: SearchMode::Hybrid,
             recency: Recency::OFF,
             lexical: Lexical::Off,
+            now_ms: None,
         }
     }
 }
@@ -102,7 +106,7 @@ impl Context {
             f
         };
         let (summary_filter, turn_filter) = (filter_for("summary"), filter_for("turn"));
-        let now = jiff::Timestamp::now().as_millisecond();
+        let now = q.now_ms.unwrap_or_else(|| jiff::Timestamp::now().as_millisecond());
         if q.lexical != Lexical::Off && lexical::has_identifier(&q.text) {
             // Summaries rarely contain identifiers, so for these queries they push the session
             // that does further down (DEV-62): turns only.

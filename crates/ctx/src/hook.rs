@@ -101,12 +101,26 @@ pub fn delegate_index(embed_url: &str, target: Target, wait: Duration) -> anyhow
         agent.get(&format!("{base}/index/status")).call().ok()?.body_mut().read_json().ok()
     };
     let Some(before) = status(&agent) else { return Ok(None) };
-    agent.post(&format!("{base}/index")).send_json(serde_json::json!({ "source": target }))?;
+    let accepted: Option<crate::embed_server::IndexAccepted> =
+        agent.post(&format!("{base}/index")).send_json(serde_json::json!({ "source": target }))?.body_mut().read_json().ok();
     let deadline = std::time::Instant::now() + wait;
     while std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
-        if let Some(s) = status(&agent).filter(|s| s.runs > before.runs && !s.running) {
-            return Ok(Some(s));
+        let Some(accepted) = accepted else {
+            if let Some(s) = status(&agent).filter(|s| s.runs > before.runs && !s.running) {
+                return Ok(Some(s));
+            }
+            continue;
+        };
+        let url = format!("{base}/index/ticket/{}/{}", accepted.epoch, accepted.ticket);
+        let ticket: Option<crate::queue::Ticket> = agent.get(&url).call().ok().and_then(|mut r| r.body_mut().read_json().ok());
+        match ticket {
+            Some(crate::queue::Ticket::Done(outcome)) => {
+                let s = status(&agent).unwrap_or_else(|| before.clone());
+                return Ok(Some(crate::queue::Status { last_report: outcome.report, last_error: outcome.error, ..s }));
+            }
+            Some(crate::queue::Ticket::Unknown) => anyhow::bail!("the daemon restarted before the requested index run finished; run the command again"),
+            Some(crate::queue::Ticket::Pending) | None => {}
         }
     }
     anyhow::bail!("daemon accepted the request but did not finish within {wait:?}; check `/index/status`")

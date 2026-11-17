@@ -58,6 +58,8 @@ pub enum Decision {
     CoolingDown,
     /// Stale and eligible: the scraper should be run.
     Trigger,
+    /// A sync this process launched is still running.
+    Running,
 }
 
 /// "8-18" → `(8, 18)`. Malformed, reversed or out-of-range input falls back to `(8, 18)`. The
@@ -79,6 +81,44 @@ fn within_hours(now: &Zoned, (start, end): (u32, u32)) -> bool {
     hour >= start && hour < end
 }
 
+/// Time inside the weekday `[start, end)` window between `since_ms` and `now`. The scraper only
+/// syncs in working hours, so a night or a weekend without a sync is not a missed sync: counting
+/// wall-clock time made "Teams stale" show every evening and all weekend while nothing was wrong.
+pub fn working_ms_since(since_ms: i64, now: &Zoned, (start, end): (u32, u32)) -> i64 {
+    use jiff::civil::Weekday::{Saturday, Sunday};
+    let now_ms = now.timestamp().as_millisecond();
+    if since_ms >= now_ms {
+        return 0;
+    }
+    // Weeks of silence are stale whatever the exact count; this also bounds the day loop.
+    const HORIZON_MS: i64 = 30 * 24 * 3_600_000;
+    let since_ms = since_ms.max(now_ms - HORIZON_MS);
+    let tz = now.time_zone().clone();
+    let Ok(since) = jiff::Timestamp::from_millisecond(since_ms) else { return now_ms - since_ms };
+    let mut day = since.to_zoned(tz.clone()).date();
+    let mut total = 0;
+    while day <= now.date() {
+        if !matches!(day.weekday(), Saturday | Sunday) {
+            let at = |h: u32| -> Option<i64> {
+                let civil = if h >= 24 { day.tomorrow().ok()?.at(0, 0, 0, 0) } else { day.at(h as i8, 0, 0, 0) };
+                Some(civil.to_zoned(tz.clone()).ok()?.timestamp().as_millisecond())
+            };
+            if let (Some(open), Some(close)) = (at(start), at(end)) {
+                total += (close.min(now_ms) - open.max(since_ms)).max(0);
+            }
+        }
+        let Ok(next) = day.tomorrow() else { break };
+        day = next;
+    }
+    total
+}
+
+/// Whether the scraper has missed its syncs: more than `stale_after` of working time since the
+/// last heartbeat. A db that never synced is stale.
+pub fn is_stale(cfg: &WatchConfig, last_synced_ms: Option<i64>, now: &Zoned) -> bool {
+    last_synced_ms.is_none_or(|synced| working_ms_since(synced, now, cfg.hours) >= cfg.stale_after.as_millis() as i64)
+}
+
 /// Decide what to do from the freshness inputs alone — pure, so the policy is testable without a
 /// database, a clock or a process.
 pub fn decide(cfg: &WatchConfig, last_synced_ms: Option<i64>, last_trigger_ms: Option<i64>, now: &Zoned) -> Decision {
@@ -89,11 +129,7 @@ pub fn decide(cfg: &WatchConfig, last_synced_ms: Option<i64>, last_trigger_ms: O
         return Decision::OutsideHours;
     }
     let now_ms = now.timestamp().as_millisecond();
-    let stale_ms = cfg.stale_after.as_millis() as i64;
-    // A never-synced db (None) is treated as stale.
-    if let Some(synced) = last_synced_ms
-        && now_ms.saturating_sub(synced) < stale_ms
-    {
+    if !is_stale(cfg, last_synced_ms, now) {
         return Decision::Fresh;
     }
     if let Some(triggered) = last_trigger_ms
@@ -138,23 +174,82 @@ pub fn build_command(cmd: &str) -> std::process::Command {
 /// minutes (it drives a headless browser), so its outcome is logged, never awaited — indexing
 /// must not block on it, and the cooldown already prevents a second launch.
 pub fn check_and_trigger(cfg: &WatchConfig, teams_db: &Path, state: &State, now: &Zoned) -> anyhow::Result<Decision> {
+    // The cooldown alone does not stop a sync that outlives it from being launched again.
+    let Some(guard) = SyncGuard::acquire() else {
+        return Ok(Decision::Running);
+    };
     let (decision, cmd) = check(cfg, teams_db, state, now)?;
     if let Some(cmd) = cmd {
         std::thread::spawn(move || {
+            let _guard = guard;
             let started = std::time::Instant::now();
             eprintln!("[teams-sync] scraper looks stopped; running: {cmd}");
-            match build_command(&cmd).output() {
-                Ok(out) if out.status.success() => eprintln!("[teams-sync] sync finished in {:.0?}", started.elapsed()),
-                Ok(out) => {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    let tail: String = err.trim().chars().rev().take(400).collect::<String>().chars().rev().collect();
-                    eprintln!("[teams-sync] sync FAILED ({}); if this persists the Teams login has likely expired — run `npm run login`. stderr: {tail}", out.status);
-                }
-                Err(e) => eprintln!("[teams-sync] could not launch the scraper ({e}); check CTX_TEAMS_SYNC_CMD"),
+            match run_sync(&cmd, SYNC_TIMEOUT) {
+                Ok(()) => eprintln!("[teams-sync] sync finished in {:.0?}", started.elapsed()),
+                Err(e) => eprintln!("[teams-sync] sync FAILED ({e}); if this persists the Teams login has likely expired — run `npm run login`"),
             }
         });
     }
     Ok(decision)
+}
+
+/// Longest a triggered sync may run before it is killed; a healthy one takes minutes.
+pub const SYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+static SYNC_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Held while a triggered sync runs; at most one exists per process.
+pub struct SyncGuard(());
+
+impl SyncGuard {
+    pub fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        SYNC_RUNNING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok().then(|| Self(()))
+    }
+}
+
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Runs `cmd` through the shell and waits for it, killing its whole process tree after
+/// `timeout`: the scraper drives a headless browser, which a hung run would otherwise keep alive.
+pub fn run_sync(cmd: &str, timeout: Duration) -> Result<(), String> {
+    use std::io::Read;
+    let mut child = build_command(cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not launch the scraper ({e}); check CTX_TEAMS_SYNC_CMD"))?;
+    let mut err = child.stderr.take().expect("piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = err.read_to_string(&mut s);
+        let _ = tx.send(s);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                crate::summarizer::kill_tree(&mut child);
+                return Err(format!("killed after {timeout:?}"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(e) => return Err(format!("waiting for the scraper: {e}")),
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    // Bounded: a grandchild that inherited the pipe could keep it open after exit.
+    let stderr = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    let tail: String = stderr.trim().chars().rev().take(400).collect::<String>().chars().rev().collect();
+    Err(format!("{status}; stderr: {tail}"))
 }
 
 #[cfg(test)]
@@ -204,15 +299,45 @@ mod tests {
     #[test]
     fn stale_heartbeat_triggers_and_never_synced_counts_as_stale() {
         let now = at("2026-09-28T10:00:00[Europe/Warsaw]");
-        let synced = ms(&at("2026-09-28T02:00:00[Europe/Warsaw]")); // 8h ago > 6h
+        let synced = ms(&at("2026-09-25T11:00:00[Europe/Warsaw]")); // Fri 11:00: 7h Fri + 2h Mon > 6h
         assert_eq!(decide(&cfg(Some("sync")), Some(synced), None, &now), Decision::Trigger);
         assert_eq!(decide(&cfg(Some("sync")), None, None, &now), Decision::Trigger, "never synced");
     }
 
     #[test]
+    fn only_working_hours_count_towards_staleness() {
+        let h = (8, 18);
+        let friday_15 = ms(&at("2026-09-25T15:09:00[Europe/Warsaw]"));
+        // Friday evening and the whole weekend add nothing: 2h51m on Friday, then Monday from 08.
+        assert_eq!(working_ms_since(friday_15, &at("2026-09-26T23:00:00[Europe/Warsaw]"), h), (2 * 60 + 51) * 60_000);
+        assert_eq!(working_ms_since(friday_15, &at("2026-09-28T09:00:00[Europe/Warsaw]"), h), (3 * 60 + 51) * 60_000);
+        // Inside one working day it is plain elapsed time; a heartbeat in the future is 0.
+        let monday_9 = ms(&at("2026-09-28T09:00:00[Europe/Warsaw]"));
+        assert_eq!(working_ms_since(monday_9, &at("2026-09-28T12:30:00[Europe/Warsaw]"), h), 210 * 60_000);
+        assert_eq!(working_ms_since(monday_9 + 1, &at("2026-09-28T09:00:00[Europe/Warsaw]"), h), 0);
+        // Before the window opens and across a DST change (2026-10-25, Sunday).
+        assert_eq!(working_ms_since(monday_9, &at("2026-09-29T07:00:00[Europe/Warsaw]"), h), 9 * 3_600_000);
+        let fri_17 = ms(&at("2026-10-23T17:00:00[Europe/Warsaw]"));
+        assert_eq!(working_ms_since(fri_17, &at("2026-10-26T09:00:00[Europe/Warsaw]"), h), 2 * 3_600_000);
+        // A 0-24 window counts whole weekdays.
+        assert_eq!(working_ms_since(monday_9, &at("2026-09-29T09:00:00[Europe/Warsaw]"), (0, 24)), 24 * 3_600_000);
+    }
+
+    #[test]
+    fn evenings_and_weekends_are_not_stale_but_a_missed_working_day_is() {
+        let c = WatchConfig { stale_after: Duration::from_secs(3 * 3600), ..cfg(Some("sync")) };
+        let friday_15 = ms(&at("2026-09-25T15:09:00[Europe/Warsaw]"));
+        assert!(!is_stale(&c, Some(friday_15), &at("2026-09-26T23:00:00[Europe/Warsaw]")), "Saturday night");
+        assert!(!is_stale(&c, Some(friday_15), &at("2026-09-28T08:05:00[Europe/Warsaw]")), "Monday before the first sync");
+        assert!(is_stale(&c, Some(friday_15), &at("2026-09-28T09:00:00[Europe/Warsaw]")), "Monday 09:00: 3h51m of working time");
+        assert!(is_stale(&c, None, &at("2026-09-26T23:00:00[Europe/Warsaw]")), "never synced");
+        assert!(is_stale(&c, Some(0), &at("2026-09-28T09:00:00[Europe/Warsaw]")), "decades ago, bounded loop");
+    }
+
+    #[test]
     fn cooldown_holds_back_a_repeat_trigger() {
         let now = at("2026-09-28T10:00:00[Europe/Warsaw]");
-        let stale = ms(&at("2026-09-27T10:00:00[Europe/Warsaw]"));
+        let stale = ms(&at("2026-09-24T10:00:00[Europe/Warsaw]")); // Thursday
         let recent = ms(&at("2026-09-28T09:30:00[Europe/Warsaw]")); // 30m ago < 90m
         assert_eq!(decide(&cfg(Some("sync")), Some(stale), Some(recent), &now), Decision::CoolingDown);
         let old = ms(&at("2026-09-28T08:00:00[Europe/Warsaw]")); // 2h ago > 90m
@@ -247,5 +372,99 @@ mod tests {
         let (decision, cmd) = check(&c, &missing_db, &state, &soon).unwrap();
         assert_eq!((decision, cmd), (Decision::CoolingDown, None));
         assert_eq!(state.get_meta(TRIGGER_KEY).unwrap().as_deref(), Some(ms(&now).to_string().as_str()), "marker unchanged");
+    }
+
+    /// The guard is one process-wide flag: every test that takes it goes through this lock.
+    static GUARD_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn wait_for_guard_release(within: Duration) -> SyncGuard {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if let Some(g) = SyncGuard::acquire() {
+                return g;
+            }
+            assert!(std::time::Instant::now() < deadline, "guard still held after {within:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn sync_guard_is_exclusive_and_released_on_drop() {
+        let _serial = GUARD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let first = SyncGuard::acquire().expect("nothing holds the guard at the start");
+        assert!(SyncGuard::acquire().is_none(), "a second guard while the first is held");
+        assert!(SyncGuard::acquire().is_none(), "still held on a repeated attempt");
+        drop(first);
+        let again = SyncGuard::acquire().expect("released on drop");
+        drop(again);
+    }
+
+    #[test]
+    fn check_and_trigger_reports_running_without_touching_the_marker_while_a_sync_runs() {
+        let _serial = GUARD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(&dir.path().join("state.db")).unwrap();
+        let missing_db = dir.path().join("nope.db"); // never synced: stale, so `check` would trigger
+        let monday_10 = at("2026-09-28T10:00:00[Europe/Warsaw]");
+        // Runs ~2 s, long enough to observe the guard held by the launched sync.
+        let c = cfg(Some("ping -n 3 127.0.0.1 >nul"));
+
+        let held = SyncGuard::acquire().expect("guard free at start");
+        assert_eq!(check_and_trigger(&c, &missing_db, &state, &monday_10).unwrap(), Decision::Running);
+        assert_eq!(state.get_meta(TRIGGER_KEY).unwrap(), None, "no cooldown marker while a sync runs");
+        assert!(SyncGuard::acquire().is_none(), "a `Running` answer leaves the guard with its holder");
+        drop(held);
+
+        assert_eq!(check_and_trigger(&c, &missing_db, &state, &monday_10).unwrap(), Decision::Trigger);
+        assert_eq!(state.get_meta(TRIGGER_KEY).unwrap(), Some(ms(&monday_10).to_string()));
+
+        // The launched sync holds the guard: every check past the cooldown is still `Running`,
+        // and the marker keeps the first trigger's time.
+        for minute in ["12:00", "12:01"] {
+            let past_cooldown = at(&format!("2026-09-28T{minute}:00[Europe/Warsaw]"));
+            assert_eq!(check_and_trigger(&c, &missing_db, &state, &past_cooldown).unwrap(), Decision::Running, "{minute}");
+            assert_eq!(state.get_meta(TRIGGER_KEY).unwrap(), Some(ms(&monday_10).to_string()), "{minute}");
+        }
+
+        // ... and gives it back when the sync ends.
+        drop(wait_for_guard_release(Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn run_sync_succeeds_on_exit_zero() {
+        assert_eq!(run_sync("exit 0", Duration::from_secs(20)), Ok(()));
+    }
+
+    #[test]
+    fn run_sync_reports_the_exit_status_and_stderr_on_failure() {
+        assert_eq!(run_sync(">&2 echo login expired& exit 3", Duration::from_secs(20)), Err("exit code: 3; stderr: login expired".to_owned()));
+    }
+
+    #[test]
+    fn run_sync_keeps_only_the_last_400_characters_of_stderr() {
+        // 120 lines "line1".."line120" on stderr, CRLF-separated: well over 400 characters.
+        let r = run_sync("(for /L %i in (1,1,120) do @(>&2 echo line%i)) & exit 5", Duration::from_secs(20));
+        let all = (1..=120).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\r\n");
+        let tail: String = all.chars().skip(all.chars().count() - 400).collect();
+        assert_eq!(r, Err(format!("exit code: 5; stderr: {tail}")));
+    }
+
+    #[test]
+    fn run_sync_kills_the_whole_tree_on_timeout_and_returns_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker.txt");
+        let script = dir.path().join("grandchild.bat");
+        // A grandchild that outlives a killed parent would write the marker after ~3 s.
+        std::fs::write(&script, format!("@ping -n 4 127.0.0.1 >nul\r\n@echo done> \"{}\"\r\n", marker.display())).unwrap();
+        assert!(!script.to_string_lossy().contains(' '), "the command line below assumes no spaces: {}", script.display());
+
+        let started = std::time::Instant::now();
+        let r = run_sync(&format!("cmd /C {}", script.display()), Duration::from_millis(1500));
+        let took = started.elapsed();
+
+        assert_eq!(r, Err("killed after 1.5s".to_owned()));
+        assert!(took < Duration::from_secs(6), "returned after {took:?}");
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(!marker.exists(), "the grandchild survived the kill and finished its work");
     }
 }

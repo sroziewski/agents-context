@@ -19,12 +19,56 @@ pub struct IndexConfig {
     /// Padded tokens per embedding call; see [`batches`].
     pub max_padded_tokens: usize,
     pub max_batch: usize,
+    /// Chunks whose `ts` is at or before this are not written: `ctx prune older-than` removed
+    /// them, and a re-read of their session, thread or issue must not bring them back.
+    pub prune_before_ms: Option<i64>,
 }
 
 impl Default for IndexConfig {
     fn default() -> Self {
         // ~2000 padded tokens took ~1 s per call on the GTX 1650 in the spike, half the TDR limit.
-        Self { chunk: ChunkConfig::default(), max_padded_tokens: 2000, max_batch: 8 }
+        Self { chunk: ChunkConfig::default(), max_padded_tokens: 2000, max_batch: 8, prune_before_ms: None }
+    }
+}
+
+/// Payload field naming the index version (model and chunker) a point's vectors were made with.
+pub const VERSION_FIELD: &str = "index_version";
+
+/// Re-embeds from its stored `text` every point of `store` not stamped with `version`, and stamps
+/// it. A sync after a model or chunker change skips chunks whose text is unchanged, and never
+/// re-reads sessions whose transcript is gone, so without this their old vectors would stay next
+/// to new ones they cannot be compared with. Returns how many points were re-embedded.
+pub async fn reembed_stale(store: &Store, embedder: &mut dyn Embedder, version: &str) -> Result<usize, IndexError> {
+    const PAGE: u32 = 64;
+    // Stored texts run to ~480 tokens; 4 of them stay inside the padded-token budget.
+    const BATCH: usize = 4;
+    let stale = SearchFilter::default().ne(VERSION_FIELD, version);
+    let limit = store.count(&stale).await? as usize + PAGE as usize;
+    let mut done = 0;
+    loop {
+        // Stamped points drop out of the filter, so each read starts from what is left.
+        let page = store.scroll(&stale, PAGE).await?;
+        if page.is_empty() {
+            return Ok(done);
+        }
+        if done > limit {
+            return Err(IndexError::Source(format!("re-embedding did not finish after {done} points")));
+        }
+        for batch in page.chunks(BATCH) {
+            let texts: Vec<&str> = batch.iter().map(|h| h.payload.get("text").and_then(|t| t.as_str()).unwrap_or_default()).collect();
+            let embeddings = embedder.embed(&texts)?;
+            let docs = batch
+                .iter()
+                .zip(embeddings)
+                .map(|(h, embedding)| {
+                    let mut payload = h.payload.clone();
+                    payload.insert(VERSION_FIELD.into(), version.into());
+                    Doc { id: h.id, embedding, payload }
+                })
+                .collect();
+            store.upsert(docs).await?;
+            done += batch.len();
+        }
     }
 }
 
@@ -50,6 +94,8 @@ pub struct Report {
     pub redactions: usize,
     /// `(session id, error)` for sessions that could not be read; the rest of the sync proceeds.
     pub failed: Vec<(String, String)>,
+    /// Items removed because their source no longer has them (Jira issues deleted or moved).
+    pub removed: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,13 +118,15 @@ pub(crate) async fn write_chunks(
     scope: &SearchFilter,
     chunks: &[Chunk],
 ) -> Result<usize, IndexError> {
+    let pruned = |c: &&Chunk| config.prune_before_ms.is_some_and(|cut| c.payload.get("ts").and_then(|t| t.as_i64()).is_some_and(|ts| ts <= cut));
+    let chunks: Vec<&Chunk> = chunks.iter().filter(|c| !pruned(c)).collect();
     let stored: HashMap<Uuid, String> = store
         .scroll(scope, MAX_SESSION_CHUNKS)
         .await?
         .into_iter()
         .filter_map(|h| h.payload.get("text").and_then(|t| t.as_str()).map(|t| (h.id, t.to_owned())))
         .collect();
-    let todo: Vec<&Chunk> = chunks.iter().filter(|c| stored.get(&c.id) != Some(&c.text)).collect();
+    let todo: Vec<&Chunk> = chunks.iter().copied().filter(|c| stored.get(&c.id) != Some(&c.text)).collect();
 
     let tokens: Vec<usize> = todo.iter().map(|c| c.tokens).collect();
     let mut docs = Vec::with_capacity(todo.len());
@@ -153,7 +201,16 @@ impl Indexer<'_> {
                     continue;
                 }
             };
-            let (chunks, redactions) = self.index_session(&session).await?;
+            let (chunks, redactions) = match self.index_session(&session).await {
+                Ok(r) => r,
+                // Not recorded, so the next sync retries it; the sessions after it go ahead.
+                Err(e) => {
+                    let error = e.to_string();
+                    progress(Progress::Failed { id: &r.id, error: &error });
+                    report.failed.push((r.id.clone(), error));
+                    continue;
+                }
+            };
             let record = Record {
                 source,
                 session_id: &r.id,

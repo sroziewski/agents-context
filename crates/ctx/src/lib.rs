@@ -59,6 +59,34 @@ pub fn index_version(model: &str) -> String {
     format!("chunker-{}/{model}", ingest::CHUNKER_VERSION)
 }
 
+/// Index settings for writing into `store`: the redaction list, and the `prune older-than` cutoff
+/// recorded for that collection.
+pub fn index_config(store: &Store, state: &State, redactor: &ingest::Redactor) -> anyhow::Result<IndexConfig> {
+    let mut config = IndexConfig::default();
+    config.chunk.redactor = redactor.clone();
+    config.prune_before_ms = state.get_meta(&prune::cutoff_key(store.collection()))?.and_then(|v| v.parse().ok());
+    Ok(config)
+}
+
+/// Brings `store` to the current index version: after a model or chunker change every point is
+/// re-embedded from its stored text, once per collection. The version a collection was last
+/// brought to is kept in the state DB. A collection with none recorded is taken to be current
+/// unless the version has changed since this was introduced, so an upgrade does not re-embed.
+pub async fn reembed_if_needed(store: &Store, embedder: &mut dyn Embedder, state: &State, version: &str) -> anyhow::Result<()> {
+    let key = format!("index_version/{}", store.collection());
+    let recorded = state.get_meta(&key)?;
+    let current = match recorded.as_deref() {
+        Some(v) => v == version,
+        None => !state.version_ever_changed()?,
+    };
+    if !current {
+        let n = ingest::reembed_stale(store, embedder, version).await?;
+        eprintln!("[{}] re-embedded {n} points for {version}", store.collection());
+    }
+    state.set_meta(&key, version)?;
+    Ok(())
+}
+
 pub async fn run_index(
     store: &Store,
     embedder: &mut dyn Embedder,
@@ -69,12 +97,13 @@ pub async fn run_index(
     redactor: &ingest::Redactor,
     mut on_progress: impl FnMut(Progress<'_>),
 ) -> anyhow::Result<Report> {
-    if state.ensure_version(&index_version(model))? {
+    let version = index_version(model);
+    if state.ensure_version(&version)? {
         eprintln!("model or chunker changed: re-indexing every session");
     }
     store.ensure_collection(ingest::SESSION_FIELDS).await?;
-    let mut config = IndexConfig::default();
-    config.chunk.redactor = redactor.clone();
+    reembed_if_needed(store, embedder, state, &version).await?;
+    let config = index_config(store, state, redactor)?;
     let mut indexer = Indexer { store, embedder, counter, state, config };
     let now = jiff::Timestamp::now().as_millisecond();
     Ok(indexer.sync(refs, load, |p| on_progress(p), now).await?)
@@ -91,13 +120,14 @@ pub async fn run_teams_index(
     state: &State,
     redactor: &ingest::Redactor,
 ) -> anyhow::Result<Report> {
-    if state.ensure_version(&index_version(model))? {
+    let version = index_version(model);
+    if state.ensure_version(&version)? {
         eprintln!("model or chunker changed: re-indexing everything");
     }
     store.ensure_collection(ingest::teams::TEAMS_FIELDS).await?;
+    reembed_if_needed(store, embedder, state, &version).await?;
     let db = sources::teams::TeamsDb::open(&cfg.teams_db)?;
-    let mut config = IndexConfig::default();
-    config.chunk.redactor = redactor.clone();
+    let config = index_config(store, state, redactor)?;
     let now = jiff::Timestamp::now().as_millisecond();
     // Channel threads go to the teams collection; meeting transcripts to their own `meetings`
     // collection so the two never surface each other's chunks. A teams.db from an older scraper
@@ -105,6 +135,8 @@ pub async fn run_teams_index(
     let mut report = ingest::teams::sync_teams(store, embedder, counter, state, &db, &config, now).await?;
     if let Some(meetings) = meetings_store {
         meetings.ensure_collection(ingest::teams::MEETING_FIELDS).await?;
+        reembed_if_needed(meetings, embedder, state, &version).await?;
+        let config = index_config(meetings, state, redactor)?;
         match ingest::teams::sync_meetings(meetings, embedder, counter, state, &db, &config, now).await {
             Ok(m) => {
                 report.scanned += m.scanned;
@@ -131,15 +163,16 @@ pub async fn run_jira_index(
     state: &State,
     redactor: &ingest::Redactor,
 ) -> anyhow::Result<Report> {
-    if state.ensure_version(&index_version(model))? {
+    let version = index_version(model);
+    if state.ensure_version(&version)? {
         eprintln!("model or chunker changed: re-indexing everything");
     }
     let jira = cfg.jira().ok_or_else(|| anyhow::anyhow!("Jira is not configured (JIRA_URL / JIRA_TOKEN)"))?;
     let keys = jira::all_keys(&jira::load_project_keys(&cfg.jira_projects)?);
     anyhow::ensure!(!keys.is_empty(), "no Jira keys mapped in {}", cfg.jira_projects.display());
     store.ensure_collection(ingest::jira::JIRA_FIELDS).await?;
-    let mut config = IndexConfig::default();
-    config.chunk.redactor = redactor.clone();
+    reembed_if_needed(store, embedder, state, &version).await?;
+    let config = index_config(store, state, redactor)?;
     let now = jiff::Timestamp::now().as_millisecond();
     // Opt-in image descriptions: screenshots on issues become searchable text. Off by default.
     // A configured OpenAI-compatible vision endpoint (CTX_VISION_URL, e.g. OPI's GLM) is preferred
@@ -169,15 +202,16 @@ pub async fn run_confluence_index(
     state: &State,
     redactor: &ingest::Redactor,
 ) -> anyhow::Result<ingest::confluence::ConfluenceReport> {
-    if state.ensure_version(&index_version(model))? {
+    let version = index_version(model);
+    if state.ensure_version(&version)? {
         eprintln!("model or chunker changed: re-indexing everything");
     }
     let client = cfg.confluence().ok_or_else(|| anyhow::anyhow!("Confluence is not configured (CONFLUENCE_URL / CONFLUENCE_TOKEN)"))?;
     let units = confluence::all_units(&cfg.confluence_projects)?;
     anyhow::ensure!(!units.is_empty(), "no Confluence spaces or pages mapped in {}", cfg.confluence_projects.display());
     store.ensure_collection(ingest::confluence::CONFLUENCE_FIELDS).await?;
-    let mut config = IndexConfig::default();
-    config.chunk.redactor = redactor.clone();
+    reembed_if_needed(store, embedder, state, &version).await?;
+    let config = index_config(store, state, redactor)?;
     let now = jiff::Timestamp::now().as_millisecond();
     // The client is blocking (ureq); the caller already runs this on a blocking thread.
     Ok(ingest::confluence::sync_confluence(store, embedder, counter, state, &client, &units, &config, now).await?)
@@ -292,7 +326,7 @@ pub fn daemon_runner(
                                 for (id, error) in &r.failed {
                                     eprintln!("[jira]   FAILED {id}: {error}");
                                 }
-                                parts.push(format!("jira: scanned {} · indexed {} · unchanged {} · failed {} · {} chunks", r.scanned, r.indexed, r.unchanged, r.failed.len(), r.chunks));
+                                parts.push(format!("jira: scanned {} · indexed {} · unchanged {} · removed {} · failed {} · {} chunks", r.scanned, r.indexed, r.unchanged, r.removed, r.failed.len(), r.chunks));
                             }
                             Err(e) => {
                                 eprintln!("[jira] FAILED: {e:#}");

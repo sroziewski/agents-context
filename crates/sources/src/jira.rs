@@ -141,6 +141,33 @@ impl Jira {
         Ok(SearchPage { issues, total })
     }
 
+    /// Every issue key matching `jql`, across all pages. Strict where [`Self::search`] is lenient:
+    /// a reply without `issues` or `total`, or a listing that ends short of `total`, is an error,
+    /// because callers remove what is missing from this list.
+    pub fn all_keys(&self, jql: &str) -> Result<Vec<String>> {
+        const PAGE: usize = 1000;
+        let mut keys: Vec<String> = Vec::new();
+        loop {
+            let path = format!("/rest/api/2/search?jql={}&startAt={}&maxResults={PAGE}&fields=key", url_encode(jql), keys.len());
+            let v = self.get_json(&path)?;
+            let total = v.get("total").and_then(Value::as_u64).ok_or_else(|| JiraError::Parse("search reply without total".into()))?;
+            let issues = v.get("issues").and_then(Value::as_array).ok_or_else(|| JiraError::Parse("search reply without issues".into()))?;
+            if issues.is_empty() {
+                if (keys.len() as u64) < total {
+                    return Err(JiraError::Parse(format!("issue listing ended after {} of {total}", keys.len())));
+                }
+                return Ok(keys);
+            }
+            for issue in issues {
+                let key = issue.get("key").and_then(Value::as_str).filter(|k| !k.is_empty());
+                keys.push(key.ok_or_else(|| JiraError::Parse("issue without a key".into()))?.to_owned());
+            }
+            if keys.len() as u64 >= total {
+                return Ok(keys);
+            }
+        }
+    }
+
     /// `(key, name)` for every visible project.
     pub fn projects(&self) -> Result<Vec<(String, String)>> {
         let v = self.get_json("/rest/api/2/project")?;

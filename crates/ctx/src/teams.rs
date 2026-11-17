@@ -557,19 +557,27 @@ impl TeamsSearch {
 
         // Local half: FTS lines + meeting metadata, gathered on a blocking thread.
         let (db_path, text, speaker, since, until) = (self.db.clone(), q.text.clone(), q.speaker.clone(), q.since, q.until);
-        let (fts, meetings) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Result<Vec<TranscriptHit>, String>, HashMap<String, Meeting>)> {
+        type Found = (Result<Vec<TranscriptHit>, String>, HashMap<String, Meeting>, Option<HashSet<String>>);
+        let (fts, meetings, spoken_in) = tokio::task::spawn_blocking(move || -> anyhow::Result<Found> {
             let db = TeamsDb::open(&db_path)?;
             let speakers = speaker.as_deref().map(|s| db.resolve_speakers(s)).transpose()?;
+            // Semantic chunks are not per speaker, so the filter applies to them per meeting.
+            let spoken_in = speakers.as_deref().map(|s| db.meetings_with_speakers(s)).transpose()?;
             let filter = TranscriptFilter { speakers, meeting_ids: None, since, until };
             let fts = db.transcript_fts(&text, &filter, depth).map_err(|e| e.to_string());
             let meetings = db.meetings()?.into_iter().map(|m| (m.id.clone(), m)).collect();
-            Ok((fts, meetings))
+            Ok((fts, meetings, spoken_in))
         })
         .await??;
 
         let mut notes = Vec::new();
         let semantic = match self.semantic_meetings(q, depth).await {
-            Ok(h) => h,
+            Ok(mut h) => {
+                if let Some(ids) = &spoken_in {
+                    h.retain(|hit| ids.contains(&string(&hit.payload, "meeting_id")));
+                }
+                h
+            }
             Err(e) => {
                 notes.push(format!("semantic search unavailable ({e}); keyword matches only"));
                 Vec::new()

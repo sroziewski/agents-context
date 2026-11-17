@@ -18,7 +18,7 @@ Opus 5.5 · ctx ▰▰▰▰▰▰▰▰▱▱ 81% · /clear → ctx hands over 
 | Same, **yellow** (≥ 50%) | The conversation is getting long: every turn resends all of it | Finish the current task, then `/clear` |
 | Same, **red** (≥ 75%), with `/clear → ctx hands over` | Close to auto-compact; long contexts also get less precise | `/clear` now. ctx hands the session over (see below) |
 | `ctx daemon down` (red) | The ctx daemon is not answering: no indexing, no auto-inject, no search | Run `scripts/install.ps1`, or start the daemon via the Startup launcher |
-| `Teams stale` (dim) | `teams.db` hasn't been synced for `CTX_TEAMS_STALE_HOURS` (6 h) | Usually nights and weekends; otherwise check the Teams scraper |
+| `Teams stale` (dim) | `teams.db` hasn't been synced for `CTX_TEAMS_STALE_HOURS` (3 h) of working time: weekdays within `CTX_TEAMS_SYNC_HOURS` (8–18). Nights and weekends don't count, so it means a scheduled sync really failed | Check the end of `D:\dev\my\teams\data\sync.log`; run `npm run login` there only if it says you are logged out |
 
 The usage part is missing until the first reply of a session (Claude Code has no
 number before then) and right after `/compact`.
@@ -77,7 +77,7 @@ In `%APPDATA%\agents-context\.env`; read on every update, so no restart is neede
 | `CTX_STATUS_WARN` | `50` | Usage (%) from which the bar is yellow |
 | `CTX_STATUS_CRIT` | `75` | Usage (%) from which it is red, with the `/clear` hint |
 | `CTX_HANDOFF` | `on` | `off` stops the `/clear` note; the red hint then says `/clear or /compact` |
-| `CTX_TEAMS_STALE_HOURS` | `6` | When `Teams stale` appears |
+| `CTX_TEAMS_STALE_HOURS` | `3` | Working hours without a sync before `Teams stale` appears (and the daemon re-runs the scraper) |
 
 Related Claude Code settings, if you want auto-compact to run earlier rather than
 relying on the nudge: `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (1–100, can only lower the

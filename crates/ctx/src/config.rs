@@ -176,7 +176,7 @@ impl Config {
             teams_projects: path("CTX_TEAMS_PROJECTS", Self::config_dir().join("teams-projects.json")),
             teams_watch: crate::teams_watch::WatchConfig {
                 cmd: get("CTX_TEAMS_SYNC_CMD").map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()),
-                stale_after: Duration::from_secs_f64(number("CTX_TEAMS_STALE_HOURS", 6.0).max(0.0) * 3600.0),
+                stale_after: Duration::from_secs_f64(number("CTX_TEAMS_STALE_HOURS", 3.0).max(0.0) * 3600.0),
                 cooldown: Duration::from_secs_f64(number("CTX_TEAMS_SYNC_COOLDOWN_MINS", 90.0).max(0.0) * 60.0),
                 hours: crate::teams_watch::parse_hours(get("CTX_TEAMS_SYNC_HOURS").as_deref().unwrap_or("8-18")),
             },
@@ -272,29 +272,65 @@ pub fn parse_times(s: &str) -> Vec<(u32, u32)> {
 /// and keeping every other line (the API key lives there) and the file's line endings. The
 /// file is replaced by a rename, so a crash mid-write cannot leave it half written.
 pub fn set_env_value(path: &std::path::Path, key: &str, value: &str) -> std::io::Result<()> {
+    edit_env_values(path, &[(key, Some(value))])
+}
+
+/// Removes every assignment of `key` from a `.env` file, keeping the rest as [`set_env_value`]
+/// does. A file without the key (or no file) is left untouched.
+pub fn remove_env_value(path: &std::path::Path, key: &str) -> std::io::Result<()> {
+    edit_env_values(path, &[(key, None)])
+}
+
+/// Turns auto-inject on or off in a `.env` file. For one `client` (`claude` / `opencode`) only
+/// that client's key is written. Without a client the global `CTX_INJECT` is written and both
+/// per-client keys are dropped, since a per-client key overrides the global one and would keep
+/// its client on the old setting. One rewrite of the file, so it cannot stop half way.
+pub fn switch_inject(path: &std::path::Path, client: Option<&str>, on: bool) -> anyhow::Result<()> {
+    let value = Some(if on { "on" } else { "off" });
+    let edits: &[(&str, Option<&str>)] = match client {
+        None => &[("CTX_INJECT", value), ("CTX_INJECT_CLAUDE", None), ("CTX_INJECT_OPENCODE", None)],
+        Some("claude") => &[("CTX_INJECT_CLAUDE", value)],
+        Some("opencode") => &[("CTX_INJECT_OPENCODE", value)],
+        Some(other) => anyhow::bail!("unknown client {other:?}; use claude or opencode"),
+    };
+    Ok(edit_env_values(path, edits)?)
+}
+
+/// Applies every `(key, value)` edit in one rewrite: `Some` sets the key, `None` removes it.
+fn edit_env_values(path: &std::path::Path, edits: &[(&str, Option<&str>)]) -> std::io::Result<()> {
     let text = std::fs::read_to_string(path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(String::new()) } else { Err(e) })?;
     let (bom, text) = match text.strip_prefix('\u{feff}') {
         Some(rest) => ("\u{feff}", rest),
         None => ("", text.as_str()),
     };
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let assigns = |line: &str| {
+    let assigns = |line: &str, key: &str| {
         let l = line.trim_start();
         let l = l.strip_prefix("export ").map_or(l, str::trim_start);
         l.strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with('='))
     };
-    let mut found = false;
+    let mut found = vec![false; edits.len()];
     let mut lines: Vec<String> = Vec::new();
     for line in text.lines() {
-        if !assigns(line) {
-            lines.push(line.to_owned());
-        } else if !found {
-            found = true;
-            lines.push(format!("{key}={value}"));
+        match edits.iter().position(|(key, _)| assigns(line, key)) {
+            None => lines.push(line.to_owned()),
+            Some(i) if !found[i] => {
+                found[i] = true;
+                let (key, value) = edits[i];
+                lines.extend(value.map(|value| format!("{key}={value}")));
+            }
+            Some(_) => {}
         }
     }
-    if !found {
-        lines.push(format!("{key}={value}"));
+    let mut changed = found.contains(&true);
+    for (&(key, value), _) in edits.iter().zip(&found).filter(|(_, found)| !**found) {
+        if let Some(value) = value {
+            lines.push(format!("{key}={value}"));
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(());
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -387,6 +423,149 @@ mod tests {
         std::fs::write(&path, format!("{line}\nCTX_INJECT=off\n")).unwrap();
         set_env_value(&path, "CTX_INJECT", "on").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{line}\nCTX_INJECT=on\n"));
+    }
+
+    #[test]
+    fn remove_env_value_drops_every_assignment_of_the_key_and_nothing_else() {
+        let rows = [
+            (
+                "plain, export, spaced and duplicate assignments; prefix keys, comments and values stay",
+                "CTX_INJECT",
+                "QDRANT_API_KEY=abc=def\n# CTX_INJECT=on\nCTX_INJECT=off\nCTX_INJECT_CLAUDE=on\nexport CTX_INJECT=on\n  CTX_INJECT = on\nCTX_INJECTX=1\nOTHER=CTX_INJECT=on\nCTX_INJECT_OPENCODE=off\n",
+                "QDRANT_API_KEY=abc=def\n# CTX_INJECT=on\nCTX_INJECT_CLAUDE=on\nCTX_INJECTX=1\nOTHER=CTX_INJECT=on\nCTX_INJECT_OPENCODE=off\n",
+            ),
+            (
+                "a per-client key goes, the global key and the other client stay",
+                "CTX_INJECT_CLAUDE",
+                "CTX_INJECT=off\nCTX_INJECT_CLAUDE=on\nCTX_INJECT_OPENCODE=on\n",
+                "CTX_INJECT=off\nCTX_INJECT_OPENCODE=on\n",
+            ),
+            (
+                "BOM and CRLF survive",
+                "CTX_INJECT_CLAUDE",
+                "\u{feff}QDRANT_API_KEY=k\r\nexport CTX_INJECT_CLAUDE=on\r\nCTX_INJECT=off\r\nCTX_INJECT_CLAUDE=off\r\n",
+                "\u{feff}QDRANT_API_KEY=k\r\nCTX_INJECT=off\r\n",
+            ),
+            (
+                "the key on the BOM line is found",
+                "CTX_INJECT_CLAUDE",
+                "\u{feff}CTX_INJECT_CLAUDE=on\nQDRANT_API_KEY=k\n",
+                "\u{feff}QDRANT_API_KEY=k\n",
+            ),
+            ("a Windows path next to the key is kept verbatim", "CTX_INJECT_OPENCODE", "CTX_MODEL_DIR=D:\\dev\\models\\bge-m3-fp32\nCTX_INJECT_OPENCODE=on\n", "CTX_MODEL_DIR=D:\\dev\\models\\bge-m3-fp32\n"),
+        ];
+        for (name, key, before, after) in rows {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(".env");
+            std::fs::write(&path, before).unwrap();
+            remove_env_value(&path, key).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), after, "{name}");
+            assert!(!path.with_extension("env.tmp").exists(), "{name}: no temp file is left behind");
+        }
+    }
+
+    #[test]
+    fn remove_env_value_leaves_a_file_without_the_key_byte_for_byte() {
+        // No trailing newline and mixed line endings: a rewrite would normalise both.
+        for before in ["A=1\r\nCTX_INJECT=on\nCTX_INJECT_CLAUDEX=1", "\u{feff}# CTX_INJECT_CLAUDE=on\n\n\nB=2\n\n", ""] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(".env");
+            std::fs::write(&path, before).unwrap();
+            remove_env_value(&path, "CTX_INJECT_CLAUDE").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), before.as_bytes(), "{before:?}");
+            assert!(!path.with_extension("env.tmp").exists());
+        }
+    }
+
+    #[test]
+    fn remove_env_value_does_not_create_a_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("new/.env");
+        remove_env_value(&path, "CTX_INJECT_CLAUDE").unwrap();
+        assert!(!path.exists());
+        assert!(!tmp.path().join("new").exists(), "not even its directory");
+    }
+
+    /// The inject settings a `.env` file alone gives, without the process environment.
+    fn inject_from(path: &std::path::Path) -> crate::inject::InjectConfig {
+        let text = std::fs::read_to_string(path).unwrap();
+        let file: HashMap<String, String> = dotenvy::from_read_iter(text.as_bytes()).map(Result::unwrap).collect();
+        Config::from_env(|k| file.get(k).cloned()).inject
+    }
+
+    #[test]
+    fn the_global_switch_wins_over_an_earlier_per_client_switch() {
+        // (client, its switch, the global switch that follows)
+        let rows = [("claude", true, false), ("claude", false, true), ("opencode", true, false), ("opencode", false, true)];
+        for (client, client_on, global_on) in rows {
+            let name = format!("{client} {client_on}, then all {global_on}");
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(".env");
+            std::fs::write(&path, "QDRANT_API_KEY=k\n").unwrap();
+            switch_inject(&path, Some(client), client_on).unwrap();
+            let before = inject_from(&path);
+            // The other client still follows the unset global switch, which is off.
+            let (this, other) = if client == "claude" { (before.enabled_claude, before.enabled_opencode) } else { (before.enabled_opencode, before.enabled_claude) };
+            assert_eq!((this, other), (client_on, false), "{name}: the per-client switch applies to its client only");
+
+            switch_inject(&path, None, global_on).unwrap();
+            let value = if global_on { "on" } else { "off" };
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("QDRANT_API_KEY=k\nCTX_INJECT={value}\n"), "{name}");
+            let i = inject_from(&path);
+            assert_eq!((i.enabled, i.enabled_claude, i.enabled_opencode), (global_on, global_on, global_on), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_global_switch_drops_both_per_client_keys_in_every_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".env");
+        std::fs::write(&path, "\u{feff}CTX_INJECT_OPENCODE=on\r\nCTX_INJECT=on\r\nQDRANT_API_KEY=k\r\nexport CTX_INJECT_CLAUDE=on\r\nCTX_INJECT_CLAUDE = on\r\nCTX_INJECT_TEAMS=on\r\n").unwrap();
+        switch_inject(&path, None, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "\u{feff}CTX_INJECT=off\r\nQDRANT_API_KEY=k\r\nCTX_INJECT_TEAMS=on\r\n");
+        assert!(!path.with_extension("env.tmp").exists());
+    }
+
+    #[test]
+    fn a_per_client_switch_leaves_the_global_and_the_other_clients_key_alone() {
+        // (file, client, on, file afterwards, expected (global, claude, opencode))
+        let rows = [
+            ("CTX_INJECT=off\nCTX_INJECT_OPENCODE=on\n", "claude", true, "CTX_INJECT=off\nCTX_INJECT_OPENCODE=on\nCTX_INJECT_CLAUDE=on\n", (false, true, true)),
+            ("CTX_INJECT=off\nCTX_INJECT_OPENCODE=on\nCTX_INJECT_CLAUDE=on\n", "claude", false, "CTX_INJECT=off\nCTX_INJECT_OPENCODE=on\nCTX_INJECT_CLAUDE=off\n", (false, false, true)),
+            ("CTX_INJECT=on\nCTX_INJECT_CLAUDE=off\n", "opencode", false, "CTX_INJECT=on\nCTX_INJECT_CLAUDE=off\nCTX_INJECT_OPENCODE=off\n", (true, false, false)),
+            ("CTX_INJECT_CLAUDE=on\nCTX_INJECT=off\nCTX_INJECT_OPENCODE=off\n", "opencode", true, "CTX_INJECT_CLAUDE=on\nCTX_INJECT=off\nCTX_INJECT_OPENCODE=on\n", (false, true, true)),
+            ("CTX_INJECT=on\nCTX_INJECT_OPENCODE=off\n", "claude", false, "CTX_INJECT=on\nCTX_INJECT_OPENCODE=off\nCTX_INJECT_CLAUDE=off\n", (true, false, false)),
+            ("CTX_INJECT=off\nCTX_INJECT_CLAUDE=on\n", "opencode", false, "CTX_INJECT=off\nCTX_INJECT_CLAUDE=on\nCTX_INJECT_OPENCODE=off\n", (false, true, false)),
+        ];
+        for (before, client, on, after, enabled) in rows {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(".env");
+            std::fs::write(&path, before).unwrap();
+            switch_inject(&path, Some(client), on).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), after, "{client} {on} on {before:?}");
+            let i = inject_from(&path);
+            assert_eq!((i.enabled, i.enabled_claude, i.enabled_opencode), enabled, "{client} {on} on {before:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_client_is_an_error_and_the_file_is_not_touched() {
+        // CRLF and no final newline: any rewrite would show.
+        let before = "CTX_INJECT=off\r\nCTX_INJECT_CLAUDE=on\r\nCTX_INJECT_OPENCODE=on";
+        for client in ["cursor", "Claude", "claude ", "all", ""] {
+            for on in [true, false] {
+                let tmp = tempfile::tempdir().unwrap();
+                let path = tmp.path().join(".env");
+                std::fs::write(&path, before).unwrap();
+                let err = switch_inject(&path, Some(client), on).unwrap_err();
+                assert_eq!(err.to_string(), format!("unknown client {client:?}; use claude or opencode"));
+                assert_eq!(std::fs::read(&path).unwrap(), before.as_bytes(), "{client:?}");
+
+                let missing = tmp.path().join("new/.env");
+                switch_inject(&missing, Some(client), on).unwrap_err();
+                assert!(!tmp.path().join("new").exists(), "{client:?}: nothing is created either");
+            }
+        }
     }
 
     #[test]

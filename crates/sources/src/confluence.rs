@@ -96,7 +96,12 @@ impl Confluence {
         let mut start = 0u32;
         loop {
             let v = self.get_json(&format!("{path}{sep}start={start}&limit={PAGE}"))?;
-            let results = v.get("results").and_then(Value::as_array).cloned().unwrap_or_default();
+            // Missing is not empty: read as empty, the sync would delete every page of the unit.
+            let results = v
+                .get("results")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| ConfluenceError::Parse(format!("{path}: reply without a results list")))?;
             let n = results.len() as u32;
             out.extend(results);
             if n == 0 || v.pointer("/_links/next").is_none() {

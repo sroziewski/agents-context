@@ -422,6 +422,16 @@ impl TeamsDb {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Ids of the meetings in which any of `speakers` has a transcript line.
+    pub fn meetings_with_speakers(&self, speakers: &[String]) -> Result<std::collections::HashSet<String>> {
+        let mut sql = String::from("select distinct l.meeting_id from transcript_lines l where 1");
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        push_in(&mut sql, &mut args, "l.speaker", speakers);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Distinct transcript speakers whose name contains `needle` (folded). NULL (system) lines
     /// are excluded.
     pub fn resolve_speakers(&self, needle: &str) -> Result<Vec<String>> {
@@ -664,6 +674,46 @@ mod tests {
         let db = TeamsDb::open(&path).unwrap();
         assert_eq!(db.resolve_speakers("chmiel").unwrap(), ["Tomasz Chmiel"]);
         assert!(db.resolve_speakers("nobody").unwrap().is_empty());
+    }
+
+    fn three_meetings() -> (tempfile::TempDir, TeamsDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.db");
+        let c = create(&path);
+        meeting(&c, "m1", "Standup", 100, 200, "available");
+        meeting(&c, "m2", "Retro", 300, 400, "available");
+        meeting(&c, "m3", "Planning", 500, 600, "available");
+        line(&c, "m1", 0, Some("Tomasz Chmiel"), 105, "a");
+        line(&c, "m1", 1, Some("Tomasz Chmiel"), 106, "b");
+        line(&c, "m2", 0, Some("Ewa Lis"), 305, "c");
+        line(&c, "m2", 1, Some("Tomasz Chmiel"), 306, "d");
+        line(&c, "m3", 0, Some("Jan Nowak"), 505, "e");
+        line(&c, "m3", 1, None, 506, "started transcription");
+        drop(c);
+        let db = TeamsDb::open(&path).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn meetings_with_speakers_are_those_where_any_of_them_has_a_line() {
+        let (_d, db) = three_meetings();
+        let set = |ids: &[&str]| ids.iter().map(|s| (*s).to_owned()).collect::<std::collections::HashSet<String>>();
+        let rows: &[(&[&str], &[&str])] = &[
+            (&["Tomasz Chmiel"], &["m1", "m2"]),
+            (&["Ewa Lis"], &["m2"]),
+            (&["Ewa Lis", "Jan Nowak"], &["m2", "m3"]),
+            (&["Nobody Here"], &[]),
+        ];
+        for (speakers, want) in rows {
+            let speakers: Vec<String> = speakers.iter().map(|s| (*s).to_owned()).collect();
+            assert_eq!(db.meetings_with_speakers(&speakers).unwrap(), set(want), "{speakers:?}");
+        }
+    }
+
+    #[test]
+    fn meetings_with_no_speakers_is_empty() {
+        let (_d, db) = three_meetings();
+        assert!(db.meetings_with_speakers(&[]).unwrap().is_empty());
     }
 
     #[test]

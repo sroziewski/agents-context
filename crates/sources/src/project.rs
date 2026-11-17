@@ -9,8 +9,13 @@ use std::path::Path;
 /// nested in a plain folder stay separate. Lower-casing is right because Windows paths are
 /// case-insensitive and agents report the same directory with different drive-letter casing
 /// (`D:\dev` vs `d:/dev`); this tool only runs on Windows.
+///
+/// A relative `cwd` is taken against the process's working directory first: `.` or `src` would
+/// otherwise normalise to `.`, `src` or an empty key that matches no real project.
 pub fn key(cwd: &str) -> String {
     let path = Path::new(cwd);
+    let absolute = if path.is_relative() { std::path::absolute(path).ok() } else { None };
+    let path = absolute.as_deref().unwrap_or(path);
     let root = git_root(path).unwrap_or(path);
     normalise(&root.to_string_lossy())
 }
@@ -89,5 +94,36 @@ mod tests {
     #[test]
     fn missing_directory_falls_back_to_normalised_path() {
         assert_eq!(key(r"Z:\gone\project"), "z:/gone/project");
+    }
+
+    /// The workspace root, two levels above this crate: the git repo the test process runs in.
+    fn workspace_root() -> String {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        normalise(&crate_dir.parent().and_then(Path::parent).expect("crates/sources").to_string_lossy())
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_process_cwd_to_the_repo_root() {
+        // cargo runs unit tests with the cwd at the crate directory, inside this repo.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(normalise(&cwd.to_string_lossy()), normalise(env!("CARGO_MANIFEST_DIR")), "precondition: cwd is the crate dir");
+        let root = workspace_root();
+        assert!(Path::new(&root).join(".git").exists(), "precondition: {root} is the git root");
+        for rel in [".", "src", r"src\project.rs", "..", "./src/"] {
+            assert_eq!(key(rel), root, "{rel:?}");
+        }
+    }
+
+    #[test]
+    fn a_relative_path_outside_any_repo_still_becomes_absolute() {
+        // From the crate dir, `../../..` is the folder holding the repo.
+        let outside = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3).unwrap();
+        assert!(git_root(outside).is_none(), "precondition: {} is not inside a repo", outside.display());
+        assert_eq!(key(r"..\..\.."), normalise(&outside.to_string_lossy()));
+    }
+
+    #[test]
+    fn empty_path_stays_empty() {
+        assert_eq!(key(""), "");
     }
 }

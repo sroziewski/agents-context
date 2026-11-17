@@ -13,7 +13,7 @@ pub mod teams;
 pub mod tokens;
 
 pub use chunk::{CHUNKER_VERSION, ChunkConfig};
-pub use indexer::{IndexConfig, IndexError, Indexer, Progress, Report};
+pub use indexer::{IndexConfig, IndexError, Indexer, Progress, Report, VERSION_FIELD, reembed_stale};
 pub use rescan::{RescanReport, rescan};
 pub use scrub::Redactor;
 pub use state::State;

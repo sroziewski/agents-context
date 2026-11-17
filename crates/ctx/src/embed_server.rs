@@ -3,14 +3,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use embed::{Embedder, Embedding, SparseVector};
 use serde::{Deserialize, Serialize};
 
-use crate::queue::{IndexQueue, Status, Target};
+use crate::queue::{IndexQueue, Status, Target, Ticket};
 
 /// Upper bound per request so one client cannot pin the GPU for minutes; the indexer sends
 /// small token-capped batches anyway.
@@ -143,6 +143,7 @@ pub fn daemon_router(
         .route("/embed", post(embed))
         .route("/index", post(request_index))
         .route("/index/status", get(index_status))
+        .route("/index/ticket/{epoch}/{ticket}", get(index_ticket))
         .route("/context", post(context))
         .route("/rerank", post(rerank))
         .layer(axum::middleware::from_fn(loopback_host_only))
@@ -191,14 +192,21 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
 }
 
-async fn request_index(State(s): State<AppState>, Json(req): Json<IndexRequest>) -> StatusCode {
-    match s.queue {
-        Some(q) => {
-            q.request(req.source);
-            StatusCode::ACCEPTED
-        }
-        None => StatusCode::NOT_FOUND,
-    }
+/// The answer to `POST /index`: what to ask `/index/ticket/{epoch}/{ticket}` about.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexAccepted {
+    pub epoch: u64,
+    pub ticket: u64,
+}
+
+async fn request_index(State(s): State<AppState>, Json(req): Json<IndexRequest>) -> Result<(StatusCode, Json<IndexAccepted>), StatusCode> {
+    let q = s.queue.ok_or(StatusCode::NOT_FOUND)?;
+    let ticket = q.request(req.source);
+    Ok((StatusCode::ACCEPTED, Json(IndexAccepted { epoch: q.epoch(), ticket })))
+}
+
+async fn index_ticket(State(s): State<AppState>, Path((epoch, ticket)): Path<(u64, u64)>) -> Result<Json<Ticket>, StatusCode> {
+    s.queue.map(|q| Json(q.ticket(epoch, ticket))).ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn index_status(State(s): State<AppState>) -> Result<Json<Status>, StatusCode> {
@@ -516,6 +524,122 @@ mod tests {
         })
         .await;
         assert_eq!(status, 403);
+    }
+
+    async fn spawn_with_queue() -> (String, IndexQueue) {
+        let runner: crate::queue::Runner = Arc::new(|t| Box::pin(async move { Ok(format!("ran {t:?}")) }));
+        let queue = IndexQueue::start(runner, std::time::Duration::from_millis(10));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = service_router(SharedEmbedder::new(Box::new(HashEmbedder::new(16))), "m", Some(queue.clone()));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), queue)
+    }
+
+    fn get_ticket(base: &str, epoch: u64, ticket: u64) -> Ticket {
+        ureq::get(&format!("{base}/index/ticket/{epoch}/{ticket}")).call().unwrap().body_mut().read_json().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_index_answers_202_with_a_ticket_the_ticket_route_resolves() {
+        let (base, queue) = spawn_with_queue().await;
+        let epoch = queue.epoch();
+        let (first, second, done, other_epoch, not_issued) = blocking(move || {
+            let post = || {
+                let mut r = ureq::post(&format!("{base}/index")).send_json(serde_json::json!({ "source": "claude" })).unwrap();
+                (r.status().as_u16(), r.body_mut().read_json::<IndexAccepted>().unwrap())
+            };
+            let (first, second) = (post(), post());
+            let mut done = Ticket::Pending;
+            for _ in 0..500 {
+                done = get_ticket(&base, epoch, 2);
+                if done != Ticket::Pending {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            (first, second, done, get_ticket(&base, epoch + 1, 2), get_ticket(&base, epoch, 3))
+        })
+        .await;
+        assert_eq!(first, (202, IndexAccepted { epoch, ticket: 1 }));
+        assert_eq!(second, (202, IndexAccepted { epoch, ticket: 2 }));
+        assert_eq!(done, Ticket::Done(crate::queue::Outcome { report: Some("ran Claude".into()), error: None }));
+        assert_eq!(other_epoch, Ticket::Unknown);
+        assert_eq!(not_issued, Ticket::Unknown);
+    }
+
+    /// The JSON other clients see, independent of the Rust types that also read it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn index_and_ticket_bodies_have_the_documented_json_shape() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let g = gate.clone();
+        let runner: crate::queue::Runner = Arc::new(move |t| {
+            let g = g.clone();
+            Box::pin(async move {
+                g.notified().await;
+                Ok(format!("ran {t:?}"))
+            })
+        });
+        let queue = IndexQueue::start(runner, std::time::Duration::from_millis(10));
+        let epoch = queue.epoch();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = service_router(SharedEmbedder::new(Box::new(HashEmbedder::new(16))), "m", Some(queue));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (accepted, pending, done, unknown) = blocking(move || {
+            let json = |url: String| ureq::get(&url).call().unwrap().body_mut().read_json::<serde_json::Value>().unwrap();
+            let accepted: serde_json::Value = ureq::post(&format!("{base}/index")).send_json(serde_json::json!({ "source": "opencode" })).unwrap().body_mut().read_json().unwrap();
+            let pending = json(format!("{base}/index/ticket/{epoch}/1"));
+            gate.notify_one();
+            let mut done = pending.clone();
+            for _ in 0..500 {
+                done = json(format!("{base}/index/ticket/{epoch}/1"));
+                if done != pending {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            (accepted, pending, done, json(format!("{base}/index/ticket/{epoch}/2")))
+        })
+        .await;
+        assert_eq!(accepted, serde_json::json!({ "epoch": epoch, "ticket": 1 }));
+        assert_eq!(pending, serde_json::json!({ "state": "pending" }));
+        assert_eq!(done, serde_json::json!({ "state": "done", "report": "ran Opencode", "error": null }));
+        assert_eq!(unknown, serde_json::json!({ "state": "unknown" }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn index_and_its_ticket_route_are_404_without_a_queue() {
+        let base = spawn("m").await;
+        let (post, ticket) = blocking(move || {
+            let code = |r: Result<ureq::http::Response<ureq::Body>, ureq::Error>| match r {
+                Err(ureq::Error::StatusCode(code)) => code,
+                other => panic!("expected status error, got {other:?}"),
+            };
+            (
+                code(ureq::post(&format!("{base}/index")).send_json(serde_json::json!({ "source": "claude" }))),
+                code(ureq::get(&format!("{base}/index/ticket/1/1")).call()),
+            )
+        })
+        .await;
+        assert_eq!((post, ticket), (404, 404));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ticket_route_refuses_a_rebinding_host_header() {
+        let (base, queue) = spawn_with_queue().await;
+        let url = format!("{base}/index/ticket/{}/1", queue.epoch());
+        let (loopback, rebinding) = blocking(move || {
+            let loopback = ureq::get(&url).call().unwrap().status().as_u16();
+            let rebinding = match ureq::get(&url).header("Host", "attacker.example:7997").call() {
+                Err(ureq::Error::StatusCode(code)) => code,
+                other => panic!("expected 403, got {other:?}"),
+            };
+            (loopback, rebinding)
+        })
+        .await;
+        assert_eq!((loopback, rebinding), (200, 403));
     }
 
     #[test]

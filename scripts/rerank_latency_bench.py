@@ -17,13 +17,30 @@ The point is the shape of the trade-off and the crossover N, not false precision
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-HOST_DEFAULT = "sroziewski@192.0.2.10"
+
+
+def local_env(key: str, default: str) -> str:
+    """The value from the environment or the local, uncommitted %APPDATA%/agents-context/.env,
+    which keeps the real host out of the repo."""
+    if os.environ.get(key):
+        return os.environ[key]
+    env = Path(os.environ.get("APPDATA", "")) / "agents-context" / ".env"
+    if env.is_file():
+        for line in env.read_text(encoding="utf-8").splitlines():
+            name, sep, value = line.partition("=")
+            if sep and name.strip() == key:
+                return value.strip().strip("'\"")
+    return default
+
+
+HOST_DEFAULT = local_env("CTX_BENCH_HOST", "user@gpu-host")
 
 # --- estimates (edit or pass on the CLI); label them as such in any report ---
 # A cross-encoder reranker scores one (query, document) pair. Rates are pairs/second at
@@ -72,7 +89,7 @@ def ssh_per_request_ms(host: str, key: str, payload_bytes: int, reps: int = 5) -
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default=HOST_DEFAULT)
-    ap.add_argument("--ip", default="192.0.2.10")
+    ap.add_argument("--ip", default=local_env("CTX_BENCH_IP", "192.0.2.10"))
     ap.add_argument("--key", default="D:/dev_tools/moba/.ssh/id_rsa")
     ap.add_argument("--cpu-rate", type=float, default=CPU_PAIRS_PER_SEC)
     ap.add_argument("--gpu-rate", type=float, default=GPU_PAIRS_PER_SEC)

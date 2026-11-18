@@ -185,6 +185,8 @@ the project's directory, with OpenCode's global model.
 
 - **What is sent:** prompts from main Claude sessions in `CTX_REPLAY_PROJECTS`, taken from the
   index (so already redacted), at least 40 characters, never a slash command, each at most once.
+  Never sent: anything mentioning Claude, and prompts with a database word (`db`, `sql`, `baza`, …,
+  `CTX_REPLAY_SKIP_WORDS`). A `Next:` line that breaks either rule ends the replay instead.
 - **Pacing:** checked on each periodic index run; one replay at a time, at most one per
   `CTX_REPLAY_EVERY_MINS` and `CTX_REPLAY_DAILY_MAX` per day.
 - **Safety:** runs use the `ctx-replay` agent (installed by `scripts/install.ps1`), which denies
@@ -226,6 +228,7 @@ All in `%APPDATA%\agents-context\.env` (quote Windows paths with single quotes).
 | `CTX_REPLAY_MODEL` | unset | `provider/model`; unset uses OpenCode's global model |
 | `CTX_REPLAY_LOG` | `<data dir>\logs\opencode.log` | Replay log |
 | `CTX_REPLAY_MIN_CHARS` | `40` | Shorter prompts are never replayed |
+| `CTX_REPLAY_SKIP_WORDS` | `db,database,sql,baza,…` | Prompts and `Next:` lines with one of these words are never sent; empty for none. Anything mentioning Claude never is |
 | `CTX_REPLAY_AGENT` | `ctx-replay` | OpenCode agent the replays run with; must exist in the agents dir |
 | `CTX_OPENCODE_AGENTS_DIR` | `~\.config\opencode\agents` | Where that agent file is checked for |
 | `CTX_OPENCODE_EXE` | `opencode` | The OpenCode CLI |

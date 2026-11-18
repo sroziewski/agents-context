@@ -49,7 +49,29 @@ pub struct ReplayConfig {
     pub timeout: Duration,
     /// Shorter prompts ("ok", "commit") mean nothing without the conversation around them.
     pub min_chars: usize,
+    /// Lowercase words that keep a prompt or follow-up out of replays; see [`excluded`].
+    pub skip_words: Vec<String>,
     pub log: PathBuf,
+}
+
+/// Prompts about databases ("check on prod db …") ask for access the replay agent does not
+/// have, so they are not replayed. Polish forms of "baza" are listed because prompts mix both.
+pub const DEFAULT_SKIP_WORDS: &str = "db,dbs,database,databases,sql,psql,sqlplus,baza,bazy,bazie,bazę,bazą,bazach,bazami,bazo,baz";
+
+/// Comma-separated words, lowercased; unset gives [`DEFAULT_SKIP_WORDS`], an empty value none.
+pub fn parse_skip_words(v: Option<&str>) -> Vec<String> {
+    parse_projects(Some(v.unwrap_or(DEFAULT_SKIP_WORDS))).into_iter().map(|w| w.to_lowercase()).collect()
+}
+
+/// Why `text` must not be sent to OpenCode, if it must not: nothing mentioning Claude is ever
+/// sent (anywhere in the text, so `CLAUDE.md` and `.claude/` count too), and nothing with one of
+/// `skip_words` as a whole word, words being split at anything but letters and digits.
+pub fn excluded(text: &str, skip_words: &[String]) -> Option<String> {
+    let lower = text.to_lowercase();
+    if lower.contains("claude") {
+        return Some("mentions Claude".to_owned());
+    }
+    lower.split(|c: char| !c.is_alphanumeric()).find(|w| !w.is_empty() && skip_words.iter().any(|s| s == w)).map(|w| format!("has the skip word `{w}`"))
 }
 
 /// `"2-5"` → (2, 5), `"3"` → (3, 3). Unparseable values give `default`; a reversed range is
@@ -238,7 +260,7 @@ pub async fn candidates(store: &Store, state: &State, cfg: &ReplayConfig) -> any
     for hit in store.scroll(&filter, 1_000_000).await? {
         let p = &hit.payload;
         let str_of = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_owned();
-        let Some(prompt) = prompt_of(&str_of("text")).filter(|t| usable(t, cfg.min_chars)) else { continue };
+        let Some(prompt) = prompt_of(&str_of("text")).filter(|t| usable(t, cfg.min_chars) && excluded(t, &cfg.skip_words).is_none()) else { continue };
         let turn = match p.get("turn_id").and_then(|v| v.as_str()).filter(|t| !t.is_empty()) {
             Some(id) => id.to_owned(),
             None => p.get("turn_index").and_then(|v| v.as_i64()).unwrap_or_default().to_string(),
@@ -247,7 +269,19 @@ pub async fn candidates(store: &Store, state: &State, cfg: &ReplayConfig) -> any
         if state.get_meta(&done_key(&session_id, &turn))?.is_some() {
             continue;
         }
-        let Some(cwd) = [str_of("cwd"), project.clone()].into_iter().map(PathBuf::from).find(|d| !d.as_os_str().is_empty() && d.is_dir()) else { continue };
+        // OpenCode puts its working directory into the system prompt, so a `.claude/…` one
+        // would send Claude's name after all.
+        if project.to_lowercase().contains("claude") {
+            continue;
+        }
+        let Some(cwd) = [str_of("cwd"), project.clone()]
+            .into_iter()
+            .filter(|d| !d.to_lowercase().contains("claude"))
+            .map(PathBuf::from)
+            .find(|d| !d.as_os_str().is_empty() && d.is_dir())
+        else {
+            continue;
+        };
         let prompt: String = prompt.chars().take(MAX_PROMPT_CHARS).collect();
         out.push(Candidate { session_id, turn, project, cwd, prompt });
     }
@@ -334,10 +368,14 @@ impl Agent for OpencodeCli {
         };
         // Bounded: a grandchild that inherited the pipes could keep them open after exit.
         let stderr = err_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+        let stdout = out_rx.recv_timeout(Duration::from_secs(5)).ok();
         if !status.success() {
-            return Err(format!("opencode exited with {status}: {}", tail(&stderr, 400)));
+            // OpenCode prints a failed request ("Model not found") as an `error` event on stdout
+            // and leaves stderr empty.
+            let reason = stdout.as_deref().and_then(reported_error).unwrap_or_else(|| tail(&stderr, 400));
+            return Err(format!("opencode exited with {status}: {reason}"));
         }
-        let Ok(stdout) = out_rx.recv_timeout(Duration::from_secs(5)) else {
+        let Some(stdout) = stdout else {
             return Err("opencode exited but a process it started kept its output open; the answer was lost".into());
         };
         parse_reply(&stdout).map_err(|e| if stderr.trim().is_empty() { e } else { format!("{e}; stderr: {}", tail(&stderr, 400)) })
@@ -376,7 +414,7 @@ pub fn parse_reply(stdout: &str) -> Result<Reply, String> {
                 reply.tokens_in += n("input");
                 reply.tokens_out += n("output") + n("reasoning");
             }
-            Some("error") => errors.push(v.get("error").map(|e| e.to_string()).unwrap_or_else(|| line.to_owned())),
+            Some("error") => errors.push(v.get("error").map(error_text).unwrap_or_else(|| line.to_owned())),
             _ => {}
         }
     }
@@ -388,6 +426,27 @@ pub fn parse_reply(stdout: &str) -> Result<Reply, String> {
         return Err(format!("no session in opencode output: {}", tail(stdout, 300)));
     }
     Ok(reply)
+}
+
+/// The `message` of an `error` event's error, or the whole error when it has none.
+fn error_text(e: &serde_json::Value) -> String {
+    match e.get("message").or_else(|| e.get("data").and_then(|d| d.get("message"))).and_then(|m| m.as_str()) {
+        Some(m) => m.to_owned(),
+        None => e.to_string(),
+    }
+}
+
+/// The errors of the `error` events in `opencode run --format json` output, if any.
+fn reported_error(stdout: &str) -> Option<String> {
+    let errors: Vec<String> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('{'))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("error"))
+        .map(|v| v.get("error").map(error_text).unwrap_or_else(|| v.to_string()))
+        .collect();
+    (!errors.is_empty()).then(|| tail(&errors.join("; "), 400))
 }
 
 /// Totals of one replayed conversation.
@@ -448,14 +507,15 @@ fn now_local() -> String {
 }
 
 /// Sends the prompt, then up to `follow_ups` `Next:` suggestions in the same session. Stops
-/// early when an answer has no suggestion or a call fails.
-pub fn converse(agent: &dyn Agent, cand: &Candidate, follow_ups: u32, log: &ReplayLog) -> Outcome {
+/// early when an answer has no suggestion, the suggestion is [`excluded`] by `skip_words`, or a
+/// call fails.
+pub fn converse(agent: &dyn Agent, cand: &Candidate, follow_ups: u32, skip_words: &[String], log: &ReplayLog) -> Outcome {
     log.rotate_if_full();
     let first_line: String = cand.prompt.lines().next().unwrap_or_default().chars().take(60).collect();
     let title = format!("{TITLE_PREFIX}{first_line}");
     let total = follow_ups + 1;
     log.write(&format!(
-        "\n===== {} · {} · replay of claude {}/{} · up to {} /next =====\n",
+        "\n===== {} · {} · replay of {}/{} · up to {} /next =====\n",
         now_local(),
         cand.project,
         cand.session_id,
@@ -486,7 +546,13 @@ pub fn converse(agent: &dyn Agent, cand: &Candidate, follow_ups: u32, log: &Repl
                     break;
                 }
                 match extract_next(&r.text) {
-                    Some(next) => prompt = next,
+                    Some(next) => match excluded(&next, skip_words) {
+                        None => prompt = next,
+                        Some(why) => {
+                            log.write(&format!("--- the `Next:` line {why}; not sent, stopping\n"));
+                            break;
+                        }
+                    },
                     None => {
                         log.write("--- no `Next:` line in the answer; stopping\n");
                         break;
@@ -577,7 +643,7 @@ pub async fn run_once(cfg: &ReplayConfig, store: &Store, state: &State, agent: &
     check_agent(cfg)?;
     record_start(state, &cand, &jiff::Zoned::now())?;
     let log = ReplayLog::new(cfg.log.clone());
-    let o = converse(agent, &cand, follow_ups, &log);
+    let o = converse(agent, &cand, follow_ups, &cfg.skip_words, &log);
     let summary = format!("{}: {} answers, in {} · out {} tokens; log: {}", cand.project, o.exchanges, o.tokens_in, o.tokens_out, log.path().display());
     match o.error {
         Some(e) => anyhow::bail!("{summary}\nfailed: {e}"),
@@ -613,7 +679,7 @@ pub async fn maybe_start(cfg: &ReplayConfig, store: &Store, state: &State, now: 
     std::thread::spawn(move || {
         let _guard = guard;
         let log = ReplayLog::new(cfg.log.clone());
-        let o = converse(&OpencodeCli::from_config(&cfg), &cand, follow_ups, &log);
+        let o = converse(&OpencodeCli::from_config(&cfg), &cand, follow_ups, &cfg.skip_words, &log);
         match o.error {
             Some(e) => eprintln!("[replay] {} failed after {} answers: {e}", cand.project, o.exchanges),
             None => eprintln!("[replay] {}: {} answers, in {} · out {} tokens", cand.project, o.exchanges, o.tokens_in, o.tokens_out),
@@ -641,7 +707,106 @@ mod tests {
             exe: PathBuf::from("Z:/no/such/opencode.exe"),
             timeout: Duration::from_secs(7),
             min_chars: 40,
+            skip_words: parse_skip_words(None),
             log: PathBuf::from("Z:/no/such/opencode.log"),
+        }
+    }
+
+    fn words(w: &[&str]) -> Vec<String> {
+        w.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    mod parse_skip_words {
+        use super::*;
+
+        #[test]
+        fn unset_gives_the_database_words_and_a_value_replaces_them() {
+            let defaults: &[&str] = &["db", "dbs", "database", "databases", "sql", "psql", "sqlplus", "baza", "bazy", "bazie", "bazę", "bazą", "bazach", "bazami", "bazo", "baz"];
+            let rows: [(&str, Option<&str>, &[&str]); 7] = [
+                ("unset", None, defaults),
+                ("empty means none", Some(""), &[]),
+                ("only blanks and commas", Some(" , ,"), &[]),
+                ("one word", Some("staging"), &["staging"]),
+                ("trimmed, blanks dropped, lowercased", Some(" Prod , ,STAGING,,"), &["prod", "staging"]),
+                ("non-ASCII capitals are lowercased", Some("BAZĘ,Łódź"), &["bazę", "łódź"]),
+                ("a value does not add the defaults", Some("mongo"), &["mongo"]),
+            ];
+            for (name, input, want) in rows {
+                assert_eq!(parse_skip_words(input), want, "{name}: {input:?}");
+            }
+        }
+    }
+
+    mod excluded {
+        use super::*;
+
+        const CLAUDE: Option<&str> = Some("mentions Claude");
+
+        #[test]
+        fn anything_mentioning_claude_is_excluded_whatever_the_skip_words() {
+            let long_tail = format!("{} see CLAUDE.md", "ż".repeat(12_001));
+            // `None`: the default skip words.
+            let rows: [(&str, &str, Option<&[&str]>); 9] = [
+                ("the name", "ask Claude about the parser", Some(&[])),
+                ("upper case file", "update CLAUDE.md with the rule", Some(&[])),
+                ("a dot directory", "edit .claude/settings.json hooks", Some(&["staging"])),
+                ("hyphenated", "how do claude-code hooks run", Some(&[])),
+                ("inside a longer word", "the xclaudex tool", Some(&[])),
+                ("at the very start", "Claude: why", Some(&[])),
+                ("past the 12000 chars a replay keeps", &long_tail, Some(&[])),
+                ("wins over a skip word earlier in the text", "the db that Claude made", Some(&["db"])),
+                ("with the default skip words", "ask claude", None),
+            ];
+            for (name, text, skip) in rows {
+                let skip = skip.map_or_else(|| parse_skip_words(None), words);
+                assert_eq!(excluded(text, &skip).as_deref(), CLAUDE, "{name}: {text:.60}");
+            }
+        }
+
+        #[test]
+        fn a_skip_word_counts_only_as_a_whole_word_in_any_case() {
+            let defaults = parse_skip_words(None);
+            let rows: [(&str, &str, Option<&str>); 22] = [
+                ("a plain word", "check on prod db", Some("has the skip word `db`")),
+                ("joined by an underscore", "prod_db is slow", Some("has the skip word `db`")),
+                ("upper case", "DB_HOST is wrong", Some("has the skip word `db`")),
+                ("before a question mark", "is the database up?", Some("has the skip word `database`")),
+                ("joined by a hyphen", "sql-injection risk here", Some("has the skip word `sql`")),
+                ("in parentheses", "run it (psql) first", Some("has the skip word `psql`")),
+                ("a Polish form, whole", "Sprawdź bazę danych", Some("has the skip word `bazę`")),
+                ("a Polish form in capitals", "SPRAWDŹ BAZĄ", Some("has the skip word `bazą`")),
+                ("the first skip word in the text is reported", "the sql query on the db", Some("has the skip word `sql`")),
+                ("at the end after a newline", "one\ntwo db", Some("has the skip word `db`")),
+                ("a longer word ending in one", "mongodb is slow", None),
+                ("a longer word starting with one", "dbg build fails", None),
+                ("sqlite", "sqlite file locked", None),
+                ("digits are part of the word", "db2 driver", None),
+                ("Polish letters are part of the word", "zażółćdb gęśl", None),
+                ("a Polish stem inside a longer word", "bazooka", None),
+                ("a Polish letter inside keeps the word whole", "bazęx", None),
+                ("no skip word", "why does login fail", None),
+                ("empty text", "", None),
+                ("only separators", " ,.;", None),
+                ("baz is a word on its own", "baz", Some("has the skip word `baz`")),
+                ("bazy", "dwie bazy", Some("has the skip word `bazy`")),
+            ];
+            for (name, text, want) in rows {
+                assert_eq!(excluded(text, &defaults).as_deref(), want, "{name}: {text}");
+            }
+        }
+
+        #[test]
+        fn the_given_skip_words_replace_the_defaults() {
+            let rows: [(&str, &str, &[&str], Option<&str>); 5] = [
+                ("a custom word", "deploy to staging now", &["staging"], Some("has the skip word `staging`")),
+                ("the second custom word", "deploy to prod now", &["staging", "prod"], Some("has the skip word `prod`")),
+                ("a default word is not one of them", "check the db", &["staging"], None),
+                ("no skip words", "check the db", &[], None),
+                ("a blank skip word never matches the gap between two separators", "a  b", &[""], None),
+            ];
+            for (name, text, skip, want) in rows {
+                assert_eq!(excluded(text, &words(skip)).as_deref(), want, "{name}");
+            }
         }
     }
 
@@ -1009,6 +1174,30 @@ mod tests {
         }
 
         #[test]
+        fn an_error_without_text_reports_the_errors_message() {
+            let start = "{\"type\":\"step_start\",\"sessionID\":\"ses_M\"}\n";
+            let model_not_found = "{\"type\":\"error\",\"timestamp\":5,\"sessionID\":\"ses_M\",\"error\":{\"type\":\"provider.invalid-request\",\"message\":\"Model not found\",\"status\":400,\"providerID\":\"opi\"}}";
+            let rows: [(&str, String, &str); 5] = [
+                ("message, as OpenCode 2.2.7 prints it", format!("{start}{model_not_found}"), "Model not found"),
+                ("data.message", format!("{start}{{\"type\":\"error\",\"error\":{{\"name\":\"APIError\",\"data\":{{\"message\":\"Rate limit hit\"}}}}}}"), "Rate limit hit"),
+                (
+                    "message wins over data.message",
+                    format!("{start}{{\"type\":\"error\",\"error\":{{\"message\":\"outer\",\"data\":{{\"message\":\"inner\"}}}}}}"),
+                    "outer",
+                ),
+                ("no message: the whole error", format!("{start}{{\"type\":\"error\",\"error\":{{\"name\":\"UnknownError\"}}}}"), "{\"name\":\"UnknownError\"}"),
+                (
+                    "two errors, in order",
+                    format!("{start}{{\"type\":\"error\",\"error\":{{\"message\":\"first failure\"}}}}\n{{\"type\":\"error\",\"error\":{{\"message\":\"second failure\"}}}}"),
+                    "first failure; second failure",
+                ),
+            ];
+            for (name, out, want) in rows {
+                assert_eq!(parse_reply(&out), Err(format!("opencode reported an error: {want}")), "{name}");
+            }
+        }
+
+        #[test]
         fn an_error_event_without_an_error_field_reports_its_line() {
             let line = "{\"type\":\"error\",\"sessionID\":\"ses_E\"}";
             assert_eq!(parse_reply(line), Err(format!("opencode reported an error: {line}")));
@@ -1085,6 +1274,31 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let c = fake(tmp.path(), "type reply.jsonl\r\n>&2 echo auth expired\r\nexit /b 3", None, Duration::from_secs(20));
             assert_eq!(c.send(&project(tmp.path()), None, "t", "p"), Err("opencode exited with exit code: 3: auth expired".to_owned()));
+        }
+
+        #[test]
+        fn a_non_zero_exit_reports_the_error_events_on_stdout_before_stderr() {
+            let not_found = "{\"type\":\"error\",\"timestamp\":5,\"sessionID\":\"ses_M\",\"error\":{\"type\":\"provider.invalid-request\",\"message\":\"Model not found\",\"status\":400,\"providerID\":\"opi\"}}";
+            let quota = "{\"type\":\"error\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Quota exceeded\"}}}";
+            let long = format!("{{\"type\":\"error\",\"error\":{{\"message\":\"{}{}\"}}}}", "a".repeat(100), "b".repeat(400));
+            // (name, stdout, stderr line or none, exit code, the reason after `exit code: N: `)
+            let rows: [(&str, String, Option<&str>, u8, String); 7] = [
+                ("OpenCode 2.2.7: the event on stdout, stderr empty", format!("INFO starting\r\n{not_found}\r\n"), None, 1, "Model not found".into()),
+                ("the event wins over stderr", format!("{not_found}\r\n"), Some("auth expired"), 4, "Model not found".into()),
+                ("data.message", format!("{quota}\r\n"), None, 2, "Quota exceeded".into()),
+                ("two events joined in order, broken lines skipped", format!("{{broken\r\n{not_found}\r\n{quota}\r\n"), None, 1, "Model not found; Quota exceeded".into()),
+                ("an event without an error field: the event", "{\"sessionID\":\"ses_E\",\"type\":\"error\"}\r\n".into(), None, 1, "{\"sessionID\":\"ses_E\",\"type\":\"error\"}".into()),
+                ("only the last 400 chars", format!("{long}\r\n"), None, 1, "b".repeat(400)),
+                ("other events only: the stderr tail", SAMPLE.to_owned(), Some("auth expired"), 5, "auth expired".into()),
+            ];
+            for (name, stdout, stderr, code, want) in rows {
+                let tmp = tempfile::tempdir().unwrap();
+                let p = project(tmp.path());
+                std::fs::write(p.join("out.jsonl"), &stdout).unwrap();
+                let err = stderr.map(|e| format!(">&2 echo {e}\r\n")).unwrap_or_default();
+                let c = fake(tmp.path(), &format!("type out.jsonl\r\n{err}exit /b {code}"), None, Duration::from_secs(20));
+                assert_eq!(c.send(&p, None, "t", "p"), Err(format!("opencode exited with exit code: {code}: {want}")), "{name}");
+            }
         }
 
         #[test]
@@ -1219,7 +1433,7 @@ mod tests {
                 ok("ses_3", "third answer\nNext: not taken", 33, 4),
             ]);
 
-            let o = converse(&agent, &cand(tmp.path()), 2, &log);
+            let o = converse(&agent, &cand(tmp.path()), 2, &parse_skip_words(None), &log);
 
             assert_eq!(o, Outcome { session_id: Some("ses_1".into()), exchanges: 3, tokens_in: 66, tokens_out: 7, error: None });
             // PROMPT is 65 chars; the title keeps the first 60.
@@ -1235,7 +1449,7 @@ mod tests {
             assert_eq!(
                 normalized(log.path()),
                 format!(
-                    "\n===== <ts> · d:/dev/helpdesk · replay of claude ses-src/u42 · up to 2 /next =====\n\
+                    "\n===== <ts> · d:/dev/helpdesk · replay of ses-src/u42 · up to 2 /next =====\n\
                      --- [1/3] prompt\n{PROMPT}\n\
                      --- [1/3] response · <s> s · in 11 · out 1 tokens · ses_1\nfirst answer\nNext: check the hash migration\n\
                      --- [2/3] /next\ncheck the hash migration\n\
@@ -1248,10 +1462,72 @@ mod tests {
         }
 
         #[test]
+        fn an_excluded_next_line_is_not_sent_and_stops_the_replay() {
+            // `None`: the default skip words.
+            let rows: [(&str, Option<&[&str]>, &str, &str); 5] = [
+                ("a default skip word", None, "check the prod db", "has the skip word `db`"),
+                ("a Polish default skip word", None, "sprawdź bazę na produkcji", "has the skip word `bazę`"),
+                ("a mention of Claude", None, "update CLAUDE.md with the rule", "mentions Claude"),
+                ("a mention of Claude without skip words", Some(&[]), "add it to .claude/settings.json", "mentions Claude"),
+                ("a given skip word, not a default one", Some(&["staging"]), "deploy it to staging", "has the skip word `staging`"),
+            ];
+            for (name, skip, next, why) in rows {
+                let tmp = tempfile::tempdir().unwrap();
+                let log = ReplayLog::new(tmp.path().join("o.log"));
+                let agent = Scripted::new(vec![
+                    ok("ses_1", "first answer\nNext: run the auth tests", 11, 1),
+                    ok("ses_1", &format!("second answer\nNext: {next}"), 22, 2),
+                    ok("ses_1", "never", 1, 1),
+                ]);
+                let skip = skip.map_or_else(|| parse_skip_words(None), words);
+
+                let o = converse(&agent, &cand(tmp.path()), 3, &skip, &log);
+
+                assert_eq!(o, Outcome { session_id: Some("ses_1".into()), exchanges: 2, tokens_in: 33, tokens_out: 3, error: None }, "{name}");
+                assert_eq!(agent.prompts(), [PROMPT, "run the auth tests"], "{name}");
+                assert_eq!(
+                    normalized(log.path()),
+                    format!(
+                        "\n===== <ts> · d:/dev/helpdesk · replay of ses-src/u42 · up to 3 /next =====\n\
+                         --- [1/4] prompt\n{PROMPT}\n\
+                         --- [1/4] response · <s> s · in 11 · out 1 tokens · ses_1\nfirst answer\nNext: run the auth tests\n\
+                         --- [2/4] /next\nrun the auth tests\n\
+                         --- [2/4] response · <s> s · in 22 · out 2 tokens · ses_1\nsecond answer\nNext: {next}\n\
+                         --- the `Next:` line {why}; not sent, stopping\n\
+                         ===== end · 2 answers · in 33 · out 3 tokens =====\n"
+                    ),
+                    "{name}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_excluded_next_line_in_the_first_answer_leaves_one_call() {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = ReplayLog::new(tmp.path().join("o.log"));
+            let agent = Scripted::new(vec![ok("ses_7", "an answer\nNext: ask Claude to review it", 4, 9), ok("ses_7", "never", 1, 1)]);
+
+            let o = converse(&agent, &cand(tmp.path()), 2, &parse_skip_words(None), &log);
+
+            assert_eq!(o, Outcome { session_id: Some("ses_7".into()), exchanges: 1, tokens_in: 4, tokens_out: 9, error: None });
+            assert_eq!(agent.prompts(), [PROMPT]);
+            assert_eq!(
+                normalized(log.path()),
+                format!(
+                    "\n===== <ts> · d:/dev/helpdesk · replay of ses-src/u42 · up to 2 /next =====\n\
+                     --- [1/3] prompt\n{PROMPT}\n\
+                     --- [1/3] response · <s> s · in 4 · out 9 tokens · ses_7\nan answer\nNext: ask Claude to review it\n\
+                     --- the `Next:` line mentions Claude; not sent, stopping\n\
+                     ===== end · 1 answers · in 4 · out 9 tokens =====\n"
+                )
+            );
+        }
+
+        #[test]
         fn zero_follow_ups_is_one_call() {
             let tmp = tempfile::tempdir().unwrap();
             let agent = Scripted::new(vec![ok("ses_1", "answer\nNext: would go on", 5, 6), ok("ses_1", "never", 1, 1)]);
-            let o = converse(&agent, &cand(tmp.path()), 0, &ReplayLog::new(tmp.path().join("o.log")));
+            let o = converse(&agent, &cand(tmp.path()), 0, &parse_skip_words(None), &ReplayLog::new(tmp.path().join("o.log")));
             assert_eq!(o, Outcome { session_id: Some("ses_1".into()), exchanges: 1, tokens_in: 5, tokens_out: 6, error: None });
             assert_eq!(agent.prompts(), [PROMPT]);
         }
@@ -1262,14 +1538,14 @@ mod tests {
             let log = ReplayLog::new(tmp.path().join("o.log"));
             let agent = Scripted::new(vec![ok("ses_1", "a\nNext: go deeper", 3, 4), ok("ses_1", "all done", 5, 6), ok("ses_1", "never", 1, 1)]);
 
-            let o = converse(&agent, &cand(tmp.path()), 3, &log);
+            let o = converse(&agent, &cand(tmp.path()), 3, &parse_skip_words(None), &log);
 
             assert_eq!(o, Outcome { session_id: Some("ses_1".into()), exchanges: 2, tokens_in: 8, tokens_out: 10, error: None });
             assert_eq!(agent.prompts(), [PROMPT, "go deeper"]);
             assert_eq!(
                 normalized(log.path()),
                 format!(
-                    "\n===== <ts> · d:/dev/helpdesk · replay of claude ses-src/u42 · up to 3 /next =====\n\
+                    "\n===== <ts> · d:/dev/helpdesk · replay of ses-src/u42 · up to 3 /next =====\n\
                      --- [1/4] prompt\n{PROMPT}\n\
                      --- [1/4] response · <s> s · in 3 · out 4 tokens · ses_1\na\nNext: go deeper\n\
                      --- [2/4] /next\ngo deeper\n\
@@ -1286,14 +1562,14 @@ mod tests {
             let log = ReplayLog::new(tmp.path().join("o.log"));
             let agent = Scripted::new(vec![ok("ses_1", "a\nNext: go deeper", 3, 4), Err("opencode killed after 7s".into()), ok("ses_1", "never", 1, 1)]);
 
-            let o = converse(&agent, &cand(tmp.path()), 3, &log);
+            let o = converse(&agent, &cand(tmp.path()), 3, &parse_skip_words(None), &log);
 
             assert_eq!(o, Outcome { session_id: Some("ses_1".into()), exchanges: 1, tokens_in: 3, tokens_out: 4, error: Some("opencode killed after 7s".into()) });
             assert_eq!(agent.sessions(), [None, Some("ses_1".to_owned())]);
             assert_eq!(
                 normalized(log.path()),
                 format!(
-                    "\n===== <ts> · d:/dev/helpdesk · replay of claude ses-src/u42 · up to 3 /next =====\n\
+                    "\n===== <ts> · d:/dev/helpdesk · replay of ses-src/u42 · up to 3 /next =====\n\
                      --- [1/4] prompt\n{PROMPT}\n\
                      --- [1/4] response · <s> s · in 3 · out 4 tokens · ses_1\na\nNext: go deeper\n\
                      --- [2/4] /next\ngo deeper\n\
@@ -1307,7 +1583,7 @@ mod tests {
         fn an_error_on_the_first_call_has_no_session() {
             let tmp = tempfile::tempdir().unwrap();
             let agent = Scripted::new(vec![Err("cannot start opencode".into())]);
-            let o = converse(&agent, &cand(tmp.path()), 2, &ReplayLog::new(tmp.path().join("o.log")));
+            let o = converse(&agent, &cand(tmp.path()), 2, &parse_skip_words(None), &ReplayLog::new(tmp.path().join("o.log")));
             assert_eq!(o, Outcome { session_id: None, exchanges: 0, tokens_in: 0, tokens_out: 0, error: Some("cannot start opencode".into()) });
             assert_eq!(agent.prompts(), [PROMPT]);
         }
@@ -1318,7 +1594,7 @@ mod tests {
             let first = format!("{}{}", "ż".repeat(59), "abc");
             let c = Candidate { prompt: format!("{first}\nsecond line"), ..cand(tmp.path()) };
             let agent = Scripted::new(vec![ok("ses_1", "no next", 1, 1)]);
-            converse(&agent, &c, 1, &ReplayLog::new(tmp.path().join("o.log")));
+            converse(&agent, &c, 1, &parse_skip_words(None), &ReplayLog::new(tmp.path().join("o.log")));
             assert_eq!(agent.calls()[0].2, format!("ctx-replay · {}a", "ż".repeat(59)));
         }
     }
@@ -1327,7 +1603,7 @@ mod tests {
         use super::*;
 
         fn one_conversation(log: &ReplayLog, dir: &Path) {
-            converse(&Scripted::new(vec![ok("ses_1", "no next", 1, 1)]), &cand(dir), 0, log);
+            converse(&Scripted::new(vec![ok("ses_1", "no next", 1, 1)]), &cand(dir), 0, &parse_skip_words(None), log);
         }
 
         #[test]

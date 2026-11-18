@@ -73,6 +73,7 @@ fn cfg(projects: &[&str], dirs: &Dirs) -> ReplayConfig {
         exe: PathBuf::from("Z:/no/such/opencode.exe"),
         timeout: Duration::from_secs(60),
         min_chars: 40,
+        skip_words: replay::parse_skip_words(None),
         log: dirs.tmp.path().join("logs").join("opencode.log"),
     }
 }
@@ -169,6 +170,31 @@ fn sorted(mut c: Vec<Candidate>) -> Vec<Candidate> {
     c
 }
 
+/// The log with its wall-clock parts replaced by `<ts>` and `<s>`, after checking their format.
+fn normalized(log: &str) -> String {
+    let secs = |line: &str, i: usize, after: &str, before: &str| -> String {
+        let start = i + after.len();
+        let end = start + line[start..].find(before).unwrap();
+        assert!(line[start..end].parse::<f64>().is_ok(), "seconds in {line:?}");
+        format!("{}<s>{}", &line[..start], &line[end..])
+    };
+    log.split_inclusive('\n')
+        .map(|line| {
+            if line.starts_with("===== ") && !line.starts_with("===== end") {
+                let ts = &line[6..25];
+                assert!(jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", ts).is_ok(), "start time {ts:?}");
+                format!("===== <ts>{}", &line[25..])
+            } else if let Some(i) = line.find("] response · ") {
+                secs(line, i, "] response · ", " s · ")
+            } else if let Some(i) = line.find("] FAILED after ") {
+                secs(line, i, "] FAILED after ", " s: ")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect()
+}
+
 mod candidates {
     use super::*;
 
@@ -237,6 +263,112 @@ mod candidates {
         let none = cfg(&["nomatch"], &d);
         assert_eq!(replay::candidates(&store, &state, &none).await.unwrap(), Vec::<Candidate>::new());
         assert_eq!(replay::pick(&store, &state, &none, &mut Rng::seeded(1)).await.unwrap(), None);
+    }
+
+    const CLAUDE_PROMPTS: [(&str, &str); 4] = [
+        ("skip-claude-name", "Why does Claude keep failing on the parser upgrade?"),
+        ("skip-claude-md", "Please update CLAUDE.md with the parser upgrade rules"),
+        ("skip-claude-dir", "Why is .claude/settings.json ignored after the upgrade?"),
+        ("skip-claude-code", "How do claude-code hooks run after the parser upgrade?"),
+    ];
+    const DB_PROMPTS: [(&str, &str); 5] = [
+        ("skip-db-plain", "check on prod db whether the parser upgrade broke it"),
+        ("skip-db-underscore", "Why is prod_db unreachable after the parser upgrade?"),
+        ("skip-db-upper", "DB_HOST points nowhere after the parser upgrade, why?"),
+        ("skip-db-polish", "Sprawdź bazę danych po aktualizacji parsera, proszę"),
+        ("skip-db-sql", "Run the SQL migration again after the parser upgrade"),
+    ];
+    const KEPT_PROMPTS: [(&str, &str); 4] = [
+        ("skip-kept-mongodb", "Why does the mongodb driver fail after the parser upgrade?"),
+        ("skip-kept-dbg", "Why does the dbg build fail after the parser upgrade?"),
+        ("skip-kept-sqlite", "Why is the sqlite file locked after the parser upgrade?"),
+        ("skip-kept-plain", "Why does the login form fail after the parser upgrade?"),
+    ];
+
+    /// Each prompt as a turn of its own session; point and session are `<prefix><name>`, so tests
+    /// sharing the collection do not overwrite each other's points.
+    async fn seed_prompts(store: &Store, d: &Dirs, prefix: &str, prompts: &[(&str, &str)]) {
+        let names: Vec<String> = prompts.iter().map(|(n, _)| format!("{prefix}{n}")).collect();
+        seed(store, names.iter().zip(prompts).map(|(name, (_, p))| (name.as_str(), turn(name, Some("u1"), 1, &d.helpdesk, Some(&d.helpdesk), p))).collect()).await;
+    }
+
+    fn expected(d: &Dirs, prefix: &str, prompts: &[&[(&str, &str)]]) -> Vec<Candidate> {
+        sorted(prompts.iter().flat_map(|ps| ps.iter()).map(|(n, p)| candidate(&format!("{prefix}{n}"), "u1", &d.helpdesk, d.helpdesk.clone(), (*p).to_owned())).collect())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prompts_mentioning_claude_or_with_a_skip_word_never_qualify() {
+        let q = testkit::qdrant().await;
+        let store = sessions(&q).await;
+        let d = Dirs::new();
+        let state = d.state();
+        let all: Vec<(&str, &str)> = [&CLAUDE_PROMPTS[..], &DB_PROMPTS[..], &KEPT_PROMPTS[..]].concat();
+        seed_prompts(&store, &d, "", &all).await;
+
+        let defaults = cfg(&["helpdesk"], &d);
+        let got = sorted(replay::candidates(&store, &state, &defaults).await.unwrap());
+        assert_eq!(got, expected(&d, "", &[&KEPT_PROMPTS]), "the default skip words");
+        for seed in 0..50 {
+            let p = replay::pick(&store, &state, &defaults, &mut Rng::seeded(seed)).await.unwrap().expect("candidates exist");
+            assert!(got.contains(&p), "seed {seed}: {p:?}");
+        }
+
+        // No skip words: the database prompts qualify, the Claude ones still do not.
+        let no_words = ReplayConfig { skip_words: Vec::new(), ..cfg(&["helpdesk"], &d) };
+        assert_eq!(sorted(replay::candidates(&store, &state, &no_words).await.unwrap()), expected(&d, "", &[&DB_PROMPTS, &KEPT_PROMPTS]), "no skip words");
+
+        // Given words replace the defaults.
+        let custom = ReplayConfig { skip_words: vec!["mongodb".into()], ..cfg(&["helpdesk"], &d) };
+        assert_eq!(sorted(replay::candidates(&store, &state, &custom).await.unwrap()), expected(&d, "", &[&DB_PROMPTS, &KEPT_PROMPTS[1..]]), "given skip words");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claude_directory_is_never_the_working_directory_and_a_claude_project_never_qualifies() {
+        let q = testkit::qdrant().await;
+        let store = sessions(&q).await;
+        let d = Dirs::new();
+        let state = d.state();
+        let skills = d.helpdesk.join(".Claude").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let claude_project = d.helpdesk.join(".Claude");
+        std::fs::create_dir_all(&claude_project).unwrap();
+        let claude_key = key(&claude_project);
+        state.record(&Record { source: "claude", session_id: "indexed-dot-claude", fingerprint: "f", project: &claude_key, chunks: 1, ..Default::default() }, 0).unwrap();
+        seed(
+            &store,
+            vec![
+                // The cwd exists but is under `.claude`: the project directory is used instead.
+                ("dot-dir-cwd", turn("ses-dd1", Some("u1"), 1, &d.helpdesk, Some(&skills), &prompt("dot-dir-cwd"))),
+                // Same cwd, and the project directory does not exist: nothing to run in.
+                ("dot-dir-no-fallback", turn("ses-dd2", Some("u2"), 2, &d.sedn26, Some(&skills), &prompt("dot-dir-no-fallback"))),
+                // A usable cwd, but the project itself is a `.Claude` directory.
+                ("dot-dir-project", turn("ses-dd3", Some("u3"), 3, &claude_project, Some(&d.api), &prompt("dot-dir-project"))),
+            ],
+        )
+        .await;
+
+        let got = sorted(replay::candidates(&store, &state, &cfg(&["helpdesk", "sedn26"], &d)).await.unwrap());
+
+        assert_eq!(got, [candidate("ses-dd1", "u1", &d.helpdesk, PathBuf::from(key(&d.helpdesk)), prompt("dot-dir-cwd"))]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_only_excluded_prompts_neither_a_dry_nor_a_real_run_sends_or_logs_anything() {
+        let q = testkit::qdrant().await;
+        let store = sessions(&q).await;
+        let d = Dirs::new();
+        let state = d.state();
+        seed_prompts(&store, &d, "only-", &[&CLAUDE_PROMPTS[..], &DB_PROMPTS[..]].concat()).await;
+        let c = cfg(&["helpdesk"], &d);
+        let agent = Scripted::new(vec![ok("ses_never", "never", 1, 1)]);
+
+        assert_eq!(replay::run_once(&c, &store, &state, &agent, true).await.unwrap(), "nothing to replay in helpdesk", "dry run");
+        install_agent(&c);
+        assert_eq!(replay::run_once(&c, &store, &state, &agent, false).await.unwrap(), "nothing to replay in helpdesk", "real run");
+
+        assert_eq!(agent.calls(), []);
+        assert!(!c.log.exists(), "no log written");
+        assert_eq!(records(&state, &[]), none_recorded(&[]));
     }
 }
 
@@ -378,6 +510,86 @@ mod run_once {
         assert_eq!(state.get_meta(&replay::done_key("ses-2", "u2")).unwrap(), second_start);
         assert_eq!(std::fs::read_to_string(&c.log).unwrap().matches("===== end").count(), 2, "both replays logged");
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_configured_skip_words_stop_at_a_next_line() {
+        let q = testkit::qdrant().await;
+        let store = sessions(&q).await;
+        let d = Dirs::new();
+        let state = d.state();
+        // "hi" is no default skip word, so only the configured list can stop at `Next: say hi`.
+        let c = ReplayConfig { skip_words: vec!["hi".into()], ..cfg(&["helpdesk"], &d) };
+        install_agent(&c);
+        let p = prompt("pass-through");
+        seed(&store, vec![("pass-through-run-once", turn("ses-pt1", Some("u1"), 1, &d.helpdesk, Some(&d.api), &p))]).await;
+        let agent = Scripted::new(vec![ok("ses_pt", "answer\nNext: say hi", 5, 6), ok("ses_pt", "never", 1, 1)]);
+
+        let msg = replay::run_once(&c, &store, &state, &agent, false).await.unwrap();
+
+        assert_eq!(msg, format!("{}: 1 answers, in 5 · out 6 tokens; log: {}", key(&d.helpdesk), c.log.display()));
+        assert_eq!(agent.calls(), [(d.api.clone(), None, p.clone())]);
+        assert_eq!(
+            normalized(&std::fs::read_to_string(&c.log).unwrap()),
+            format!(
+                "\n===== <ts> · {} · replay of ses-pt1/u1 · up to 2 /next =====\n\
+                 --- [1/3] prompt\n{p}\n\
+                 --- [1/3] response · <s> s · in 5 · out 6 tokens · ses_pt\nanswer\nNext: say hi\n\
+                 --- the `Next:` line has the skip word `hi`; not sent, stopping\n\
+                 ===== end · 1 answers · in 5 · out 6 tokens =====\n",
+                key(&d.helpdesk)
+            )
+        );
+    }
+}
+
+mod opencode_error {
+    use super::*;
+    use ctx::replay::OpencodeCli;
+
+    /// What OpenCode 2.2.7 prints for an unknown `--model`: an `error` event on stdout, nothing
+    /// on stderr, exit code 1.
+    const MODEL_NOT_FOUND: &str = "{\"type\":\"error\",\"timestamp\":1763460000000,\"sessionID\":\"ses_F\",\"error\":{\"type\":\"provider.invalid-request\",\"message\":\"Model not found\",\"status\":400,\"providerID\":\"opi\",\"modelID\":\"no-such-model\"}}\r\n";
+
+    /// A fake `opencode.cmd` in `bin` that appends its arguments to `calls.txt`, prints
+    /// `MODEL_NOT_FOUND` and exits 1.
+    fn failing_opencode(bin: &Path) -> PathBuf {
+        std::fs::create_dir_all(bin).unwrap();
+        let exe = bin.join("opencode.cmd");
+        std::fs::write(bin.join("error.jsonl"), MODEL_NOT_FOUND).unwrap();
+        std::fs::write(&exe, "@echo off\r\necho %*>> \"%~dp0calls.txt\"\r\ntype \"%~dp0error.jsonl\"\r\nexit /b 1\r\n").unwrap();
+        exe
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_error_event_on_stdout_with_exit_1_ends_the_replay_with_its_message() {
+        let q = testkit::qdrant().await;
+        let store = sessions(&q).await;
+        let d = Dirs::new();
+        let state = d.state();
+        let bin = d.tmp.path().join("bin");
+        let c = ReplayConfig { model: Some("opi/no-such-model".into()), exe: failing_opencode(&bin), ..cfg(&["helpdesk"], &d) };
+        install_agent(&c);
+        let p = prompt("model-not-found");
+        seed(&store, vec![("model-not-found", turn("ses-mnf", Some("u6"), 6, &d.helpdesk, Some(&d.api), &p))]).await;
+
+        let err = replay::run_once(&c, &store, &state, &OpencodeCli::from_config(&c), false).await.unwrap_err();
+
+        let reason = "opencode exited with exit code: 1: Model not found";
+        assert_eq!(err.to_string(), format!("{}: 0 answers, in 0 · out 0 tokens; log: {}\nfailed: {reason}", key(&d.helpdesk), c.log.display()));
+        assert_eq!(
+            normalized(&std::fs::read_to_string(&c.log).unwrap()),
+            format!(
+                "\n===== <ts> · {} · replay of ses-mnf/u6 · up to 2 /next =====\n\
+                 --- [1/3] prompt\n{p}\n\
+                 --- [1/3] FAILED after <s> s: {reason}\n\
+                 ===== end · 0 answers · in 0 · out 0 tokens · failed =====\n",
+                key(&d.helpdesk)
+            )
+        );
+        let calls = std::fs::read_to_string(bin.join("calls.txt")).unwrap();
+        assert_eq!(calls.lines().count(), 1, "no follow-up after the failure: {calls}");
+        assert!(calls.starts_with("run --format json --agent ctx-replay --model opi/no-such-model --archived --title "), "{calls}");
+    }
 }
 
 mod maybe_start {
@@ -485,26 +697,6 @@ mod maybe_start {
     }
 
 
-    /// The log with its wall-clock parts replaced by `<ts>` and `<s>`, after checking their format.
-    fn normalized(log: &str) -> String {
-        log.split_inclusive('\n')
-            .map(|line| {
-                if line.starts_with("===== ") && !line.starts_with("===== end") {
-                    let ts = &line[6..25];
-                    assert!(jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", ts).is_ok(), "start time {ts:?}");
-                    format!("===== <ts>{}", &line[25..])
-                } else if let Some(i) = line.find("] response · ") {
-                    let start = i + "] response · ".len();
-                    let end = start + line[start..].find(" s · ").unwrap();
-                    assert!(line[start..end].parse::<f64>().is_ok(), "seconds in {line:?}");
-                    format!("{}<s>{}", &line[..start], &line[end..])
-                } else {
-                    line.to_owned()
-                }
-            })
-            .collect()
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn due_starts_the_real_cli_on_a_thread_and_records_the_start() {
         let _turn = GUARD.lock().await;
@@ -532,7 +724,7 @@ mod maybe_start {
         assert_eq!(
             normalized(&log),
             format!(
-                "\n===== <ts> · {} · replay of claude ses-d1/u5 · up to 1 /next =====\n\
+                "\n===== <ts> · {} · replay of ses-d1/u5 · up to 1 /next =====\n\
                  --- [1/2] prompt\n{p}\n\
                  --- [1/2] response · <s> s · in 86 · out 8 tokens · ses_X\nok\nNext: say hi\n\
                  --- [2/2] /next\nsay hi\n\
@@ -548,6 +740,40 @@ mod maybe_start {
         assert!(calls[0].starts_with("run --format json --agent ctx-replay --archived --title \"ctx-replay "), "{}", calls[0]);
         assert!(calls[0].ends_with(&format!(" \"{p}\"")), "{}", calls[0]);
         assert_eq!(calls[1], "run --format json --agent ctx-replay --session ses_X \"say hi\"");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_daemon_thread_stops_at_a_next_line_with_a_configured_skip_word() {
+        let _turn = GUARD.lock().await;
+        let q = testkit::qdrant().await;
+        let store = sessions(&q).await;
+        let d = Dirs::new();
+        let state = d.state();
+        let bin = d.tmp.path().join("bin");
+        // REPLY ends with `Next: say hi`; "hi" is no default skip word.
+        let c = ReplayConfig { next: (1, 1), skip_words: vec!["hi".into()], exe: fake_opencode(&bin), ..cfg(&["helpdesk"], &d) };
+        install_agent(&c);
+        let p = prompt("daemon-pass-through");
+        seed(&store, vec![("pass-through-daemon", turn("ses-pt2", Some("u2"), 2, &d.helpdesk, Some(&d.api), &p))]).await;
+
+        let line = replay::maybe_start(&c, &store, &state, &now()).await.unwrap();
+
+        assert_eq!(line, Some(format!("replay: {} with up to 1 /next", key(&d.helpdesk))));
+        wait_for_the_replay_thread().await;
+        assert_eq!(
+            normalized(&std::fs::read_to_string(&c.log).unwrap()),
+            format!(
+                "\n===== <ts> · {} · replay of ses-pt2/u2 · up to 1 /next =====\n\
+                 --- [1/2] prompt\n{p}\n\
+                 --- [1/2] response · <s> s · in 86 · out 8 tokens · ses_X\nok\nNext: say hi\n\
+                 --- the `Next:` line has the skip word `hi`; not sent, stopping\n\
+                 ===== end · 1 answers · in 86 · out 8 tokens =====\n",
+                key(&d.helpdesk)
+            )
+        );
+        let calls = std::fs::read_to_string(bin.join("calls.txt")).unwrap();
+        assert_eq!(calls.lines().count(), 1, "{calls}");
+        assert!(calls.trim_end().ends_with(&format!(" \"{p}\"")), "{calls}");
     }
 }
 
@@ -605,6 +831,7 @@ mod daemon {
             exe: fake_opencode(&tmp.path().join("bin")),
             timeout: Duration::from_secs(60),
             min_chars: 40,
+            skip_words: replay::parse_skip_words(None),
             log: log.clone(),
         };
         let state_path = tmp.path().join("state.db");

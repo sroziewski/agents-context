@@ -240,6 +240,7 @@ impl Config {
                 exe: path("CTX_OPENCODE_EXE", PathBuf::from("opencode")),
                 timeout: Duration::from_secs_f64(number("CTX_REPLAY_TIMEOUT_MINS", 20.0).max(0.1) * 60.0),
                 min_chars: number("CTX_REPLAY_MIN_CHARS", 40.0).max(1.0) as usize,
+                skip_words: crate::replay::parse_skip_words(get("CTX_REPLAY_SKIP_WORDS").as_deref()),
                 log: path("CTX_REPLAY_LOG", data.join("logs").join("opencode.log")),
             },
         }
@@ -635,6 +636,24 @@ mod tests {
         assert_eq!(r.model, None);
         assert_eq!(r.exe, PathBuf::from("opencode"));
         assert_eq!(r.log, data.join("logs").join("opencode.log"));
+        assert_eq!(
+            r.skip_words,
+            ["db", "dbs", "database", "databases", "sql", "psql", "sqlplus", "baza", "bazy", "bazie", "bazę", "bazą", "bazach", "bazami", "bazo", "baz"]
+        );
+    }
+
+    #[test]
+    fn replay_skip_words_set_replace_the_defaults_and_empty_means_none() {
+        let rows: [(&str, &[&str]); 4] = [
+            (" Prod , ,STAGING,Bazę,", &["prod", "staging", "bazę"]),
+            ("mongo", &["mongo"]),
+            ("", &[]),
+            ("  ", &[]),
+        ];
+        for (value, want) in rows {
+            let r = Config::from_env(|k| (k == "CTX_REPLAY_SKIP_WORDS").then(|| value.to_owned())).replay;
+            assert_eq!(r.skip_words, want, "{value:?}");
+        }
     }
 
     #[test]
@@ -652,9 +671,11 @@ mod tests {
             ("CTX_OPENCODE_AGENTS_DIR", r"Z:\oc\agents"),
             ("CTX_OPENCODE_EXE", r"Z:\bin\opencode.cmd"),
             ("CTX_REPLAY_LOG", r"Z:\logs\replay.log"),
+            ("CTX_REPLAY_SKIP_WORDS", "Secret,prod"),
         ]
         .into();
         let r = Config::from_env(|k| env.get(k).map(|v| v.to_string())).replay;
+        assert_eq!(r.skip_words, ["secret", "prod"]);
         assert!(r.enabled);
         assert_eq!(r.projects, ["helpdesk", "sedn26"]);
         assert_eq!(r.every, Duration::from_secs(15 * 60));

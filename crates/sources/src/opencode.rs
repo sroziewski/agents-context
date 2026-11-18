@@ -17,17 +17,28 @@ fn open(db: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Title prefix of the sessions `ctx replay` creates. They replay prompts that are already
+/// indexed from Claude Code, so indexing them, or the subagent sessions under them, would only
+/// duplicate those as "past sessions".
+pub const REPLAY_TITLE_PREFIX: &str = "ctx-replay · ";
+
 pub fn discover(db: &Path) -> Result<Vec<SessionRef>> {
     let conn = open(db)?;
     // session.time_updated alone can lag behind streamed parts, so the part count and newest
     // part time are folded into the fingerprint too.
     let mut stmt = conn.prepare(
-        "select s.id, s.time_updated,
+        "with recursive replay(id) as (
+             select id from session where substr(title, 1, length(?1)) = ?1
+             union select s.id from session s join replay r on s.parent_id = r.id
+         )
+         select s.id, s.time_updated,
                 (select count(*) from part p where p.session_id = s.id),
                 (select coalesce(max(p.time_updated), 0) from part p where p.session_id = s.id)
-         from session s order by s.id",
+         from session s
+         where s.id not in (select id from replay)
+         order by s.id",
     )?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map([REPLAY_TITLE_PREFIX], |r| {
         Ok(SessionRef {
             source: Source::OpenCode,
             id: r.get(0)?,
@@ -291,6 +302,41 @@ mod tests {
         let after = discover(&path).unwrap();
         assert_ne!(before[0].fingerprint, after[0].fingerprint);
         assert_eq!(load(&after[0]).unwrap().turns[0].assistant, "a");
+    }
+
+    #[test]
+    fn discover_skips_replay_sessions_and_all_their_descendants_only() {
+        let (_d, path) = fixture();
+        let db = Db(Connection::open(&path).unwrap());
+        db.session("s1-replay", None, "Z:/p", "ctx-replay · Why does login fail")
+            .session("s2-replay-child", Some("s1-replay"), "Z:/p", "explore auth (@explore subagent)")
+            .session("s2b-replay-grandchild", Some("s2-replay-child"), "Z:/p", "general (@general subagent)")
+            .session("s3-mentions", None, "Z:/p", "Debugging ctx-replay titles")
+            .session("s4-plain", None, "Z:/p", "Login bug")
+            .session("s5-plain-child", Some("s4-plain"), "Z:/p", "explore")
+            .session("s6-orphan-child", Some("gone"), "Z:/p", "")
+            .session("s7-prefix-only", None, "Z:/p", "ctx-replay")
+            .session("s8-design", None, "Z:/p", "ctx-replay-design notes")
+            .session("s8b-design-child", Some("s8-design"), "Z:/p", "explore")
+            .session("s9-upper", None, "Z:/p", "CTX-REPLAY · upper case");
+        let all = [
+            "s1-replay",
+            "s2-replay-child",
+            "s2b-replay-grandchild",
+            "s3-mentions",
+            "s4-plain",
+            "s5-plain-child",
+            "s6-orphan-child",
+            "s7-prefix-only",
+            "s8-design",
+            "s8b-design-child",
+            "s9-upper",
+        ];
+        for id in all {
+            db.message(id, &format!("{id}-m1"), 100, "user", &[text("q")]);
+        }
+        let ids: Vec<String> = discover(&path).unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, ["s3-mentions", "s4-plain", "s5-plain-child", "s6-orphan-child", "s7-prefix-only", "s8-design", "s8b-design-child", "s9-upper"]);
     }
 
     #[test]

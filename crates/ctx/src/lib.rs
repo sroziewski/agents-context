@@ -18,6 +18,7 @@ pub mod memories;
 pub mod queue;
 pub mod rank;
 pub mod redact;
+pub mod replay;
 pub mod search;
 pub mod statusline;
 pub mod summarizer;
@@ -283,6 +284,15 @@ pub fn daemon_runner(
                                 parts.push(format!("sessions: FAILED ({e})"));
                                 sessions_error = Some(e);
                             }
+                        }
+                    }
+                    // After indexing, so the newest prompts can be picked; the conversation runs
+                    // on its own thread and never holds up this run.
+                    if cfg.replay.enabled && target.sessions().is_some() {
+                        match crate::replay::maybe_start(&cfg.replay, &store, &state, &jiff::Zoned::now()).await {
+                            Ok(Some(line)) => parts.push(line),
+                            Ok(None) => {}
+                            Err(e) => eprintln!("[replay] {e:#}"),
                         }
                     }
                     if let (true, Some(teams)) = (target.includes_teams(), &teams_store) {

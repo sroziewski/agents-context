@@ -99,6 +99,8 @@ pub struct Config {
     pub confluence_collection: String,
     /// Local times to index Confluence at (`CTX_CONFLUENCE_INDEX_TIMES`).
     pub confluence_index_times: Vec<(u32, u32)>,
+    /// Background replay of past Claude prompts to OpenCode (`CTX_REPLAY*`, off by default).
+    pub replay: crate::replay::ReplayConfig,
 }
 
 /// Off: on the real query set (2026-09-27, 33 queries) every weight tried lowered MRR and none
@@ -225,6 +227,21 @@ impl Config {
             confluence_collection: get("CTX_CONFLUENCE_COLLECTION").unwrap_or_else(|| "confluence".into()),
             // Half an hour after Jira's slots, so the two runs do not queue behind each other.
             confluence_index_times: parse_times(get("CTX_CONFLUENCE_INDEX_TIMES").as_deref().unwrap_or("10:30,17:30")),
+            replay: crate::replay::ReplayConfig {
+                enabled: on("CTX_REPLAY", false),
+                projects: crate::replay::parse_projects(get("CTX_REPLAY_PROJECTS").as_deref()),
+                every: Duration::from_secs_f64(number("CTX_REPLAY_EVERY_MINS", 60.0).max(1.0) * 60.0),
+                daily_max: number("CTX_REPLAY_DAILY_MAX", 10.0).max(0.0) as u32,
+                next: crate::replay::parse_range(get("CTX_REPLAY_NEXT").as_deref(), (2, 5)),
+                agent: get("CTX_REPLAY_AGENT").map(|a| a.trim().to_owned()).filter(|a| !a.is_empty()).unwrap_or_else(|| "ctx-replay".into()),
+                agents_dir: path("CTX_OPENCODE_AGENTS_DIR", home.join(".config").join("opencode").join("agents")),
+                // Unset: OpenCode's own global model and provider.
+                model: get("CTX_REPLAY_MODEL").map(|m| m.trim().to_owned()).filter(|m| !m.is_empty()),
+                exe: path("CTX_OPENCODE_EXE", PathBuf::from("opencode")),
+                timeout: Duration::from_secs_f64(number("CTX_REPLAY_TIMEOUT_MINS", 20.0).max(0.1) * 60.0),
+                min_chars: number("CTX_REPLAY_MIN_CHARS", 40.0).max(1.0) as usize,
+                log: path("CTX_REPLAY_LOG", data.join("logs").join("opencode.log")),
+            },
         }
     }
 }
@@ -599,6 +616,83 @@ mod tests {
     fn non_finite_numbers_fall_back_to_defaults() {
         let c = Config::from_env(|k| (k == "CTX_RECENCY_WEIGHT").then(|| "NaN".to_owned()));
         assert_eq!(c.recency.weight, DEFAULT_RECENCY_WEIGHT);
+    }
+
+    #[test]
+    fn replay_is_off_by_default_with_documented_defaults() {
+        let data = PathBuf::from(r"Z:\ctx-data");
+        let r = Config::from_env(|k| (k == "CTX_DATA_DIR").then(|| data.to_string_lossy().into_owned())).replay;
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        assert!(!r.enabled);
+        assert_eq!(r.projects, Vec::<String>::new());
+        assert_eq!(r.every, Duration::from_secs(60 * 60));
+        assert_eq!(r.daily_max, 10);
+        assert_eq!(r.next, (2, 5));
+        assert_eq!(r.timeout, Duration::from_secs(20 * 60));
+        assert_eq!(r.min_chars, 40);
+        assert_eq!(r.agent, "ctx-replay");
+        assert_eq!(r.agents_dir, home.join(".config").join("opencode").join("agents"));
+        assert_eq!(r.model, None);
+        assert_eq!(r.exe, PathBuf::from("opencode"));
+        assert_eq!(r.log, data.join("logs").join("opencode.log"));
+    }
+
+    #[test]
+    fn replay_reads_every_key() {
+        let env: HashMap<&str, &str> = [
+            ("CTX_REPLAY", "on"),
+            ("CTX_REPLAY_PROJECTS", " helpdesk , ,sedn26,"),
+            ("CTX_REPLAY_EVERY_MINS", "15"),
+            ("CTX_REPLAY_DAILY_MAX", "3"),
+            ("CTX_REPLAY_NEXT", "4-1"),
+            ("CTX_REPLAY_TIMEOUT_MINS", "2.5"),
+            ("CTX_REPLAY_MIN_CHARS", "25"),
+            ("CTX_REPLAY_MODEL", " opi/glm-5 "),
+            ("CTX_REPLAY_AGENT", " ro-agent "),
+            ("CTX_OPENCODE_AGENTS_DIR", r"Z:\oc\agents"),
+            ("CTX_OPENCODE_EXE", r"Z:\bin\opencode.cmd"),
+            ("CTX_REPLAY_LOG", r"Z:\logs\replay.log"),
+        ]
+        .into();
+        let r = Config::from_env(|k| env.get(k).map(|v| v.to_string())).replay;
+        assert!(r.enabled);
+        assert_eq!(r.projects, ["helpdesk", "sedn26"]);
+        assert_eq!(r.every, Duration::from_secs(15 * 60));
+        assert_eq!(r.daily_max, 3);
+        assert_eq!(r.next, (1, 4), "a reversed range is put in order");
+        assert_eq!(r.timeout, Duration::from_secs(150));
+        assert_eq!(r.min_chars, 25);
+        assert_eq!(r.model.as_deref(), Some("opi/glm-5"));
+        assert_eq!(r.agent, "ro-agent");
+        assert_eq!(r.agents_dir, PathBuf::from(r"Z:\oc\agents"));
+        assert_eq!(r.exe, PathBuf::from(r"Z:\bin\opencode.cmd"));
+        assert_eq!(r.log, PathBuf::from(r"Z:\logs\replay.log"));
+    }
+
+    #[test]
+    fn replay_numbers_at_or_below_zero_are_clamped() {
+        for value in ["0", "-5"] {
+            let env: HashMap<&str, &str> = [
+                ("CTX_REPLAY_EVERY_MINS", value),
+                ("CTX_REPLAY_DAILY_MAX", value),
+                ("CTX_REPLAY_TIMEOUT_MINS", value),
+                ("CTX_REPLAY_MIN_CHARS", value),
+            ]
+            .into();
+            let r = Config::from_env(|k| env.get(k).map(|v| v.to_string())).replay;
+            assert_eq!((r.every, r.daily_max, r.timeout, r.min_chars), (Duration::from_secs(60), 0, Duration::from_secs(6), 1), "{value}");
+        }
+    }
+
+    #[test]
+    fn replay_next_falls_back_on_garbage_and_blank_model_and_agent_mean_the_defaults() {
+        let rows: [(&str, (u32, u32)); 4] = [("3", (3, 3)), ("2-5", (2, 5)), ("two to five", (2, 5)), ("", (2, 5))];
+        for (next, want) in rows {
+            assert_eq!(Config::from_env(|k| (k == "CTX_REPLAY_NEXT").then(|| next.to_owned())).replay.next, want, "{next:?}");
+        }
+        let env: HashMap<&str, &str> = [("CTX_REPLAY_MODEL", "  "), ("CTX_REPLAY_AGENT", " "), ("CTX_REPLAY", "maybe")].into();
+        let r = Config::from_env(|k| env.get(k).map(|v| v.to_string())).replay;
+        assert_eq!((r.model, r.agent.as_str(), r.enabled), (None, "ctx-replay", false));
     }
 
     #[test]

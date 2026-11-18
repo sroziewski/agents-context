@@ -176,6 +176,30 @@ How to read it and use it day to day: [status-line.md](status-line.md).
 
 ---
 
+## 5. Replay to OpenCode — background, off by default
+
+For projects that should be worked in OpenCode, the daemon can replay prompts you once sent
+Claude Code there. One replay is one prompt plus 2-5 follow-ups, each being the previous
+answer's `Next:` line (what `/next` does in OpenCode), all in one archived OpenCode session in
+the project's directory, with OpenCode's global model.
+
+- **What is sent:** prompts from main Claude sessions in `CTX_REPLAY_PROJECTS`, taken from the
+  index (so already redacted), at least 40 characters, never a slash command, each at most once.
+- **Pacing:** checked on each periodic index run; one replay at a time, at most one per
+  `CTX_REPLAY_EVERY_MINS` and `CTX_REPLAY_DAILY_MAX` per day.
+- **Safety:** runs use the `ctx-replay` agent (installed by `scripts/install.ps1`), which denies
+  every tool except reading files, searching, ctx's read tools and the `explore` subagent. Without that agent file the replay refuses to
+  start, because OpenCode would fall back to its default agent.
+- **Log:** `%LOCALAPPDATA%\agents-context\logs\opencode.log`: every prompt and answer with time
+  and tokens; rotated to `opencode.log.1` at 10 MB.
+- Replay sessions are titled `ctx-replay · …` and are not indexed back into ctx.
+- `ctx replay --dry-run` shows the prompt it would pick; `ctx replay` runs one now.
+
+Replay settings are read when the daemon starts: restart it (`scripts/install.ps1`) after
+changing them.
+
+---
+
 ## Configuration reference
 
 All in `%APPDATA%\agents-context\.env` (quote Windows paths with single quotes).
@@ -193,6 +217,18 @@ All in `%APPDATA%\agents-context\.env` (quote Windows paths with single quotes).
 | `CTX_STATUS_WARN` | `50` | Status line: context usage (%) shown in yellow |
 | `CTX_STATUS_CRIT` | `75` | Status line: context usage (%) shown in red, with the `/clear` hint |
 | `CTX_DATA_DIR` | `%LOCALAPPDATA%\agents-context` | Local working data (state DB, handoff records, …) |
+| `CTX_REPLAY` | `off` | Background replay of past Claude prompts to OpenCode (section 5) |
+| `CTX_REPLAY_PROJECTS` | empty | Project names to replay, e.g. `helpdesk,sedn26`; matches any path segment |
+| `CTX_REPLAY_EVERY_MINS` | `60` | Minimum gap between replays |
+| `CTX_REPLAY_DAILY_MAX` | `10` | Replays per day |
+| `CTX_REPLAY_NEXT` | `2-5` | Follow-ups (`Next:` suggestions) per replay, picked at random |
+| `CTX_REPLAY_TIMEOUT_MINS` | `20` | Per OpenCode call; the process tree is killed after it |
+| `CTX_REPLAY_MODEL` | unset | `provider/model`; unset uses OpenCode's global model |
+| `CTX_REPLAY_LOG` | `<data dir>\logs\opencode.log` | Replay log |
+| `CTX_REPLAY_MIN_CHARS` | `40` | Shorter prompts are never replayed |
+| `CTX_REPLAY_AGENT` | `ctx-replay` | OpenCode agent the replays run with; must exist in the agents dir |
+| `CTX_OPENCODE_AGENTS_DIR` | `~\.config\opencode\agents` | Where that agent file is checked for |
+| `CTX_OPENCODE_EXE` | `opencode` | The OpenCode CLI |
 
 The `.env` is re-read by the daemon each run, so `ctx redact add` and inject
 setting changes apply without a restart. Injection scope stays within the current

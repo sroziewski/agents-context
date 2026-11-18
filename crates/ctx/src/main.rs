@@ -52,6 +52,13 @@ enum Command {
     /// Claude Code status line: model, context usage with a /clear nudge, daemon and Teams
     /// health. Reads the status JSON on stdin.
     Statusline,
+    /// Replay one past Claude prompt to OpenCode now, then follow its `Next:` suggestions
+    /// (`CTX_REPLAY_*`). The daemon does this in the background when `CTX_REPLAY=on`.
+    Replay {
+        /// Show the prompt that would be sent, without sending it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Auto-inject of past-session summaries into Claude Code prompts.
     Inject {
         #[command(subcommand)]
@@ -759,6 +766,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Command::Replay { dry_run } => {
+            let store = connect_store(&cfg)?;
+            let state = State::open(&cfg.state_path)?;
+            let agent = ctx::replay::OpencodeCli::from_config(&cfg.replay);
+            println!("{}", ctx::replay::run_once(&cfg.replay, &store, &state, &agent, dry_run).await?);
             Ok(())
         }
         Command::Sessions { all, limit } => {

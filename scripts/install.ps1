@@ -38,6 +38,10 @@ if (Test-Path (Split-Path -Parent $plugins)) {
     foreach ($js in 'ctx-index.js', 'ctx-inject.js') {
         Copy-Item (Join-Path $repo "integrations\opencode\$js") (Join-Path $plugins $js) -Force
     }
+    # The read-only agent `ctx replay` runs with; without it the replay refuses to start.
+    $agents = Join-Path $env:USERPROFILE '.config\opencode\agents'
+    New-Item -ItemType Directory -Force $agents | Out-Null
+    Copy-Item (Join-Path $repo 'integrations\opencode\agents\ctx-replay.md') (Join-Path $agents 'ctx-replay.md') -Force
 }
 
 function Test-Daemon([int]$seconds) {
